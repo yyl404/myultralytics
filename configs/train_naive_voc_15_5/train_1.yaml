@@ -1,0 +1,26 @@
+base_model:
+model_cfg: yolov8l.yaml
+
+new_classes:
+  - aeroplane
+  - bicycle
+  - bird
+  - boat
+  - bottle
+  - bus
+  - car
+  - cat
+  - chair
+  - cow
+  - diningtable
+  - dog
+  - horse
+  - motorbike
+  - person
+
+data_cfg: /hy-tmp/datasets/VOC_inc_15_5/task_1_cls_15/dataconfig.yaml
+
+epochs: 100
+batch: 16
+workers: 8
+device: 0
