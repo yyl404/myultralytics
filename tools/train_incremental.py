@@ -4,8 +4,10 @@ import shutil
 
 from ultralytics.utils import YAML
 from ultralytics import YOLO
+from ultralytics.models.yolo.detect.train import DistillationDetectionTrainer
 
 from incremental_utils import expand_detection_head, create_classes_expanded_dataset, create_pseudo_labels_dataset
+from osr_utils import copy_paste_replay, mix_up_augmentation
 
 
 def main():
@@ -41,19 +43,40 @@ def main():
                 if os.path.exists(os.path.join(save_dir, "training_dataset_expanded")):
                     shutil.rmtree(os.path.join(save_dir, "training_dataset_expanded"))
                 create_classes_expanded_dataset(data_cfg, new_class_id_map, save_dir, f"training_dataset_expanded", all_classes)
+            model_teacher = YOLO(base_model).model
+            model.train(trainer=DistillationDetectionTrainer, data=training_dataset_cfg, epochs=cfg["epochs"], batch=cfg["batch"],
+                        workers=cfg["workers"], device=cfg["device"], project=save_dir, teacher_model=model_teacher)
         else:
-            training_dataset_cfg = f"{save_dir}/training_dataset_with_pseudo_labels/dataconfig.yaml"
+            training_dataset_cfg = f"{save_dir}/training_dataset_with_copy_paste_replay/dataconfig.yaml"
             if not os.path.exists(training_dataset_cfg):
                 Warning(f"Resumed training dataset {training_dataset_cfg} does not exist, recreating...")
+                # # 先进行mix-up增强
+                # if os.path.exists(os.path.join(save_dir, "training_dataset_with_mixed_up_samples")):
+                #     shutil.rmtree(os.path.join(save_dir, "training_dataset_with_mixed_up_samples"))
+                # os.makedirs(os.path.join(save_dir, "training_dataset_with_mixed_up_samples", "images", "train"))
+                # mix_up_augmentation(data_cfg, cfg["memory_bank_dir"], os.path.join(save_dir, "training_dataset_with_mixed_up_samples", "images", "train"),
+                #                     "train", num_generations=cfg["num_mixup"])
+                # # 进行伪标签生成
+                # shutil.copytree(os.path.dirname(data_cfg), os.path.join(save_dir, "training_dataset_with_mixed_up_samples"), dirs_exist_ok=True)
+                # if os.path.exists(os.path.join(save_dir, "training_dataset_with_pseudo_labels")):
+                #     shutil.rmtree(os.path.join(save_dir, "training_dataset_with_pseudo_labels"))
+                # create_pseudo_labels_dataset(model, base_class_id_map, new_class_id_map, 
+                #                              os.path.join(save_dir, "training_dataset_with_mixed_up_samples", os.path.basename(data_cfg)),
+                #                              os.path.join(save_dir, "training_dataset_with_pseudo_labels"), all_classes, conf_threshold=0.25)
+                # # 进行copy-paste回放
+                # if os.path.exists(os.path.join(save_dir, "training_dataset_with_copy_paste_replay")):
+                #     shutil.rmtree(os.path.join(save_dir, "training_dataset_with_copy_paste_replay"))
+                # copy_paste_replay(os.path.join(save_dir, "training_dataset_with_pseudo_labels", "dataconfig.yaml"),
+                #                   os.path.join(save_dir, "osr_memory_bank"),
+                #                   os.path.join(save_dir, "training_dataset_with_copy_paste_replay"),
+                #                   "train")
                 if os.path.exists(os.path.join(save_dir, "training_dataset_with_pseudo_labels")):
                     shutil.rmtree(os.path.join(save_dir, "training_dataset_with_pseudo_labels"))
-                create_pseudo_labels_dataset(model, base_class_id_map, new_class_id_map, data_cfg, 
+                create_pseudo_labels_dataset(model, base_class_id_map, new_class_id_map, 
+                                             data_cfg,
                                              os.path.join(save_dir, "training_dataset_with_pseudo_labels"), all_classes, conf_threshold=0.25)
-
-
-        model.train(data=training_dataset_cfg, epochs=cfg["epochs"], batch=cfg["batch"],
-                    workers=cfg["workers"], device=cfg["device"], project=save_dir, resume=True)
-
+            model.train(data=training_dataset_cfg, epochs=cfg["epochs"], batch=cfg["batch"],
+                        workers=cfg["workers"], device=cfg["device"], project=save_dir, resume=True)
         model.save(os.path.join(save_dir, "best.pt"))
         return
     
@@ -100,16 +123,43 @@ def main():
         create_classes_expanded_dataset(data_cfg, new_class_id_map, save_dir, f"training_dataset_expanded", all_classes)
         training_dataset_cfg = f"{save_dir}/training_dataset_expanded/dataconfig.yaml"
     else:
-        # create_classes_expanded_dataset(data_cfg, new_class_id_map, save_dir, f"training_dataset_expanded", all_classes)
+        # # 先进行mix-up增强
+        # if os.path.exists(os.path.join(save_dir, "training_dataset_with_mixed_up_samples")):
+        #     shutil.rmtree(os.path.join(save_dir, "training_dataset_with_mixed_up_samples"))
+        # os.makedirs(os.path.join(save_dir, "training_dataset_with_mixed_up_samples", "images", "train"))
+        # mix_up_augmentation(data_cfg, cfg["memory_bank_dir"], os.path.join(save_dir, "training_dataset_with_mixed_up_samples", "images", "train"),
+        #                     "train", num_generations=cfg["num_mixup"])
+        # # 进行伪标签生成
+        # shutil.copytree(os.path.dirname(data_cfg), os.path.join(save_dir, "training_dataset_with_mixed_up_samples"), dirs_exist_ok=True)
+        # if os.path.exists(os.path.join(save_dir, "training_dataset_with_pseudo_labels")):
+        #     shutil.rmtree(os.path.join(save_dir, "training_dataset_with_pseudo_labels"))
+        # create_pseudo_labels_dataset(model, base_class_id_map, new_class_id_map, 
+        #                              os.path.join(save_dir, "training_dataset_with_mixed_up_samples", os.path.basename(data_cfg)),
+        #                              os.path.join(save_dir, "training_dataset_with_pseudo_labels"), all_classes, conf_threshold=0.25)
+        # # 进行copy-paste回放
+        # if os.path.exists(os.path.join(save_dir, "training_dataset_with_copy_paste_replay")):
+        #     shutil.rmtree(os.path.join(save_dir, "training_dataset_with_copy_paste_replay"))
+        # copy_paste_replay(os.path.join(save_dir, "training_dataset_with_pseudo_labels", "dataconfig.yaml"),
+        #                   os.path.join(save_dir, "osr_memory_bank"),
+        #                   os.path.join(save_dir, "training_dataset_with_copy_paste_replay"),
+        #                   "train")
+        # 进行伪标签生成
         if os.path.exists(os.path.join(save_dir, "training_dataset_with_pseudo_labels")):
             shutil.rmtree(os.path.join(save_dir, "training_dataset_with_pseudo_labels"))
-        create_pseudo_labels_dataset(model, base_class_id_map, new_class_id_map, data_cfg, os.path.join(save_dir, 
-                                     "training_dataset_with_pseudo_labels"), all_classes, conf_threshold=0.25)
-        training_dataset_cfg = f"{save_dir}/training_dataset_with_pseudo_labels/dataconfig.yaml"
+        create_pseudo_labels_dataset(model, base_class_id_map, new_class_id_map, 
+                                     data_cfg,
+                                     os.path.join(save_dir, "training_dataset_with_pseudo_labels"), all_classes, conf_threshold=0.25)
+        training_dataset_cfg = os.path.join(save_dir, "training_dataset_with_pseudo_labels", "dataconfig.yaml")
 
     model = YOLO(f"{save_dir}/{model_name}_expanded.pt")
-    model.train(data=training_dataset_cfg, epochs=cfg["epochs"], batch=cfg["batch"],
-                workers=cfg["workers"], device=cfg["device"], project=save_dir)
+    
+    if base_model is not None:
+        model_teacher = YOLO(base_model).model
+        model.train(trainer=DistillationDetectionTrainer, data=training_dataset_cfg, epochs=cfg["epochs"], batch=cfg["batch"],
+                    workers=cfg["workers"], device=cfg["device"], project=save_dir, teacher_model=model_teacher, freeze=[i for i in range(9)])
+    else:
+        model.train(data=training_dataset_cfg, epochs=cfg["epochs"], batch=cfg["batch"],
+                    workers=cfg["workers"], device=cfg["device"], project=save_dir)
 
     model.save(os.path.join(save_dir, "best.pt"))
 

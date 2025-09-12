@@ -1,4 +1,4 @@
-base_model: runs/yolov8l_voc_inc_15_5_fromscratch_naive/task-1/best.pt
+base_model: runs/yolov8l_voc_inc_15_5_fromscratch/task-1/best.pt
 model_cfg: yolov8l.yaml
 
 new_classes:
@@ -8,7 +8,9 @@ new_classes:
   - train
   - tvmonitor
 
-data_cfg: /hy-tmp/datasets/VOC_inc_15_5/task_2_cls_5/dataconfig.yaml
+data_cfg: data/VOC_inc_15_5/task_2_cls_5/dataconfig.yaml
+memory_bank_dir: runs/yolov8l_voc_inc_15_5_fromscratch/task-2/osr_memory_bank
+num_mixup: 100
 
 epochs: 100
 batch: 16

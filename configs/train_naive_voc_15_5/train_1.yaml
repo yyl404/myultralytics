@@ -18,7 +18,7 @@ new_classes:
   - motorbike
   - person
 
-data_cfg: /hy-tmp/datasets/VOC_inc_15_5/task_1_cls_15/dataconfig.yaml
+data_cfg: data/VOC_inc_15_5/task_1_cls_15/dataconfig.yaml
 
 epochs: 100
 batch: 16

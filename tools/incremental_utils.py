@@ -144,9 +144,6 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
             layer_id = int(key.split('.')[1])
             # 处理cv3中最后的分类层权重（Conv2d层，即.2.weight）
             if layer_id == len(model.model.model) - 1 and 'cv3' in key and key.endswith('.2.weight'):
-                print(f"Migrating weight for {key}")
-                print(weight[key].shape)
-                print(new_weight[key].shape)
                 # 根据transfer_map迁移权重
                 for old_idx, new_idx in channel_map.items():
                     if old_idx < weight[key].shape[0] and new_idx < new_weight[key].shape[0]:
