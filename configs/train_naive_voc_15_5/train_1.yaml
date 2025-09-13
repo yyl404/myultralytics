@@ -1,26 +1,15 @@
+# model settings
 base_model:
 model_cfg: yolov8l.yaml
-
-new_classes:
-  - aeroplane
-  - bicycle
-  - bird
-  - boat
-  - bottle
-  - bus
-  - car
-  - cat
-  - chair
-  - cow
-  - diningtable
-  - dog
-  - horse
-  - motorbike
-  - person
-
+# data settings
 data_cfg: data/VOC_inc_15_5/task_1_cls_15/dataconfig.yaml
-
+base_data_cfg:
+# training settings
 epochs: 100
 batch: 16
 workers: 8
 device: 0
+frozen_layers:
+# projection settings
+pca_sample_num: 100
+projection_layers:

@@ -138,6 +138,25 @@ def on_show_distillation_loss(trainer):
                 print(f"\033[1;31mERROR\033[0m: plot distillation loss failed. Cause by: {e}")
             show_error = False
 # ============================== END: show distillation loss in tensorboard ============================================
+
+# ============================== MODIFIED: show projection loss in tensorboard =======================================
+def on_show_projection_loss(trainer):
+    if WRITER:
+        """
+        numpy>=1.18.5,<1.24.0
+        protobuf<4.21.3
+        """
+        show_error = True
+        try:
+            WRITER.add_scalar('projection/prj_loss',  trainer.tb_prj_mean,  trainer.epoch + 1)
+            WRITER.add_scalar('projection/or_loss',  trainer.tb_or_mean,  trainer.epoch + 1)
+            WRITER.add_scalar('projection/total_loss',  trainer.tb_prj_mean + trainer.tb_or_mean,  trainer.epoch + 1)
+            WRITER.add_scalar('projection/ratio',    trainer.tb_prj_ratio, trainer.epoch + 1)
+        except Exception as e:
+            if show_error:
+                print(f"\033[1;31mERROR\033[0m: plot projection loss failed. Cause by: {e}")
+            show_error = False
+# ============================== END: show projection loss in tensorboard ============================================
  
 callbacks = (
     {
@@ -147,6 +166,9 @@ callbacks = (
         "on_train_epoch_end": on_train_epoch_end,
         # ============================== MODIFIED: show distillation loss in tensorboard ===============================
         "on_show_distillation_loss": on_show_distillation_loss,
+        # ============================== END: show distillation loss in tensorboard ====================================
+        # ============================== MODIFIED: show projection loss in tensorboard ===============================
+        "on_show_projection_loss": on_show_projection_loss,
         # ============================== END: show distillation loss in tensorboard ====================================
     }
     if SummaryWriter

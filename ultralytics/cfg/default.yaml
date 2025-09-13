@@ -129,3 +129,10 @@ tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yam
 # Distillation settings --------------------------------------------------------------------------------------------------
 teacher_model: None
 loss_type: "mgd"
+
+# projection settings ----------------------------------------------------------------------------------------------------
+base_model: None # (str, optional) path to base model for projection
+projection_layers: None # (list[str], optional) list of layers for projection
+sample_images: None # (str, optional) path to sample images for projection
+sample_labels: None # (str, optional) path to sample labels for projection
+pca_sample_num: 1000 # (int) number of samples for PCA
