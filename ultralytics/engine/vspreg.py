@@ -156,8 +156,13 @@ class VSPRegLoss:
             proj = proj.to(delta_w.device, delta_w.dtype)
             bias = bias.to(delta_w.device, delta_w.dtype)
             scale = scale.to(delta_w.device, delta_w.dtype)
+
+            if proj.shape[1] < delta_w.shape[1]:
+                # when the sampled features are less than feature dimension, we need to pad the components matrix and scales array
+                proj = torch.cat([proj, torch.zeros((proj.shape[0], delta_w.shape[1] - proj.shape[1]), device=proj.device, dtype=proj.dtype)], dim=1)
+                scale = torch.cat([scale, torch.zeros((delta_w.shape[1] - scale.shape[0]), device=scale.device, dtype=scale.dtype)], dim=0)
             
-            loss += self.alpha * (delta_w @ proj.transpose(0, 1) @ torch.diag(scale)).norm(dim=1).mean() \
+            loss += self.alpha * (delta_w @ proj.T @ torch.diag(scale)).norm(dim=1).mean() \
                 + self.beta * (delta_w @ bias.unsqueeze(-1)).square().mean()
         return loss
     
@@ -287,20 +292,22 @@ class PCAHooker:
         self._handles.clear()
 
     def clear_feature_cache(self):
-        for cache in self.feature_caches.values():
+        for n, cache in self.feature_caches.items():
+            if len(cache) > 0:
+                # before clearing the cache, we need to fit the PCA operator with the final batch of features
+                if not hasattr(self.pca_operators[n], 'components_'):
+                    # If components_ is not calculated, it means the PCA operator has not been called yet, and that
+                    # means the number of features in this cache has never reached n_components, so we need to
+                    # reduce n_components to the number of features in this cache.
+                    LOGGER.warning(f"Too few samples to fit PCA in module {n}. Could result in instability.")
+                    self.pca_operators[n].n_components = torch.cat(cache, dim=1).shape[1]
+                self.pca_operators[n].partial_fit(torch.cat(cache, dim=1).cpu().T.numpy())
             cache.clear()
     
     def get_pca_results(self, name):
-        try:
-            return (self.pca_operators[name].components_, 
-                    self.pca_operators[name].explained_variance_, 
-                    self.pca_operators[name].mean_)
-        except AttributeError:
-            LOGGER.warning(f"Too few samples to fit PCA in module {name}. Skip this module.")
-            n_components = self.pca_operators[name].n_components
-            return (np.zeros((n_components, n_components)), 
-                    np.zeros(n_components), 
-                    np.zeros(n_components))
+        return (self.pca_operators[name].components_, 
+                self.pca_operators[name].explained_variance_, 
+                self.pca_operators[name].mean_)
 
     def get_pca_operator(self, name):
         return self.pca_operators[name]
