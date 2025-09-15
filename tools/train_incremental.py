@@ -5,7 +5,7 @@ import shutil
 
 from ultralytics.utils import YAML
 from ultralytics import YOLO
-from ultralytics.models.yolo.detect.train import DistillationDetectionTrainer, ProjectionLossDetectionTrainer
+from ultralytics.models.yolo.detect.train import VSPRegDetectionTrainer
 
 from incremental_utils import expand_detection_head, create_classes_expanded_dataset, create_pseudo_labels_dataset
 
@@ -64,12 +64,16 @@ def main():
                                          OSP.join(save_dir, "training_dataset_with_pseudo_labels"), all_classes)
             model = YOLO(f"{save_dir}/{model_name}_expanded.pt")
             resume = False
+        pca_cache_save_path = cfg["pca_cache_save_path"]
+        pca_cache_load_path = cfg["pca_cache_load_path"]
         model.train(data=OSP.join(save_dir, "training_dataset_with_pseudo_labels", "dataconfig.yaml"), epochs=cfg["epochs"], batch=cfg["batch"],
                     workers=cfg["workers"], device=cfg["device"], project=save_dir, freeze=cfg["frozen_layers"],
-                    trainer=ProjectionLossDetectionTrainer, base_model=base_model.model,
+                    trainer=VSPRegDetectionTrainer,
                     sample_images=OSP.join(OSP.dirname(base_data_cfg_path), "images", "train"),
                     sample_labels=OSP.join(OSP.dirname(base_data_cfg_path), "labels", "train"),
                     pca_sample_num=cfg["pca_sample_num"], projection_layers=cfg["projection_layers"],
+                    pca_cache_save_path=pca_cache_save_path,
+                    pca_cache_load_path=pca_cache_load_path,
                     resume=resume)
     else:
         if checkpoint is not None:

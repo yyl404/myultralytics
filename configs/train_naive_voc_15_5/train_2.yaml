@@ -9,7 +9,9 @@ epochs: 100
 batch: 16
 workers: 8
 device: 0
-frozen_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+frozen_layers:
 # projection settings
-pca_sample_num: 100
-projection_layers: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+pca_sample_num: 500
+projection_layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+pca_cache_save_path: runs/yolov8l_voc_inc_15_5_fromscratch/task-1/pca_cache.joblib
+pca_cache_load_path: runs/yolov8l_voc_inc_15_5_fromscratch/task-1/pca_cache.joblib
