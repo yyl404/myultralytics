@@ -1,8 +1,8 @@
 # model settings
 base_model:
-model_cfg: yolov8l.yaml
+model_cfg: yolov8l.pt
 # data settings
-data_cfg: data/VOC_inc_15_5/task_1_cls_15/dataset.yaml
+data_cfg: data/VOC_inc_15_1x5/task_1_cls_15/dataset.yaml
 base_data_cfg:
 # training settings
 epochs: 100

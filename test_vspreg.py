@@ -8,7 +8,7 @@ def test_vspreg_trainer():
     
     # 基础配置
     base_config = {
-        "data": "/root/data/datasets/VOC_inc_15_5/task_2_cls_5/dataconfig.yaml",
+        "data": "/root/data/datasets/VOC_inc_15_5/task_2_cls_5/dataset.yaml",
         "epochs": 1,
         "batch": 16,
         "workers": 8,
@@ -26,56 +26,56 @@ def test_vspreg_trainer():
     
     # 测试用例列表
     test_cases = [
-        # {
-        #     "name": "Test 1: 既没有指定sample_images也没有指定sample_labels",
-        #     "config": {**base_config, "model": "yolov8m.pt"}
-        # },
-        # {
-        #     "name": "Test 2: 指定了sample_images而没有指定sample_labels",
-        #     "config": {
-        #         **base_config, 
-        #         "model": "yolov8m.pt",
-        #         "sample_images": sample_images
-        #     }
-        # },
-        # {
-        #     "name": "Test 3: 指定了sample_labels而没有指定sample_images",
-        #     "config": {
-        #         **base_config, 
-        #         "model": "yolov8m.pt",
-        #         "sample_labels": sample_labels
-        #     }
-        # },
-        # {
-        #     "name": "Test 4: 基于Test 3，指定freeze=[1, 2, 3]",
-        #     "config": {
-        #         **base_config, 
-        #         "model": "yolov8m.pt",
-        #         "sample_images": sample_images,
-        #         "sample_labels": sample_labels,
-        #         "freeze": [1, 2, 3]
-        #     }
-        # },
-        # {
-        #     "name": "Test 5: 基于Test 3，指定freeze=1",
-        #     "config": {
-        #         **base_config, 
-        #         "model": "yolov8m.pt",
-        #         "sample_images": sample_images,
-        #         "sample_labels": sample_labels,
-        #         "freeze": 1
-        #     }
-        # },
-        # {
-        #     "name": "Test 6: 基于Test 3，指定projection_layers=[1, 2, 3]",
-        #     "config": {
-        #         **base_config, 
-        #         "model": "yolov8m.pt",
-        #         "sample_images": sample_images,
-        #         "sample_labels": sample_labels,
-        #         "projection_layers": [1, 2, 3]
-        #     }
-        # },
+        {
+            "name": "Test 1: 既没有指定sample_images也没有指定sample_labels",
+            "config": {**base_config, "model": "yolov8m.pt"}
+        },
+        {
+            "name": "Test 2: 指定了sample_images而没有指定sample_labels",
+            "config": {
+                **base_config, 
+                "model": "yolov8m.pt",
+                "sample_images": sample_images
+            }
+        },
+        {
+            "name": "Test 3: 指定了sample_labels而没有指定sample_images",
+            "config": {
+                **base_config, 
+                "model": "yolov8m.pt",
+                "sample_labels": sample_labels
+            }
+        },
+        {
+            "name": "Test 4: 基于Test 3，指定freeze=[1, 2, 3]",
+            "config": {
+                **base_config, 
+                "model": "yolov8m.pt",
+                "sample_images": sample_images,
+                "sample_labels": sample_labels,
+                "freeze": [1, 2, 3]
+            }
+        },
+        {
+            "name": "Test 5: 基于Test 3，指定freeze=1",
+            "config": {
+                **base_config, 
+                "model": "yolov8m.pt",
+                "sample_images": sample_images,
+                "sample_labels": sample_labels,
+                "freeze": 1
+            }
+        },
+        {
+            "name": "Test 6: 基于Test 3，指定projection_layers=[1, 2, 3]",
+            "config": {
+                **base_config, 
+                "model": "yolov8m.pt",
+                "sample_images": sample_images,
+                "sample_labels": sample_labels,
+                "projection_layers": [1, 2, 3]
+            }
+        },
         {
             "name": "Test 7: 基于Test 3，指定pca_cache_save_path",
             "config": {

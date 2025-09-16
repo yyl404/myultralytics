@@ -2,7 +2,8 @@ import numpy as np
 import random
 import os
 import cv2
-from sklearn.decomposition import IncrementalPCA
+# from sklearn.decomposition import IncrementalPCA
+from gpu_pca import IncrementalPCAonGPU as IncrementalPCA # 2:32
 import threading
 import psutil
 import joblib
@@ -63,7 +64,7 @@ class RealTimeMemoryMonitor:
             
             # Real-time update progress bar description
             if self.pbar is not None:
-                self.pbar.set_description(f"Processing images - GPU Mem: {self.gpu_mem:.2f} MB, Mem: {self.mem:.2f} MB")
+                self.pbar.set_description(f"PCA computing - GPU Mem: {self.gpu_mem:.2f} MB, Mem: {self.mem:.2f} MB")
             
             time.sleep(self.update_interval)
     
@@ -280,7 +281,8 @@ class PCAHooker:
                 if sum([x.shape[1] for x in feature_cache]) >= pca_operator.n_components: # Incremental PCA requires the first batch's size is larger than n_components
                     feat_sampled = torch.cat(feature_cache, dim=1)
                     feature_cache.clear()
-                    pca_operator.partial_fit(feat_sampled.cpu().T.numpy())
+                    # pca_operator.partial_fit(feat_sampled.cpu().T.numpy())
+                    pca_operator.partial_fit(feat_sampled.T)
             else:
                 raise RuntimeError(f"Module type {type(module)} is not supported")
 
@@ -301,7 +303,8 @@ class PCAHooker:
                     # reduce n_components to the number of features in this cache.
                     LOGGER.warning(f"Too few samples to fit PCA in module {n}. Could result in instability.")
                     self.pca_operators[n].n_components = torch.cat(cache, dim=1).shape[1]
-                self.pca_operators[n].partial_fit(torch.cat(cache, dim=1).cpu().T.numpy())
+                # self.pca_operators[n].partial_fit(torch.cat(cache, dim=1).cpu().T.numpy())
+                self.pca_operators[n].partial_fit(torch.cat(cache, dim=1).T)
             cache.clear()
     
     def get_pca_results(self, name):
@@ -353,9 +356,9 @@ class VSPRegTrainer(BaseTrainer):
                     self.pca_hooker.set_pca_operator(n, pca_operator)
                 for n in self.pca_hooker.names:
                     component_matrix, variance_array, mean_array = self.pca_hooker.get_pca_results(n)
-                    components[n] = torch.from_numpy(component_matrix).to(self.device).detach()
-                    variances[n] = torch.from_numpy(variance_array).to(self.device).detach()
-                    means[n] = torch.from_numpy(mean_array).to(self.device).detach()
+                    components[n] = component_matrix.to(self.device).detach()
+                    variances[n] = variance_array.to(self.device).detach()
+                    means[n] = mean_array.to(self.device).detach()
                 if self.args.pca_cache_save_path:
                     LOGGER.info(f"Saving PCA cache to {self.args.pca_cache_save_path}")
                     with open(self.args.pca_cache_save_path, "wb") as f:
@@ -367,13 +370,19 @@ class VSPRegTrainer(BaseTrainer):
         memory_monitor = RealTimeMemoryMonitor(update_interval=0.2) # Monitor memory and CUDA memory usage
         pbar = TQDM(range(self.args.pca_sample_num), desc="PCA computing", total=self.args.pca_sample_num)
         memory_monitor.set_progress_bar(pbar)
+        memory_monitor.start_monitoring()
 
         if self.args.sample_images is not None:
-            image_files = os.listdir(self.args.sample_images)
-            random.shuffle(image_files)
-            image_files = image_files[:self.args.pca_sample_num]
+            if isinstance(self.args.sample_images, list) or isinstance(self.args.sample_images, tuple):
+                sample_files = []
+                for _dir in self.args.sample_images:
+                    sample_files.extend(os.path.join(_dir, x) for x in os.listdir(_dir))
+            else:
+                sample_files = [os.path.join(self.args.sample_images, x) for x in os.listdir(self.args.sample_images)]
+            random.shuffle(sample_files)
+            sample_files = sample_files[:self.args.pca_sample_num]
             for i in pbar:
-                image = cv2.imread(os.path.join(self.args.sample_images, image_files[i]))
+                image = cv2.imread(sample_files[i])
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 image = cv2.resize(image, (640, 640))
                 image = image.transpose(2, 0, 1) / 255.0
@@ -405,9 +414,9 @@ class VSPRegTrainer(BaseTrainer):
             if self.args.pca_cache_save_path:
                 pca_cache[n] = self.pca_hooker.get_pca_operator(n)
             component_matrix, variance_array, mean_array = self.pca_hooker.get_pca_results(n)
-            components[n] = torch.from_numpy(component_matrix).to(self.device).detach()
-            variances[n] = torch.from_numpy(variance_array).to(self.device).detach()
-            means[n] = torch.from_numpy(mean_array).to(self.device).detach()
+            components[n] = component_matrix.to(self.device).detach()
+            variances[n] = variance_array.to(self.device).detach()
+            means[n] = mean_array.to(self.device).detach()
         
         if self.args.pca_cache_save_path:
             LOGGER.info(f"Saving PCA cache to {self.args.pca_cache_save_path}")

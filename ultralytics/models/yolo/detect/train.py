@@ -498,9 +498,9 @@ class VSPRegDetectionTrainer(VSPRegTrainer):
                     self.pca_hooker.set_pca_operator(n, pca_operator)
                 for n in self.pca_hooker.names:
                     component_matrix, variance_array, mean_array = self.pca_hooker.get_pca_results(n)
-                    components[n] = torch.from_numpy(component_matrix).to(self.device).detach()
-                    variances[n] = torch.from_numpy(variance_array).to(self.device).detach()
-                    means[n] = torch.from_numpy(mean_array).to(self.device).detach()
+                    components[n] = component_matrix.to(self.device).detach()
+                    variances[n] = variance_array.to(self.device).detach()
+                    means[n] = mean_array.to(self.device).detach()
                 if self.args.pca_cache_save_path:
                     LOGGER.info(f"Saving PCA cache to {self.args.pca_cache_save_path}")
                     with open(self.args.pca_cache_save_path, "wb") as f:
@@ -513,18 +513,30 @@ class VSPRegDetectionTrainer(VSPRegTrainer):
             LOGGER.warning("Insufficient data(images and labels) for local PCA, fallback to global PCA")
             return super()._do_pca()
         
-        image_files = os.listdir(self.args.sample_images)
-        random.shuffle(image_files)
-        image_files = image_files[:self.args.pca_sample_num]
-        label_files = [image_file.replace(".jpg", ".txt") for image_file in image_files]
+        if isinstance(self.args.sample_images, list) or isinstance(self.args.sample_images, tuple):
+            sample_files = []
+            for _dir_img, _dir_label in zip(self.args.sample_images, self.args.sample_labels):
+                sample_files.extend({
+                    "image_file": os.path.join(_dir_img, x),
+                    "label_file": os.path.join(_dir_label, x.replace(".jpg", ".txt"))
+                } for x in os.listdir(_dir_img))
+        else:
+            sample_files = [
+                {
+                    "image_file": os.path.join(self.args.sample_images, x),
+                    "label_file": os.path.join(self.args.sample_labels, x.replace(".jpg", ".txt"))
+                } for x in os.listdir(self.args.sample_images)
+            ]
+        random.shuffle(sample_files)
+        sample_files = sample_files[:self.args.pca_sample_num]
         
         memory_monitor = RealTimeMemoryMonitor(update_interval=0.2)
-        pbar = TQDM(zip(image_files, label_files), desc="PCA computing", total=len(image_files))
+        pbar = TQDM(sample_files, desc="PCA computing", total=len(sample_files))
         memory_monitor.set_progress_bar(pbar)
         memory_monitor.start_monitoring()
 
-        for image_file, label_file in pbar:
-            image = cv2.imread(os.path.join(self.args.sample_images, image_file))
+        for sample_file in pbar:
+            image = cv2.imread(sample_file["image_file"])
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             image = cv2.resize(image, (640, 640))
             image = image.transpose(2, 0, 1) / 255.0
@@ -532,7 +544,7 @@ class VSPRegDetectionTrainer(VSPRegTrainer):
             image = image.to(self.device)
 
             bboxes = []
-            with open(os.path.join(self.args.sample_labels, label_file), "r") as f:
+            with open(sample_file["label_file"], "r") as f:
                 labels = f.readlines()
                 for _label in labels:
                     _label = _label.strip().split()
@@ -558,9 +570,9 @@ class VSPRegDetectionTrainer(VSPRegTrainer):
             if self.args.pca_cache_save_path:
                 pca_cache[n] = self.pca_hooker.get_pca_operator(n)
             component_matrix, variance_array, mean_array = self.pca_hooker.get_pca_results(n)
-            components[n] = torch.from_numpy(component_matrix).to(self.device).detach()
-            variances[n] = torch.from_numpy(variance_array).to(self.device).detach()
-            means[n] = torch.from_numpy(mean_array).to(self.device).detach()
+            components[n] = component_matrix.to(self.device).detach()
+            variances[n] = variance_array.to(self.device).detach()
+            means[n] = mean_array.to(self.device).detach()
         
         if self.args.pca_cache_save_path:
             LOGGER.info(f"Saving PCA cache to {self.args.pca_cache_save_path}")
