@@ -76,3 +76,14 @@ $$
 7. 其余tools目录下的代码均为工具代码，这里不一一列出了了，注释都有阐述。
 
 8. 具体调度完整的多阶段增量学习的指令，位于configs目录下，每一个实验设置对应其中一个子目录。子目录里的train.sh和eval.sh是完整的训练脚本和测试脚本。
+
+## 三、环境配置
+
+```shell
+conda create -n yolo python=0 -y
+pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url https://download.pytorch.org/whl/cu118
+pip install -e . -v
+pip install PCAonGPU
+pip install scikit-learn
+pip install "numpy<2" # 一定要降低numpy版本，否则不兼容，降低版本以后可能会出现opencv-python版本不兼容的报错，但是不用管
+```
