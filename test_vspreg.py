@@ -28,13 +28,13 @@ def test_vspreg_trainer():
     test_cases = [
         {
             "name": "Test 1: 既没有指定sample_images也没有指定sample_labels",
-            "config": {**base_config, "model": "yolov8m.pt"}
+            "config": {**base_config, "model": "yolov8l.pt"}
         },
         {
             "name": "Test 2: 指定了sample_images而没有指定sample_labels",
             "config": {
                 **base_config, 
-                "model": "yolov8m.pt",
+                "model": "yolov8l.pt",
                 "sample_images": sample_images
             }
         },
@@ -42,7 +42,7 @@ def test_vspreg_trainer():
             "name": "Test 3: 指定了sample_labels而没有指定sample_images",
             "config": {
                 **base_config, 
-                "model": "yolov8m.pt",
+                "model": "yolov8l.pt",
                 "sample_labels": sample_labels
             }
         },
@@ -50,7 +50,7 @@ def test_vspreg_trainer():
             "name": "Test 4: 基于Test 3，指定freeze=[1, 2, 3]",
             "config": {
                 **base_config, 
-                "model": "yolov8m.pt",
+                "model": "yolov8l.pt",
                 "sample_images": sample_images,
                 "sample_labels": sample_labels,
                 "freeze": [1, 2, 3]
@@ -60,7 +60,7 @@ def test_vspreg_trainer():
             "name": "Test 5: 基于Test 3，指定freeze=1",
             "config": {
                 **base_config, 
-                "model": "yolov8m.pt",
+                "model": "yolov8l.pt",
                 "sample_images": sample_images,
                 "sample_labels": sample_labels,
                 "freeze": 1
@@ -70,7 +70,7 @@ def test_vspreg_trainer():
             "name": "Test 6: 基于Test 3，指定projection_layers=[1, 2, 3]",
             "config": {
                 **base_config, 
-                "model": "yolov8m.pt",
+                "model": "yolov8l.pt",
                 "sample_images": sample_images,
                 "sample_labels": sample_labels,
                 "projection_layers": [1, 2, 3]
@@ -80,7 +80,7 @@ def test_vspreg_trainer():
             "name": "Test 7: 基于Test 3，指定pca_cache_save_path",
             "config": {
                 **base_config, 
-                "model": "yolov8m.pt",
+                "model": "yolov8l.pt",
                 "sample_images": sample_images,
                 "sample_labels": sample_labels,
                 "pca_cache_save_path": f"{cache_dir}/test_7_pca_cache.joblib"
@@ -90,7 +90,7 @@ def test_vspreg_trainer():
             "name": "Test 8: 基于Test 3，指定pca_cache_load_path（使用Test 7的缓存）",
             "config": {
                 **base_config, 
-                "model": "yolov8m.pt",
+                "model": "yolov8l.pt",
                 "sample_images": sample_images,
                 "sample_labels": sample_labels,
                 "pca_cache_load_path": f"{cache_dir}/test_7_pca_cache.joblib"
@@ -100,7 +100,7 @@ def test_vspreg_trainer():
             "name": "Test 9: 基于Test 3，同时指定pca_cache_load_path和pca_cache_save_path",
             "config": {
                 **base_config, 
-                "model": "yolov8m.pt",
+                "model": "yolov8l.pt",
                 "sample_images": sample_images,
                 "sample_labels": sample_labels,
                 "pca_cache_load_path": f"{cache_dir}/test_7_pca_cache.joblib",
