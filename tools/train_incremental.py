@@ -68,9 +68,11 @@ def main():
         pca_sample_labels = cfg["pca_sample_labels"]
         pca_cache_save_path = cfg["pca_cache_save_path"]
         pca_cache_load_path = cfg["pca_cache_load_path"]
+        teacher_model = YOLO(cfg["teacher_model"])
         model.train(data=OSP.join(save_dir, "training_dataset_with_pseudo_labels", "dataconfig.yaml"), epochs=cfg["epochs"], batch=cfg["batch"],
                     workers=cfg["workers"], device=cfg["device"], project=save_dir, freeze=cfg["frozen_layers"],
                     trainer=VSPRegDetectionTrainer,
+                    teacher_model=teacher_model,
                     sample_images=pca_sample_images,
                     sample_labels=pca_sample_labels,
                     pca_sample_num=cfg["pca_sample_num"], projection_layers=cfg["projection_layers"],

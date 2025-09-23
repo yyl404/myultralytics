@@ -34,6 +34,10 @@ from ultralytics.utils.torch_utils import (
     autocast,
     unset_deterministic,
 )
+from ultralytics.engine.distillation import (
+    YOLOv8DistillationLoss,
+    _YOLOV8_DISTILL_LAYER
+)
 
 
 class RealTimeMemoryMonitor:
@@ -329,6 +333,17 @@ class VSPRegTrainer(BaseTrainer):
             overrides (dict, optional): Configuration overrides.
             _callbacks (list, optional): List of callback functions.
         """
+        # ============================== MODIFIED: add distillation parameter ===========================================
+        # 指定教师模型和损失函数类型（蒸馏方式）
+        self.teacher_model = overrides["teacher_model"]
+        if overrides and "distill_layers" in overrides:
+            self.distill_layers = overrides["distill_layers"]
+        else:
+            self.distill_layers = _YOLOV8_DISTILL_LAYER
+        if overrides and "loss_type" in overrides:
+            self.loss_type = overrides["loss_type"]
+        else:
+            self.loss_type = "mgd"
         super().__init__(cfg, overrides, _callbacks)
 
     def _do_pca(self):
@@ -431,16 +446,33 @@ class VSPRegTrainer(BaseTrainer):
         self.model = self.model.to(self.device)
         self.set_model_attributes()
 
-        # ============================== MODIFIED: set up VSPReg loss ============================================
+        # ============================== MODIFIED: set up VS
+        # PReg loss ============================================
         self.base_model = deepcopy(self.model).eval()
         for p in self.base_model.parameters():
             p.requires_grad_(False)
         # Do PCA
-        components, variances, biases = self._do_pca()
+        components, variances, biases = self._do_pca()         
         # Initialize VSPRegLoss
         self.vspreg_loss = VSPRegLoss(self.model, self.base_model, module_names=self.pca_hooker.names,
                                       components=components, variances=variances, means=biases)
         # ============================== END: set up VSPReg loss ==================================================
+
+        # ============================== MODIFIED: Add Distillation loss
+        self.teacher_model = self.teacher_model.to(self.device).eval()
+        for p in self.teacher_model.parameters():
+            p.requires_grad_(False)
+        self.kd_loss = YOLOv8DistillationLoss(self.model, self.teacher_model, distill_layers=self.distill_layers, distiller=self.loss_type, device=self.device)
+        
+        # 计算并打印 KD-loss 相关的参数量
+        if self.kd_loss.distill_type.lower() == "feature":
+            # 统计 feature‐head（D_loss_fn）里的参数量
+            kd_params = sum(p.numel() for p in self.kd_loss.D_loss_fn.parameters())
+            LOGGER.info(f"{colorstr('Feature-level KD params:')} {kd_params/1e6:.2f} M")
+        else:
+            # logit‐level KD 只是额外计算一个 loss，没有新参数
+            LOGGER.info(f"{colorstr('Logit-level KD enabled, no extra sub-module parameters')}")
+        # ============================== END: add distillation parameter ==================================================
 
         # Freeze layers
         freeze_list = (
@@ -580,6 +612,11 @@ class VSPRegTrainer(BaseTrainer):
                 _ = self.base_model(torch.randn(1, 3, 640, 640).to(self.device))
             # ============================== END: register hook ================================================
 
+            self.kd_loss_sum = 0.0  # 蒸馏损失
+            self.or_loss_sum = 0.0  # 原始损失
+            self.loss_count = 0     # epoch的step数
+            self.kd_loss.register_hook() # Register hook for KD loss
+
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -610,6 +647,25 @@ class VSPRegTrainer(BaseTrainer):
                     self.tloss = (
                         (self.tloss * i + loss_items) / (i + 1) if self.tloss is not None else loss_items
                     )
+
+                    # ============================== MODIFIED: add distillation parameter ===================================
+                    with torch.no_grad():
+                        _ = self.teacher_model(batch["img"])
+                    bs = batch["img"].shape[0]  # batch size
+                    ws = world_size if RANK != -1 else 1  # world size
+                    scale = bs * ws
+
+                    # 获取蒸馏损失及其衰减权重
+                    raw_d_loss_weight = self.kd_loss.get_kd_weight(epoch=self.epoch, total_epochs=self.epochs)
+                    raw_d_loss = self.kd_loss.get_loss() * raw_d_loss_weight
+                    self.kd_loss_sum += raw_d_loss.item()
+                    self.or_loss_sum += (self.loss.detach().item()) / scale if scale else 0
+                    self.loss_count += 1
+
+                    self.d_loss = raw_d_loss * scale
+                    # print(f"or_loss: {self.loss / scale:.2f}, kd_loss: {raw_d_loss:.2f}, ratio: {self.d_loss / self.loss:.2f} kd_weight: {raw_d_loss_weight:.6f}")
+
+                    self.loss += self.d_loss
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
@@ -651,6 +707,20 @@ class VSPRegTrainer(BaseTrainer):
             # ============================== MODIFIED: remove hook ===========================================
             self.vspreg_loss.remove_handle_() # Remove hook for VSPRegLoss
             # ============================== END: remove hook ================================================
+
+            # ============================== MODIFIED: add distillation parameter ===========================================
+            self.kd_loss.remove_handle_() # 移除教师模型的hook函数
+            if self.loss_count: # 避免loss_count为0
+                kd_mean = self.kd_loss_sum / self.loss_count
+                or_mean = self.or_loss_sum / self.loss_count
+                ratio = kd_mean / or_mean if or_mean else 0
+                # 保存到 trainer 上，给回调用
+                self.tb_kd_mean = kd_mean
+                self.tb_or_mean = or_mean
+                self.tb_kd_ratio = ratio
+                print(f"kd_mean: {kd_mean:.2f}, or_mean: {or_mean:.2f}, ratio: {ratio:.2f}")
+                self.run_callbacks("on_show_distillation_loss")    # 触发回调
+            # ============================== END: add distillation parameter ================================================
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
