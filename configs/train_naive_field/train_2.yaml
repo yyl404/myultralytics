@@ -1,0 +1,19 @@
+# model settings
+base_model: runs/yolov8l_field_voc_format_fromscratch/task-1/best.pt
+model_cfg: yolov8l.yaml
+# data settings
+data_cfg: data/field_voc_format/task_2/dataset.yaml
+teacher_model: runs/yolov8l_field_voc_format_fromscratch/task-1/best.pt
+# training settings
+epochs: 10
+batch: 16
+workers: 8
+device: 0
+frozen_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+# projection settings
+pca_sample_num: 100
+projection_layers:
+pca_sample_images: data/field_voc_format/task_2/images/train
+pca_sample_labels: data/field_voc_format/task_2/labels/train
+pca_cache_save_path: runs/yolov8l_field_voc_format_fromscratch/task-2/pca_cache.joblib
+pca_cache_load_path: runs/yolov8l_field_voc_format_fromscratch/task-2/pca_cache.joblib

@@ -524,7 +524,7 @@ class VSPRegDetectionTrainer(VSPRegTrainer):
             sample_files = [
                 {
                     "image_file": os.path.join(self.args.sample_images, x),
-                    "label_file": os.path.join(self.args.sample_labels, x.replace(".jpg", ".txt"))
+                    "label_file": os.path.join(self.args.sample_labels, os.path.splitext(x)[0] + ".txt")
                 } for x in os.listdir(self.args.sample_images)
             ]
         random.shuffle(sample_files)

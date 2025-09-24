@@ -33,7 +33,7 @@ from ultralytics.utils.torch_utils import (
  
 _VALID_FEATURE_LOSS = {"cwd", "mgd", "at", "atm","skd", "pkd"}
 _VALID_LOGIT_LOSS = {'dkd', 'qf'}
-_YOLOV8_DISTILL_LAYER = ["6", "8", "12", "15", "18", "21"]
+_YOLOV8_DISTILL_LAYER = ["12", "15", "18", "21"]
 # layers = ["2","4","6","8","12","15","18","21"]
 _LOSS_FACTOR_CWD = 0.15     # 
 _LOSS_FACTOR_MGD = 0.03     # pose-s+pose-m 测到最优参数：初始值0.04，权重衰减到0.25
