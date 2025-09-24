@@ -3,12 +3,13 @@ base_model: runs/yolov8l_voc_inc_15_5_fromscratch/task-1/best.pt
 model_cfg: yolov8l.yaml
 # data settings
 data_cfg: data/VOC_inc_15_5/task_2_cls_5/dataset.yaml
+teacher_model: runs/yolov8l_voc_inc_15_5_fromscratch/task-1/best.pt
 # training settings
 epochs: 100
 batch: 16
 workers: 8
 device: 0
-frozen_layers:
+frozen_layers: [0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 13, 14, 16, 17, 19, 20, 22]
 # projection settings
 pca_sample_num: 100
 projection_layers:
