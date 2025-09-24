@@ -630,8 +630,6 @@ class YOLOv8DistillationLoss:
     def _hook(self, buff):
         """ 用于注册的hook函数，把每次forward的特征append到缓存列表。 """
         def fn(_, __, out):
-            traceback.print_stack()
-            print('===============================')
             buff.append(out)
         return fn
  
@@ -648,8 +646,6 @@ class YOLOv8DistillationLoss:
         - 返回的loss已经是可backward的张量，会对学生网络产生梯度影响。
         """
         if self._type == "feature":
-            print(len(self.student_feats), len(self.teacher_feats), len(self._handles))
-            print('===============================')
             loss = self.D_loss_fn(self.student_feats, self.teacher_feats)
             # 清空缓存
             self.student_feats.clear()

@@ -650,7 +650,7 @@ class VSPRegTrainer(BaseTrainer):
 
                     # ============================== MODIFIED: add distillation parameter ===================================
                     with torch.no_grad():
-                        _ = self.teacher_model(batch["img"])
+                        _ = self.teacher_model.model(batch["img"])
                     bs = batch["img"].shape[0]  # batch size
                     ws = world_size if RANK != -1 else 1  # world size
                     scale = bs * ws
