@@ -125,3 +125,15 @@ cfg: # (str, optional) for overriding defaults.yaml
 
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yaml]
+
+# Distillation settings --------------------------------------------------------------------------------------------------
+teacher_model: None
+loss_type: "mgd"
+
+# projection settings ----------------------------------------------------------------------------------------------------
+projection_layers: None # (list[str], optional)
+sample_images: None # (str, optional)
+sample_labels: None # (str, optional)
+pca_sample_num: 100 # (int)
+pca_cache_load_path: None # (str, optional)
+pca_cache_save_path: None # (str, optional)

@@ -1,0 +1,6 @@
+python tools/eval_incremental.py --data_cfg data/VOC_inc_15_5/task_1_cls_15/dataset.yaml \
+   --model_path runs/yolov8l_voc_inc_15_5_fromscratch/task-1/best.pt --save_dir runs/yolov8l_voc_inc_15_5_fromscratch/eval-task-1-1 > eval_res_task_1.txt
+python tools/eval_incremental.py --data_cfg data/VOC_inc_15_5/task_1_cls_15/dataset.yaml \
+    --model_path runs/yolov8l_voc_inc_15_5_fromscratch/task-2/best.pt --save_dir runs/yolov8l_voc_inc_15_5_fromscratch/eval_task-2-1 > eval_res_task_2_on_task_1.txt
+python tools/eval_incremental.py --data_cfg data/VOC_inc_15_5/task_2_cls_5/dataset.yaml \
+    --model_path runs/yolov8l_voc_inc_15_5_fromscratch/task-2/best.pt --save_dir runs/yolov8l_voc_inc_15_5_fromscratch/eval_task-2-2 > eval_res_task_2_on_task_2.txt

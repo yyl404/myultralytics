@@ -1,0 +1,13 @@
+# model settings
+base_model:
+model_cfg: yolov8l.pt
+# data settings
+data_cfg: data/VOC_inc_15_1x5/task_1_cls_15/dataset.yaml
+base_data_cfg:
+teacher_model: 
+# training settings
+epochs: 100
+batch: 16
+workers: 8
+device: 0
+frozen_layers:
