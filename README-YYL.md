@@ -80,10 +80,69 @@ $$
 ## 三、环境配置
 
 ```shell
-conda create -n yolo python=0 -y
+conda create -n yolo python=3.11 -y
 pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url https://download.pytorch.org/whl/cu118
 pip install -e . -v
 pip install PCAonGPU
 pip install scikit-learn
 pip install "numpy<2" # 一定要降低numpy版本，否则不兼容，降低版本以后可能会出现opencv-python版本不兼容的报错，但是不用管
+```
+
+## 四、环境复现与校验（一键使用）
+
+- 快速复现命令（Linux）：
+
+```bash
+conda create -n yolo python=3.11 -y
+conda activate yolo
+pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url https://download.pytorch.org/whl/cu118
+cd /hy-tmp/myultralytics
+pip install -e . -v
+pip install scikit-learn PCAonGPU
+pip install "numpy<2"
+# 如遇 OpenCV 与 numpy 版本警告或导入问题（可选）：
+pip install "opencv-python<4.8"
+```
+
+- 版本/导入校验：
+
+```bash
+conda activate yolo
+python - << 'PY'
+import torch, torchvision, torchaudio, numpy, sklearn, importlib
+print('torch', torch.__version__)
+print('torchvision', torchvision.__version__)
+print('torchaudio', torchaudio.__version__)
+print('numpy', numpy.__version__)
+print('sklearn', sklearn.__version__)
+try:
+    import cv2
+    print('cv2', cv2.__version__)
+except Exception as e:
+    print('cv2 import failed:', e)
+print('PCAonGPU importable:', bool(importlib.util.find_spec('PCAonGPU') or importlib.util.find_spec('pcaongpu')))
+from ultralytics import YOLO
+print('ultralytics import OK')
+PY
+yolo --help | head -n 5
+```
+
+- 已生成环境文件：`/hy-tmp/myultralytics/env-export.yml`，可用于复现：
+
+```bash
+conda env create -f /hy-tmp/myultralytics/env-export.yml
+conda activate yolo
+```
+
+- 提示：
+  - 若出现“Ultralytics config 目录不可写”提示，可设置：
+
+```bash
+export YOLO_CONFIG_DIR="$HOME/.config/Ultralytics"
+```
+
+  - `PCAonGPU` 的导入名可能为 `PCAonGPU` 或 `pcaongpu`；若导入失败可重装：
+
+```bash
+pip install --force-reinstall PCAonGPU
 ```

@@ -2,7 +2,14 @@ import os
 import shutil
 from tqdm import tqdm
 
+import cv2
+import torch
+import numpy as np
+from PIL import Image
+import torchvision.transforms as transforms
+from typing import Optional
 from torch.nn import Sequential
+from torch.nn import functional as F
 
 from ultralytics import YOLO
 from ultralytics.utils import YAML
@@ -244,3 +251,178 @@ def create_pseudo_labels_dataset(teacher_model, base_class_id_map, new_class_id_
             # 删除临时生成的伪标注文件
             if os.path.exists(os.path.join(save_dir, f"pseudo_labels")):
                 shutil.rmtree(os.path.join(save_dir, f"pseudo_labels"))
+
+
+# ============================ VAE 回放相关 ============================
+def _vae_patch_tensor(images: torch.Tensor, patch_size: int = 64, patch_stride: int = 64, patch_padding: int = 0) -> torch.Tensor:
+    """将 [N,C,H,W] 图像分块为 [N*L,C,K,K]，与 VAE 训练/推理保持一致。"""
+    unfolded = F.unfold(images, kernel_size=patch_size, stride=patch_stride, padding=patch_padding)
+    n, ckk, l = unfolded.shape
+    c = images.shape[1]
+    k = patch_size
+    patches = unfolded.permute(0, 2, 1).contiguous().view(n * l, c, k, k)
+    return patches
+
+
+def _vae_concat_patches(patches: torch.Tensor, image_hw=(640, 640), patch_size: int = 64, patch_stride: int = 64, patch_padding: int = 0) -> torch.Tensor:
+    """将 [L,C,K,K] 或 [N*L,C,K,K] 拼回 [N,C,H,W]；此处仅用于 N=1 情况。"""
+    h, w = image_hw
+    c = patches.shape[1]
+    k = patch_size
+    s = patch_stride
+    p = patch_padding
+    num_h = (h - k + 2 * p) // s + 1
+    num_w = (w - k + 2 * p) // s + 1
+    recon = torch.zeros(1, c, h, w, device=patches.device, dtype=patches.dtype)
+    count = torch.zeros(h, w, device=patches.device, dtype=patches.dtype)
+    idx = 0
+    for i in range(num_h):
+        for j in range(num_w):
+            sh, eh = i * s, i * s + k
+            sw, ew = j * s, j * s + k
+            recon[0, :, sh:eh, sw:ew] += patches[idx]
+            count[sh:eh, sw:ew] += 1
+            idx += 1
+    count = count.clamp(min=1)
+    recon = recon / count.unsqueeze(0).unsqueeze(0)
+    return recon
+
+
+def _load_vae(model_ckpt: str, device: str = "cuda", arch: str = "vq", latent_dim: int = 512):
+    """从 /root/vae-search/vae.py 加载 VAE 模型并恢复权重。"""
+    import sys
+    vae_repo = "/root/vae-search"
+    if vae_repo not in sys.path:
+        sys.path.append(vae_repo)
+    from vae import VQVAE, VanillaVAE  # type: ignore
+
+    if arch == "vq":
+        model = VQVAE(3, latent_dim, num_embeddings=512)
+    else:
+        model = VanillaVAE(3, latent_dim)
+    state = torch.load(model_ckpt, map_location=device)
+    state_dict = state.get("model_state_dict", state)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def _prepare_transform(image_size=(640, 640)):
+    return transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
+def build_vae_replay_dataset(
+    base_model: YOLO,
+    base_class_id_map: dict,
+    new_class_id_map: dict,
+    cfg_source: str,
+    save_dir: str,
+    target_dataset_classes: list,
+    vae_ckpt: str,
+    replay_source_images: str,
+    arch: str = "vq",
+    image_size=(640, 640),
+    patch_size: int = 64,
+    patch_stride: int = 64,
+    patch_padding: int = 0,
+    conf_threshold: float = 0.25,
+    device: str = "cuda",
+) -> str:
+    """
+    使用预训练 VAE 对给定目录的图像进行重构→用旧模型打伪标签→与原数据集合并，输出新的 dataconfig.yaml。
+
+    Args:
+        base_model: 旧任务教师模型（用于伪标签）
+        base_class_id_map/new_class_id_map: 类别映射
+        cfg_source: 原数据集 yaml
+        save_dir: 输出根目录（将在其下创建 training_dataset_with_pseudo_labels_replay）
+        target_dataset_classes: 完整类别列表
+        vae_ckpt: VAE 权重路径（如 /root/vae-search/logs/best.pt）
+        replay_source_images: 用于回放生成的源图像目录（建议用历史任务样本目录或 memory bank 图像目录）
+        arch: "vq" 或 "vanilla"
+    Returns:
+        新 dataconfig.yaml 路径
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    out_root = os.path.join(save_dir, "training_dataset_with_pseudo_labels_replay")
+    if os.path.exists(out_root):
+        shutil.rmtree(out_root)
+    os.makedirs(out_root, exist_ok=True)
+
+    # 1) 准备 VAE 与图像增广
+    vae = _load_vae(vae_ckpt, device=device, arch=arch)
+    tfm = _prepare_transform(image_size)
+
+    # 2) 遍历源目录，重构图像并保存到 out_root/images/train
+    images_out = os.path.join(out_root, "images", "train")
+    labels_out = os.path.join(out_root, "labels", "train")
+    os.makedirs(images_out, exist_ok=True)
+    os.makedirs(labels_out, exist_ok=True)
+
+    def _iter_images(root):
+        for name in os.listdir(root):
+            if name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")):
+                yield os.path.join(root, name)
+
+    for img_path in tqdm(list(_iter_images(replay_source_images)), desc="VAE replay reconstruct"):
+        try:
+            img = Image.open(img_path)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img_t = tfm(img).unsqueeze(0).to(device)
+            patches = _vae_patch_tensor(img_t, patch_size, patch_stride, patch_padding)
+            with torch.no_grad():
+                recon, *_ = vae(patches)
+            recon_full = _vae_concat_patches(recon, image_hw=image_size, patch_size=patch_size, patch_stride=patch_stride, patch_padding=patch_padding)
+            # 反标准化保存
+            mean = torch.tensor([0.485, 0.456, 0.406], device=recon_full.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=recon_full.device).view(1, 3, 1, 1)
+            recon_denorm = torch.clamp(recon_full * std + mean, 0, 1)
+            recon_np = (recon_denorm[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            recon_bgr = cv2.cvtColor(recon_np, cv2.COLOR_RGB2BGR)
+            out_name = os.path.basename(img_path)
+            out_img_path = os.path.join(images_out, out_name)
+            cv2.imwrite(out_img_path, recon_bgr)
+        except Exception:
+            continue
+
+    # 3) 复制原数据集其余 split，建立基础 yaml（沿用 create_pseudo_labels_dataset 的风格）
+    source_dataset_dir = os.path.dirname(cfg_source)
+    cfg = YAML.load(cfg_source)
+    for split in ["val", "test"]:
+        if split in cfg:
+            src_images = os.path.join(cfg.get("path", source_dataset_dir), cfg[split]) if "path" in cfg.keys() else os.path.join(source_dataset_dir, cfg[split])
+            src_labels = src_images.replace("images", "labels")
+            os.makedirs(os.path.join(out_root, "images", split), exist_ok=True)
+            os.makedirs(os.path.join(out_root, "labels", split), exist_ok=True)
+            if os.path.exists(src_images):
+                shutil.copytree(src_images, os.path.join(out_root, "images", split), dirs_exist_ok=True)
+            if os.path.exists(src_labels):
+                shutil.copytree(src_labels, os.path.join(out_root, "labels", split), dirs_exist_ok=True)
+
+    # 4) 用教师模型对重构的 train 图像打伪标签（保存到 labels/train）并做类别映射
+    results = base_model.predict(images_out, conf=conf_threshold, save_txt=True, save_conf=False, stream=True,
+                                 project=out_root, name=f"pseudo_labels/train", verbose=False)
+    for _ in tqdm(results, desc="Generate pseudo labels for replay", ncols=80):
+        pass
+    pseudo_labels_src = os.path.join(out_root, "pseudo_labels", "train", "labels")
+    if os.path.exists(pseudo_labels_src):
+        converted = read_labels_and_convert_class_id(pseudo_labels_src, base_class_id_map)
+        save_labels(converted, labels_out)
+        shutil.rmtree(os.path.join(out_root, "pseudo_labels"))
+
+    # 5) 写 dataconfig.yaml
+    config = {
+        "names": {i: cls for i, cls in enumerate(target_dataset_classes)}
+    }
+    for split in ["train", "val", "test"]:
+        if split in cfg:
+            config[split] = f"images/{split}"
+    data_yaml = os.path.join(out_root, "dataconfig.yaml")
+    YAML.save(data=config, file=data_yaml)
+    return data_yaml
