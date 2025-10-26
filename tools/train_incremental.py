@@ -5,7 +5,7 @@ import shutil
 
 from ultralytics.utils import YAML
 from ultralytics import YOLO
-from ultralytics.models.yolo.detect.train import VSPRegDetectionTrainer
+from ultralytics.models.yolo.detect.train import AntiForgetDetectionTrainer
 
 from incremental_utils import expand_detection_head, create_classes_expanded_dataset, create_pseudo_labels_dataset, build_vae_replay_dataset
 
@@ -95,13 +95,16 @@ def main():
 
         model.train(data=data_yaml_path, epochs=cfg["epochs"], batch=cfg["batch"], amp=False,
                     workers=cfg["workers"], device=cfg["device"], project=save_dir, freeze=cfg["frozen_layers"],
-                    trainer=VSPRegDetectionTrainer,
-                    teacher_model=teacher_model,
+                    trainer=AntiForgetDetectionTrainer,
+                    vspreg=cfg["vspreg"],
                     sample_images=pca_sample_images,
                     sample_labels=pca_sample_labels,
                     pca_sample_num=cfg["pca_sample_num"], projection_layers=cfg["projection_layers"],
                     pca_cache_save_path=pca_cache_save_path,
                     pca_cache_load_path=pca_cache_load_path,
+                    kd=cfg["kd"],
+                    distill_layers=cfg["distill_layers"],
+                    distiller=cfg["distiller"],
                     resume=resume)
     else:
         if checkpoint is not None:

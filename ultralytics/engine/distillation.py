@@ -1,8 +1,8 @@
 # Authored by https://blog.csdn.net/qq_40387714/article/details/148203432
 # Modified by YYL
 
-import traceback
 import math
+import warnings
 import time
 import warnings
 import torch
@@ -33,8 +33,6 @@ from ultralytics.utils.torch_utils import (
  
 _VALID_FEATURE_LOSS = {"cwd", "mgd", "at", "atm","skd", "pkd"}
 _VALID_LOGIT_LOSS = {'dkd', 'qf'}
-_YOLOV8_DISTILL_LAYER = ["12", "15", "18", "21"]
-# layers = ["2","4","6","8","12","15","18","21"]
 _LOSS_FACTOR_CWD = 0.15     # 
 _LOSS_FACTOR_MGD = 0.03     # pose-s+pose-m 测到最优参数：初始值0.04，权重衰减到0.25
 _LOSS_FACTOR_AT = 0.033     # pose-s+pose-m 测到最优参数：初始值0.033，权重衰减到0.1
@@ -532,7 +530,7 @@ class LogitLoss(nn.Module):
         return self.loss_fn(s_logit, t_logit, **extra) * self.loss_weight
  
  
-class YOLOv8DistillationLoss:
+class KDLoss:
     """
     用于插入YOLOv8主干训练流程，实现知识蒸馏损失计算与反向传播。
     调用方式：
@@ -566,14 +564,14 @@ class YOLOv8DistillationLoss:
                     if _match(n, lid):
                         ch_s.append(m.out_channels)
                         break
-                else:
-                    raise ValueError(f"Student layer {lid} not found")
+                # else:
+                    # warnings.warn(f"Student layer {lid} not found")
                 for n, m in model_t.named_modules():
                     if _match(n, lid):
                         ch_t.append(m.out_channels)
                         break
-                else:
-                    raise ValueError(f"Teacher layer {lid} not found")
+                # else:
+                    # warnings.warn(f"Teacher layer {lid} not found")
  
             print(f"\033[32mINFO:\033[0m  feature distiller: {self.distiller}")
             print(f"\033[32mINFO:\033[0m  student channels: {ch_s}")
@@ -761,357 +759,3 @@ class YOLOv8DistillationLoss:
                 return 1.0
  
         return 1.0
-
-
-class DistillationTrainer(BaseTrainer):
-    """ A variant of base trainer to support online model distillation
-    """
-    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
-        """
-        Initialize the DistillationTrainer class.
-
-        Args:
-            cfg (str, optional): Path to a configuration file.
-            overrides (dict, optional): Configuration overrides.
-            _callbacks (list, optional): List of callback functions.
-        """
-        # ============================== MODIFIED: add distillation parameter ===========================================
-        # 指定教师模型和损失函数类型（蒸馏方式）
-        self.teacher_model = overrides["teacher_model"]
-        if overrides and "distill_layers" in overrides:
-            self.distill_layers = overrides['distill_layers']
-        else:
-            self.distill_layers = _YOLOV8_DISTILL_LAYER # default to _YOLOV8_DISTILL_LAYER
-        if overrides and "loss_type" in overrides:
-            self.loss_type = overrides['loss_type']
-        else:
-            self.loss_type = "mgd" # default to mgd
-        # ============================== END: add distillation parameter ================================================
-        super().__init__(cfg, overrides, _callbacks)
-
-    def _setup_train(self, world_size):
-        """Build dataloaders and optimizer on correct rank process."""
-        ckpt = self.setup_model()
-        self.model = self.model.to(self.device)
-        self.set_model_attributes()
-
-        # ============================== MODIFIED: add distillation parameter ============================================
-        # teacher 放到相同 device
-        self.teacher_model = self.teacher_model.to(self.device).eval()
-        for p in self.teacher_model.parameters():  # 彻底冻结
-            p.requires_grad_(False)
-        # 创建蒸馏损失实例（这里就会 new FeatureLoss）
-        self.kd_loss = YOLOv8DistillationLoss(self.model, self.teacher_model, distill_layers=self.distill_layers, distiller=self.loss_type, device=self.device)
-        
-        # 计算并打印 KD-loss 相关的参数量
-        if self.kd_loss.distill_type.lower() == "feature":
-            # 统计 feature‐head（D_loss_fn）里的参数量
-            kd_params = sum(p.numel() for p in self.kd_loss.D_loss_fn.parameters())
-            LOGGER.info(f"{colorstr('Feature-level KD params:')} {kd_params/1e6:.2f} M")
-        else:
-            # logit‐level KD 只是额外计算一个 loss，没有新参数
-            LOGGER.info(f"{colorstr('Logit-level KD enabled, no extra sub-module parameters')}")
-        # ============================== END: add distillation parameter ==================================================
-
-        # Freeze layers
-        freeze_list = (
-            self.args.freeze
-            if isinstance(self.args.freeze, list)
-            else range(self.args.freeze)
-            if isinstance(self.args.freeze, int)
-            else []
-        )
-        always_freeze_names = [".dfl"]  # always freeze these layers
-        freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
-        self.freeze_layer_names = freeze_layer_names
-        for k, v in self.model.named_parameters():
-            # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-            if any(x in k for x in freeze_layer_names):
-                LOGGER.info(f"Freezing layer '{k}'")
-                v.requires_grad = False
-            elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
-                LOGGER.warning(
-                    f"setting 'requires_grad=True' for frozen layer '{k}'. "
-                    "See ultralytics.engine.trainer for customization of frozen layers."
-                )
-                v.requires_grad = True
-
-        # Check AMP
-        self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
-        if self.amp and RANK in {-1, 0}:  # Single-GPU and DDP
-            callbacks_backup = callbacks.default_callbacks.copy()  # backup callbacks as check_amp() resets them
-            self.amp = torch.tensor(check_amp(self.model), device=self.device)
-            callbacks.default_callbacks = callbacks_backup  # restore callbacks
-        if RANK > -1 and world_size > 1:  # DDP
-            dist.broadcast(self.amp.int(), src=0)  # broadcast from rank 0 to all other ranks; gloo errors with boolean
-        self.amp = bool(self.amp)  # as boolean
-        self.scaler = (
-            torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4 else torch.cuda.amp.GradScaler(enabled=self.amp)
-        )
-        if world_size > 1:
-            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
-
-        # Check imgsz
-        gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
-        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
-        self.stride = gs  # for multiscale training
-
-        # Batch size
-        if self.batch_size < 1 and RANK == -1:  # single-GPU only, estimate best batch size
-            self.args.batch = self.batch_size = self.auto_batch()
-
-        # Dataloaders
-        batch_size = self.batch_size // max(world_size, 1)
-        self.train_loader = self.get_dataloader(
-            self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
-        )
-        if RANK in {-1, 0}:
-            # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
-            self.test_loader = self.get_dataloader(
-                self.data.get("val") or self.data.get("test"),
-                batch_size=batch_size if self.args.task == "obb" else batch_size * 2,
-                rank=-1,
-                mode="val",
-            )
-            self.validator = self.get_validator()
-            metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
-            self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
-            self.ema = ModelEMA(self.model)
-            if self.args.plots:
-                self.plot_training_labels()
-
-        # Optimizer
-        self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
-        weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
-        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
-        self.optimizer = self.build_optimizer(
-            model=self.model,
-            name=self.args.optimizer,
-            lr=self.args.lr0,
-            momentum=self.args.momentum,
-            decay=weight_decay,
-            iterations=iterations,
-        )
-        # Scheduler
-        self._setup_scheduler()
-        self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
-        self.resume_training(ckpt)
-        self.scheduler.last_epoch = self.start_epoch - 1  # do not move
-        self.run_callbacks("on_pretrain_routine_end")
-
-    def _do_train(self, world_size=1):
-        """Train the model with the specified world size."""
-        if world_size > 1:
-            self._setup_ddp(world_size)
-        self._setup_train(world_size)
-
-        nb = len(self.train_loader)  # number of batches
-        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
-        last_opt_step = -1
-        self.epoch_time = None
-        self.epoch_time_start = time.time()
-        self.train_time_start = time.time()
-        self.run_callbacks("on_train_start")
-        LOGGER.info(
-            f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
-            f"Using {self.train_loader.num_workers * (world_size or 1)} dataloader workers\n"
-            f"Logging results to {colorstr('bold', self.save_dir)}\n"
-            f"Starting training for " + (f"{self.args.time} hours..." if self.args.time else f"{self.epochs} epochs...")
-        )
-        if self.args.close_mosaic:
-            base_idx = (self.epochs - self.args.close_mosaic) * nb
-            self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
-        epoch = self.start_epoch
-        self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
-        while True:
-            self.epoch = epoch
-            self.run_callbacks("on_train_epoch_start")
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
-                self.scheduler.step()
-
-            self._model_train()
-            if RANK != -1:
-                self.train_loader.sampler.set_epoch(epoch)
-            pbar = enumerate(self.train_loader)
-            # Update dataloader attributes (optional)
-            if epoch == (self.epochs - self.args.close_mosaic):
-                self._close_dataloader_mosaic()
-                self.train_loader.reset()
-
-            if RANK in {-1, 0}:
-                LOGGER.info(self.progress_string())
-                pbar = TQDM(enumerate(self.train_loader), total=nb)
-            self.tloss = None
-
-            # ============================== MODIFIED: add distillation parameter ============================================
-            self.kd_loss_sum = 0.0  # 蒸馏损失
-            self.or_loss_sum = 0.0  # 原始损失
-            self.loss_count = 0     # epoch的step数
-            self.kd_loss.register_hook() # 为教师模型注册hook函数
-            # ============================== END: add distillation parameter ================================================
-
-            for i, batch in pbar:
-                self.run_callbacks("on_train_batch_start")
-                # Warmup
-                ni = i + nb * epoch
-                if ni <= nw:
-                    xi = [0, nw]  # x interp
-                    self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round()))
-                    for j, x in enumerate(self.optimizer.param_groups):
-                        # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                        x["lr"] = np.interp(
-                            ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x["initial_lr"] * self.lf(epoch)]
-                        )
-                        if "momentum" in x:
-                            x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
-
-                # Forward
-                with autocast(self.amp):
-                    batch = self.preprocess_batch(batch)
-                    loss, self.loss_items = self.model(batch)
-                    self.loss = loss.sum()
-                    if RANK != -1:
-                        self.loss *= world_size
-                    self.tloss = (
-                        (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
-                    )
-
-                    # ============================== MODIFIED: add distillation parameter ===================================
-                    with torch.no_grad():
-                        _ = self.teacher_model(batch['img'])
-
-                    bs = batch['img'].shape[0]                  # 本进程 mini-batch
-                    ws = world_size if RANK != -1 else 1        # DDP 时为 8、16…；单机=1
-                    scale = bs * ws
-                    
-                    # 获取蒸馏损失及其衰减权重
-                    raw_d_loss_weight = self.kd_loss.get_kd_weight(epoch=self.epoch, total_epochs=self.epochs)
-                    raw_d_loss = self.kd_loss.get_loss() * raw_d_loss_weight
-                    
-                    self.kd_loss_sum += raw_d_loss.item()
-                    self.or_loss_sum += (self.loss.detach().item()) / scale if scale else 0
-                    self.loss_count += 1
-
-                    self.d_loss = raw_d_loss * scale
-                    # print(f"or_loss: {self.loss / scale:.2f}, kd_loss: {raw_d_loss:.2f}, ratio: {self.d_loss / self.loss:.2f} kd_weight: {raw_d_loss_weight:.6f}")
-
-                    self.loss += self.d_loss
-                    # ============================== END: add distillation parameter ========================================
-
-                # Backward
-                self.scaler.scale(self.loss).backward()
-
-                # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
-                if ni - last_opt_step >= self.accumulate:
-                    self.optimizer_step()
-                    last_opt_step = ni
-
-                    # Timed stopping
-                    if self.args.time:
-                        self.stop = (time.time() - self.train_time_start) > (self.args.time * 3600)
-                        if RANK != -1:  # if DDP training
-                            broadcast_list = [self.stop if RANK == 0 else None]
-                            dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
-                            self.stop = broadcast_list[0]
-                        if self.stop:  # training time exceeded
-                            break
-
-                # Log
-                if RANK in {-1, 0}:
-                    loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
-                    pbar.set_description(
-                        ("%11s" * 2 + "%11.4g" * (2 + loss_length))
-                        % (
-                            f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                            batch["cls"].shape[0],  # batch size, i.e. 8
-                            batch["img"].shape[-1],  # imgsz, i.e 640
-                        )
-                    )
-                    self.run_callbacks("on_batch_end")
-                    if self.args.plots and ni in self.plot_idx:
-                        self.plot_training_samples(batch, ni)
-
-                self.run_callbacks("on_train_batch_end")
-
-            # ============================== MODIFIED: add distillation parameter ===========================================
-            self.kd_loss.remove_handle_() # 移除教师模型的hook函数
- 
-            if self.loss_count: # 避免loss_count为0
-                kd_mean = self.kd_loss_sum / self.loss_count
-                or_mean = self.or_loss_sum / self.loss_count
-                ratio = kd_mean / or_mean if or_mean else 0
-                # 保存到 trainer 上，给回调用
-                self.tb_kd_mean = kd_mean
-                self.tb_or_mean = or_mean
-                self.tb_kd_ratio = ratio
-                print(f"kd_mean: {kd_mean:.2f}, or_mean: {or_mean:.2f}, ratio: {ratio:.2f}")
-                self.run_callbacks("on_show_distillation_loss")    # 触发回调
-            # ============================== END: add distillation parameter ================================================
-
-            self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
-            self.run_callbacks("on_train_epoch_end")
-            if RANK in {-1, 0}:
-                final_epoch = epoch + 1 >= self.epochs
-                self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
-
-                # Validation
-                if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
-                    self._clear_memory(threshold=0.5)  # prevent VRAM spike
-                    self.metrics, self.fitness = self.validate()
-                self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
-                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
-                if self.args.time:
-                    self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
-
-                # Save model
-                if self.args.save or final_epoch:
-                    self.save_model()
-                    self.run_callbacks("on_model_save")
-
-            # Scheduler
-            t = time.time()
-            self.epoch_time = t - self.epoch_time_start
-            self.epoch_time_start = t
-            if self.args.time:
-                mean_epoch_time = (t - self.train_time_start) / (epoch - self.start_epoch + 1)
-                self.epochs = self.args.epochs = math.ceil(self.args.time * 3600 / mean_epoch_time)
-                self._setup_scheduler()
-                self.scheduler.last_epoch = self.epoch  # do not move
-                self.stop |= epoch >= self.epochs  # stop if exceeded epochs
-            self.run_callbacks("on_fit_epoch_end")
-            self._clear_memory(0.5)  # clear if memory utilization > 50%
-
-            # Early Stopping
-            if RANK != -1:  # if DDP training
-                broadcast_list = [self.stop if RANK == 0 else None]
-                dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
-                self.stop = broadcast_list[0]
-            if self.stop:
-                break  # must break all DDP ranks
-            epoch += 1
-
-        if RANK in {-1, 0}:
-            # Do final val with best.pt
-            seconds = time.time() - self.train_time_start
-            LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
-            self.final_eval()
-            if self.args.plots:
-                self.plot_metrics()
-            self.run_callbacks("on_train_end")
-        self._clear_memory()
-        unset_deterministic()
-        self.run_callbacks("teardown")
-
- 
-if __name__ == '__main__':
-    from ultralytics import YOLO
-    model_s_path = "/root/myultralytics/runs/yolov8l_voc_inc_15_5_fromscratch_naive/task-2/best.pt"
-    model_t_path = "/root/myultralytics/runs/yolov8l_voc_inc_15_5_fromscratch_naive/task-2/yolov8l_expanded.pt"
- 
-    model_s = YOLO(model_s_path)
-    model_t = YOLO(model_t_path)
- 
-    distill = YOLOv8DistillationLoss(model_s.model, model_t.model, distill_layers=_YOLOV8_DISTILL_LAYER, distiller="CWD")

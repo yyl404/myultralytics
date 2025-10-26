@@ -127,10 +127,12 @@ cfg: # (str, optional) for overriding defaults.yaml
 tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yaml]
 
 # Distillation settings --------------------------------------------------------------------------------------------------
-teacher_model: None
-loss_type: "mgd"
+kd: True # (bool) whether to use knowledge distillation
+distill_layers: None # (list[str], optional)
+distiller: "mgd" # (str) distiller type, choices=[mgd, cwdf, at, atm, skd, pkd]
 
 # projection settings ----------------------------------------------------------------------------------------------------
+vspreg: True # (bool) whether to use VSPReg
 projection_layers: None # (list[str], optional)
 sample_images: None # (str, optional)
 sample_labels: None # (str, optional)
