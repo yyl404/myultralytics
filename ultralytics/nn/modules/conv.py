@@ -11,6 +11,7 @@ import torch.nn as nn
 __all__ = (
     "Conv",
     "Conv2",
+    "DecomposedConv",
     "LightConv",
     "DWConv",
     "DWConvTranspose2d",
@@ -154,6 +155,73 @@ class Conv2(Conv):
         self.forward = self.forward_fuse
 
 
+class DecomposeConv(nn.Module):
+    """
+    Conv module with decomposed convolution(from matrix decomposition perspective)
+
+    Args:
+        c1 (int): Number of input channels.
+        c2 (int): Number of output channels.
+        k (int): Kernel size.
+        s (int): Stride.
+        p (int, optional): Padding.
+        g (int): Groups.
+        d (int): Dilation.
+        act (bool | nn.Module): Activation function.
+        cr (int, optional): Number of compressed channels.
+        linear_first (bool): Whether the first convolution is 1x1 convolution(True/False represent different decomposition perspective).
+    """
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, cr=None, linear_first=True):
+        super().__init__()
+        self.linear_first = linear_first
+        self.conv_args = (c1, c2, k, s, p, g, d, act, cr)
+        if cr is None:
+            cr = c1
+        if self.linear_first:
+            self.conv_1 = nn.Conv2d(c1, cr, 1, groups=g, bias=False)
+            self.conv_2 = nn.Conv2d(cr, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        else:
+            self.conv_1 = nn.Conv2d(c1, cr, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+            self.conv_2 = nn.Conv2d(cr, c2, 1, groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv_2(self.conv_1(x))))
+
+    def forward_fuse_convs(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+    def fuse_convs(self):
+        """Fuse the decomposed convolutions."""
+        with torch.no_grad():
+            c1, c2, k, s, p, g, d, act, cr = self.conv_args
+            self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+            
+            if self.linear_first:
+                w1 = self.conv_1.weight.data.reshape(g, cr//g, c1//g) # (cr, c1//g, 1, 1) --> (g, cr//g, c1//g)
+                w2 = self.conv_2.weight.data.permute((2,3,0,1)) # (c2, cr//g, k, k) --> (k, k, c2, cr//g)
+                w2 = w2.reshape(k, k, g, c2//g, cr//g) # (k, k, c2, cr//g) --> (k, k, g, c2//g, cr//g)
+                w = w2 @ w1 # (k, k, g, c2//g, cr//g) @ (g, cr//g, c1//g) --> (k, k, g, c2//g, c1//g)
+                w = w.reshape(k, k, c2, c1//g) # (k, k, g, c2//g, c1//g) --> (k, k, c2, c1//g)
+                w = w.permute((2,3,0,1)) # (k, k, c2, c1//g) --> (c2, c1//g, k, k)
+            else:
+                w1 = self.conv_1.weight.data.reshape(g, cr//g, c1//g*k*k) # (cr, c1//g, k, k) --> (g, cr//g, c1//g*k*k)
+                w2 = self.conv_2.weight.data.reshape(g, c2//g, cr//g) # (c2, cr//g, 1, 1) --> (g, c2//g, cr//g)
+                w = w2 @ w1 # (g, c2//g, cr//g) @ (g, cr//g, c1//g*k*k) --> (g, c2//g, c1//g*k*k)
+                w = w.reshape(c2, c1//g, k, k) # (g, c2//g, c1//g*k*k) --> (c2, c1//g, k, k)
+
+            self.conv.weight.data = w.detach()
+
+            # No bias should be in first convolution
+            if self.conv_2.bias is not None:
+                self.conv.register_parameter("bias", nn.Parameter(self.conv_2.bias.data.detach()))
+            
+            self.__delattr__("conv_1")
+            self.__delattr__("conv_2")
+            self.forward = self.forward_fuse_convs
+
+
 class LightConv(nn.Module):
     """
     Light convolution module with 1x1 and depthwise convolutions.
@@ -209,6 +277,23 @@ class DWConv(Conv):
         """
         super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
 
+
+class DecomposedDWConv(DecomposeConv):
+    """
+    Depth-wise convolution module with decomposed convolution(from matrix decomposition perspective)
+
+    Args:
+        c1 (int): Number of input channels.
+        c2 (int): Number of output channels.
+        k (int): Kernel size.
+        s (int): Stride.
+        d (int): Dilation.
+        act (bool | nn.Module): Activation function.
+        cr (int, optional): Number of compressed channels.
+        linear_first (bool): Whether the first convolution is 1x1 convolution(True/False represent different decomposition perspective).
+    """
+    def __init__(self, c1, c2, k=1, s=1, d=1, act=True, cr=None, linear_first=True):
+        super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act, cr=cr, linear_first=linear_first)
 
 class DWConvTranspose2d(nn.ConvTranspose2d):
     """Depth-wise transpose convolution module."""

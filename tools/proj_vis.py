@@ -25,22 +25,26 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import math
+from tqdm import tqdm
+
 import torch
 from torch import nn
 import torch.nn.functional as F
 
 from ultralytics import YOLO
+from ultralytics.nn.modules import Conv
 
 
 def flatten_augment_kernel(module):
-    if module.bias is not None:
+    assert isinstance(module, Conv), "Module must be a convolutional module"
+    if module.conv.bias is not None:
         # If bias exists, augment the weight matrix to represent convolution
         # as a homogeneous linear transformation: [W; b] * [x^T; 1]^T = W*x + b
-        weight = module.weight.reshape(module.weight.shape[0], -1)
-        bias = module.bias.reshape(module.bias.shape[0], -1)
+        weight = module.conv.weight.reshape(module.conv.weight.shape[0], -1)
+        bias = module.conv.bias.reshape(module.conv.bias.shape[0], -1)
         kernel = torch.cat([weight, bias], dim=1)
     else:
-        kernel = module.weight.reshape(module.weight.shape[0], -1)
+        kernel = module.conv.weight.reshape(module.conv.weight.shape[0], -1)
     return kernel
 
 
@@ -140,9 +144,14 @@ def plot_histgram(cosine_similarity_windowed, window_size, variances, means_rota
     # Calculate mean across kernels for each component
     cosine_sim_mean = np.mean(cosine_sim_windowed_np, axis=0)
     
-    # Plot points of cosine sim
-    ax1_sim.plot(x, cosine_sim_mean, 'o-', color='red', 
-                linewidth=2, markersize=4, alpha=0.8, label='Windowed Cosine Similarity')
+    # Plot points of cosine sim (only if there's actual data)
+    if np.any(cosine_sim_mean != 0):
+        ax1_sim.plot(x, cosine_sim_mean, 'o-', color='red', 
+                    linewidth=2, markersize=4, alpha=0.8, label='Windowed Cosine Similarity')
+    else:
+        # If no cosine similarity data, plot a horizontal line at y=0 with different styling
+        ax1_sim.plot(x, cosine_sim_mean, '--', color='gray', 
+                    linewidth=1, alpha=0.5, label='No Kernel Update Data')
     
     # Add milestone lines
     colors = ['red', 'orange', 'green', 'purple']
@@ -184,8 +193,6 @@ def plot_histgram(cosine_similarity_windowed, window_size, variances, means_rota
     save_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
-    print(f"Saved histogram plot: {save_path}")
 
 
 def plot_polar(cosine_similarity_cumsum, kernel_update, module_name, milestones, milestones_indices, save_dir):
@@ -291,8 +298,6 @@ def plot_polar(cosine_similarity_cumsum, kernel_update, module_name, milestones,
     save_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
-    print(f"Saved polar projection plot: {save_path}")
 
 
 def main(args):
@@ -302,21 +307,61 @@ def main(args):
         args(Namespace): The arguments.
     """
     # Load the PCA cache
-    pca_cache = joblib.load(args.pca_cache_path)
+    try:
+        print(f"Loading PCA cache from: {args.pca_cache_path}")
+        pca_cache = joblib.load(args.pca_cache_path)
+        print(f"Successfully loaded PCA cache with {len(pca_cache)} modules")
+    except FileNotFoundError:
+        print(f"Error: PCA cache file not found: {args.pca_cache_path}")
+        return
+    except Exception as e:
+        print(f"Error loading PCA cache: {e}")
+        return
+    
     # Load the base model
-    base_model = YOLO(args.base_model).model
+    if args.base_model is not None:
+        try:
+            print(f"Loading base model from: {args.base_model}")
+            base_model = YOLO(args.base_model).model
+            print("Successfully loaded base model")
+        except FileNotFoundError:
+            print(f"Error: Base model file not found: {args.base_model}")
+            base_model = None
+        except Exception as e:
+            print(f"Error loading base model: {e}")
+            base_model = None
+    else:
+        base_model = None
+        
     # Load the incremental model
-    incremental_model = YOLO(args.incremental_model).model
+    if args.incremental_model is not None:
+        try:
+            print(f"Loading incremental model from: {args.incremental_model}")
+            incremental_model = YOLO(args.incremental_model).model
+            print("Successfully loaded incremental model")
+        except FileNotFoundError:
+            print(f"Error: Incremental model file not found: {args.incremental_model}")
+            incremental_model = None
+        except Exception as e:
+            print(f"Error loading incremental model: {e}")
+            incremental_model = None
+    else:
+        incremental_model = None
 
     # auto set device to cpu or cuda
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    base_model.to(device).eval()
-    incremental_model.to(device).eval()
+    # Only process kernel updates if both models are provided
+    if base_model is not None and incremental_model is not None:
+        base_model.to(device).eval()
+        incremental_model.to(device).eval()
 
-    for (module_name, base_module), (incremental_module_name, incremental_module) in zip(base_model.named_modules(), incremental_model.named_modules()):
-        assert module_name == incremental_module_name, "Module names do not match"
-        if module_name in pca_cache.keys():
+        base_modules = [(name, module) for name, module in base_model.named_modules() if isinstance(module, Conv) and name in pca_cache.keys()]
+        incremental_modules = [(name, module) for name, module in incremental_model.named_modules() if isinstance(module, Conv) and name in pca_cache.keys()]
+        pbar = tqdm(zip(base_modules, incremental_modules), desc="Processing modules", total=len(base_modules))
+        for (module_name, base_module), (incremental_module_name, incremental_module) in pbar:
+            assert module_name == incremental_module_name, "Module names do not match"
+            pbar.set_description(f"Processing module: {module_name}")
             pca_operator = pca_cache[module_name]
             base_kernel = flatten_augment_kernel(base_module)
             incremental_kernel = flatten_augment_kernel(incremental_module)
@@ -355,13 +400,62 @@ def main(args):
             # plot
             plot_histgram(cosine_similarity_windowed, window_size, variances, means_rotated, module_name, milestones, milestones_indices, args.save_dir)
             plot_polar(cosine_similarity_cumsum, kernel_update, module_name, milestones, milestones_indices, args.save_dir)
+    else:
+        print("Warning: base_model or incremental_model not provided. Skipping kernel update projection plots.")
+        print("Only PCA variance and mean plots will be generated.")
+        
+        # Generate plots for PCA statistics only (without kernel updates)
+        print(f"Found {len(pca_cache)} modules in PCA cache: {list(pca_cache.keys())}")
+        
+        if len(pca_cache) == 0:
+            print("Error: PCA cache is empty. No plots will be generated.")
+            return
+            
+        for module_name in pca_cache.keys():
+            print(f"Processing module: {module_name}")
+            pca_operator = pca_cache[module_name]
+            
+            # Check if PCA operator has valid data
+            if not hasattr(pca_operator, 'explained_variance_') or len(pca_operator.explained_variance_) == 0:
+                print(f"Warning: Module {module_name} has no PCA data. Skipping.")
+                continue
+                
+            # calculate milestones indices
+            milestones = [0.75, 0.90, 0.95, 0.99]
+            variances = pca_operator.explained_variance_.to(device) # (num_components)
+            variances_cumsum = torch.cumsum(variances, dim=0) # (num_components)
+            variances_cumsum_ratio = variances_cumsum / variances_cumsum[-1] # (num_components)
+            milestones_indices = []
+            for milestone in milestones:
+                for i in range(len(variances_cumsum_ratio)):
+                    if variances_cumsum_ratio[i] >= milestone:
+                        milestones_indices.append(i)
+                        break
+
+            # other statistics
+            means = pca_operator.mean_.to(device) # (dim_feat)
+            components = F.normalize(pca_operator.components_.to(device), p=2, dim=1) # (num_components, dim_feat)
+            # Transform means to the PCA coordinate space using the rotation matrix (components_)
+            # means_rotated = means @ components.T, where components is the rotation matrix
+            means_rotated = torch.matmul(means.unsqueeze(0), components.T).squeeze(0) # (num_components)
+
+            print(f"  - Variances shape: {variances.shape}")
+            print(f"  - Means rotated shape: {means_rotated.shape}")
+            print(f"  - Milestones indices: {milestones_indices}")
+            
+            # Create dummy cosine similarity data for plotting (all zeros)
+            dummy_cosine_similarity_windowed = torch.zeros(1, len(variances), device=device)
+            
+            # plot only variance and mean histograms
+            plot_histgram(dummy_cosine_similarity_windowed, 1, variances, means_rotated, module_name, milestones, milestones_indices, args.save_dir)
+            print(f"  - Generated plot for {module_name}")
 
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pca_cache_path", type=str, required=True)
-    parser.add_argument("--base_model", type=str, required=True)
-    parser.add_argument("--incremental_model", type=str, required=True)
+    parser.add_argument("--base_model", type=str, default=None)
+    parser.add_argument("--incremental_model", type=str, default=None)
     parser.add_argument("--save_dir", type=str, required=True)
     args = parser.parse_args()
     main(args)

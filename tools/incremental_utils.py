@@ -1,6 +1,7 @@
 import os
 import shutil
 from tqdm import tqdm
+import argparse
 
 import cv2
 import torch
@@ -12,7 +13,7 @@ from torch.nn import Sequential
 from torch.nn import functional as F
 
 from ultralytics import YOLO
-from ultralytics.utils import YAML
+from ultralytics.utils import YAML, LOGGER
 from ultralytics.nn.tasks import yaml_model_load, DetectionModel, Detect
 
 
@@ -27,6 +28,8 @@ def convert_class_id(label_lines, class_id_map):
                 new_cat_id = class_id_map[old_cat_id]
                 parts[0] = str(new_cat_id)
                 converted_lines.append(' '.join(parts) + '\n')
+            else:
+                LOGGER.warning(f"Class ID {old_cat_id} not found in class_id_map")
     return converted_lines
 
 
@@ -426,3 +429,31 @@ def build_vae_replay_dataset(
     data_yaml = os.path.join(out_root, "dataconfig.yaml")
     YAML.save(data=config, file=data_yaml)
     return data_yaml
+
+
+def main(args):
+    if args.convert_dataset_class_id:
+        model = YOLO(args.model_path)
+        model_classes = [model.names[i] for i in sorted(model.names.keys())]
+        
+        data_cfg = YAML.load(args.data_cfg)
+        source_classes = [data_cfg["names"][i] for i in sorted(data_cfg["names"].keys())]
+        
+        class_id_map = {}
+        for i, cls in enumerate(source_classes):
+            class_id_map[i] = model_classes.index(cls)
+            
+        create_classes_expanded_dataset(args.data_cfg, class_id_map, args.save_dir, args.target_dataset_name, model_classes)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # 转换数据集类别ID
+    parser.add_argument("--convert_dataset_class_id", action="store_true", help="Convert dataset class id")
+    parser.add_argument("--data_cfg", type=str, required=True, help="Data config path")
+    parser.add_argument("--model_path", type=str, required=True, help="Model path")
+    parser.add_argument("--save_dir", type=str, required=True, help="Save directory")
+    parser.add_argument("--target_dataset_name", type=str, required=True, help="Target dataset name")
+    args = parser.parse_args()
+
+    main(args)

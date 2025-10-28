@@ -123,7 +123,7 @@ class VSPRegLoss:
     def get_loss(self):
         loss = 0
         for n in self.module_names:
-            proj = self.components[n] # [c_out, c_in*k*k]
+            proj = self.components[n] # [c_in*k*k, c_in*k*k]
             scale = torch.sqrt(self.variances[n]) # [c_in*k*k]
             bias = self.means[n] # [c_in*k*k]
             

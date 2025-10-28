@@ -229,3 +229,129 @@ $$
 压缩后的卷积模块参数量是$O(c\times r + r\times d)$，计算量是$O(c\times r \times L+r\times d\times L)$。
 
 如果说卷积模块的输入和输出激活值在潜在空间当中确实具有分布稀疏性，那么通过这种方式构造的压缩模型，应该仅需要少量微调就可以恢复到压缩前的精度。如果这是成立的，那么通过冻结这部分压缩后的参数，就构成了增量学习的第一步基础。
+
+
+# 2025/10/28
+
+26日的实验尚未完成，需要重新推导卷积核的分解公式：
+
+## 分解方式1：以感受野尺寸作为潜在空间维度
+
+将输入的特征（经过了padding）$\bm X\in\R^{C_{in}\times h\times w}$和卷积核的权重$\bm W\in\R^{C_{out}\times\frac{C_{in}}{G}\times k\times k}$分别按照分组数$G$进行分组，得到
+
+$$
+\begin{align*}
+\bm X_g&\in\R^{\frac{C_{in}}{G}\times h\times w}\\
+\bm W_g&\in\R^{\frac{C_{out}}{G}\times\frac{C_{in}}{G}\times k\times k}\\
+g&\in\{1,2,\dots,G\}
+\end{align*}
+$$
+
+将分组卷积核展开，得到
+
+$$
+\bm W_g\in\R^{\frac{C_{out}}{G}\times\frac{C_{in}}{G} k^2}
+$$
+
+对于每一个分组的输入特征，通过滑动窗口的方式，按照卷积操作时的感受野尺寸，将其展开为列向量矩阵
+
+$$
+\bm X_g\in\R^{\frac{C_{in}}{G}k^2\times L}
+$$
+
+其中$L$根据卷积操作时步长和卷积核尺寸决定，公式为（无需padding值，因为$\bm X$已经在处理之前padding了）
+$$
+L = \left\lfloor \frac{h - k}{s} + 1 \right\rfloor \times \left\lfloor \frac{w - k}{s} + 1 \right\rfloor
+$$
+
+无偏置的情况下
+$$
+\begin{align*}
+\bm W*\bm X&=\begin{bmatrix}\bm W_1\bm X_1\\
+\bm W_2\bm X_2\\
+\vdots\\
+\bm W_G\bm X_G\end{bmatrix}\\
+&=\begin{bmatrix}\bm W_1\bm P_1^T\bm P_1\bm X_1\\
+\bm W_2\bm P_2^T\bm P_2\bm X_2\\
+\vdots\\
+\bm W_G\bm P_G^T\bm P_G\bm X_G\end{bmatrix}\\
+&=\begin{bmatrix}\bm W_1\bm P_1^T\bm R^T\cdot\bm R\bm P_1\bm X_1\\
+\bm W_2\bm P_2^T\bm R^T\cdot\bm R\bm P_2\bm X_2\\
+\vdots\\
+\bm W_G\bm P_G^T\bm R^T\cdot\bm R\bm P_G\bm X_G\end{bmatrix}\\
+&=\begin{bmatrix}\bm A_1\cdot\bm B_1\bm X_1\\
+\bm A_2\cdot\bm B_2\bm X_2\\
+\vdots\\
+\bm A_G\cdot\bm B_G\bm X_G\end{bmatrix}
+\end{align*}
+$$
+其中$\bm A_g=\bm W_g\bm P_g^T\bm R^T,\ \bm B_g = \bm R\bm P_g$，$\bm P_g$是通过PCA找到的对特定分组特征进行正交变换从而将坐标轴对齐主成分方向的矩阵，$\bm R=[\bm I_{(r)},\bm 0]$是方向选择矩阵，其中的$r$根据在每一个分组内，方差在主成分方向索引的$p$分位数最大值选取。
+
+$\bm B_g\bm X_g$可以用与初始卷积相同尺度和分组的卷积模块实现，$\bm A_g$可以用$1\times 1$的通道线性映射卷积模块实现。如果有偏置，可以统一放在后一个分解模块中。
+
+反过来说，已知分解以后的卷积核权重是$\bm B\in\R^{rG\times\frac{C_{in}}{G}\times k\times k}$，线性映射卷积权重是$\bm A\in\R^{C_{out}\times r\times 1\times 1}$，那么还原回原始卷积权重的方法是，首先对卷积核进行分组与展开：
+
+$$
+\begin{align*}
+\bm B_g&\in\R^{r\times\frac{C_{in}}{G}k^2}\\
+\bm A_g&\in\R^{\frac{C_{out}}{G}\times r}
+\end{align*}
+$$
+
+然后作矩阵乘法
+
+$$
+\begin{align*}
+\bm W_g &= \bm A_g \bm B_g\in\R^{\frac{C_{out}}{G}\times \frac{C_{in}}{G}k^2}
+\end{align*}
+$$
+
+再还原为$\bm W_g\in\R^{\frac{C_{out}}{G}\times \frac{C_{in}}{G}\times k\times k}$，并且拼接为$\bm W\in\R^{C_{out}\times \frac{C_{in}}{G}\times k\times k}$
+
+
+## 分解方式2：以输入通道数为潜在空间维度
+
+与方式1相同，对于输入的特征和卷积核权重进行分组：
+
+$$
+\begin{align*}
+\bm X_g&\in\R^{\frac{C_{in}}{G}\times h\times w}\\
+\bm W_g&\in\R^{\frac{C_{out}}{G}\times\frac{C_{in}}{G}\times k\times k}\\
+g&\in\{1,2,\dots,G\}
+\end{align*}
+$$
+
+但是我们不再对$\bm X_g$进行滑动窗口式的展开，而是直接将卷积操作表示一系列矩阵乘法的求和：
+
+$$
+\begin{align*}
+\bm W_g*\bm X_g&=\sum_{i,j=0}^{k-1}W_g[:,:,i,j]\bm X_g[:,i::s,j::s]
+\end{align*}
+$$
+
+其中$s$是卷积步长。
+
+于是，我们对矩阵乘法$\bm W_g*\bm X_g=\sum_{i,j=0}^{k-1}\bm W_g[:,:,i,j]\bm X_g[:,i::s,j::s]$进行分解，公式如下：
+
+$$
+\begin{align*}
+\bm W_g*\bm X_g&=\sum_{i,j=0}^{k-1}\bm W_g[:,:,i,j]\bm X_g[:,i::s,j::s]
+\\
+&=\sum_{i,j=0}^{k-1}\bm W_g[:,:,i,j]\bm P_g^T\bm R^T\cdot\bm R\bm P_g\bm X_g[:,i::s,j::s]\\
+&=\sum_{i,j=0}^{k-1}\bm A_g[:,:,i,j]\cdot \bm B_g\bm X_g[:,i::s,j::s]
+\end{align*}
+$$
+
+其中$\bm A_g[:,:,i,j]=\bm W_g[:,:,i,j]\bm P_g^T\bm R^T,\ \bm B_g = \bm R\bm P_g$，$\bm P_g$是通过PCA找到的对特定分组特征进行正交变换从而将坐标轴对齐主成分方向的矩阵，$\bm R=[\bm I_{(r)},\bm 0]$是方向选择矩阵，其中的$r$根据在每一个分组内，方差在主成分方向索引的$p$分位数最大值选取。需要注意的是，在这里，PCA分析时，是以$\bm X$在通道方向上的像素柱作为特征向量，而不是以展开的感受野作为特征向量。
+
+$\bm B_g\bm X_g[:,i::s,j::s]$可以用$1\times 1$的通道线性映射卷积模块实现。$\sum_{i,j=0}^{k-1}\bm A_g[:,:,i,j]\cdot(\cdots)$可以用与初始卷积相同尺度和分组的卷积模块实现。如果有偏置，可以统一放在后一个分解模块中。
+
+反过来说，已知分解以后的$1\times 1$线性映射卷积权重是$\bm B\in\R^{rG\times\frac{C_{in}}{G}\times 1\times 1}$，卷积权重是$\bm A\in\R^{C_{out}\times r\times k\times k}$，那么还原回原始卷积权重的公式是：
+
+$$
+\begin{align*}
+\bm W_g[:,:,i,j] &= \bm A_g[:,:,i,j] \bm B_g = \bm A_g[:,:,i,j] \bm R\bm P_g
+\end{align*}
+$$
+
+其中$\bm A_g \in \R^{\frac{C_{out}}{G} \times r}$是$\bm A$的第$g$个分组对应的子矩阵。

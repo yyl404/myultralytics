@@ -93,19 +93,21 @@ def main():
                 device=str(cfg.get("device", args.device)) if hasattr(args, "device") else "cuda",
             )
 
+        # model.train(data=data_yaml_path, epochs=cfg["epochs"], batch=cfg["batch"], amp=False,
+        #             workers=cfg["workers"], device=cfg["device"], project=save_dir, freeze=cfg["frozen_layers"],
+        #             trainer=AntiForgetDetectionTrainer,
+        #             vspreg=cfg["vspreg"],
+        #             sample_images=pca_sample_images,
+        #             sample_labels=pca_sample_labels,
+        #             pca_sample_num=cfg["pca_sample_num"], projection_layers=cfg["projection_layers"],
+        #             pca_cache_save_path=pca_cache_save_path,
+        #             pca_cache_load_path=pca_cache_load_path,
+        #             kd=cfg["kd"],
+        #             distill_layers=cfg["distill_layers"],
+        #             distiller=cfg["distiller"],
+        #             resume=resume)
         model.train(data=data_yaml_path, epochs=cfg["epochs"], batch=cfg["batch"], amp=False,
-                    workers=cfg["workers"], device=cfg["device"], project=save_dir, freeze=cfg["frozen_layers"],
-                    trainer=AntiForgetDetectionTrainer,
-                    vspreg=cfg["vspreg"],
-                    sample_images=pca_sample_images,
-                    sample_labels=pca_sample_labels,
-                    pca_sample_num=cfg["pca_sample_num"], projection_layers=cfg["projection_layers"],
-                    pca_cache_save_path=pca_cache_save_path,
-                    pca_cache_load_path=pca_cache_load_path,
-                    kd=cfg["kd"],
-                    distill_layers=cfg["distill_layers"],
-                    distiller=cfg["distiller"],
-                    resume=resume)
+                    workers=cfg["workers"], device=cfg["device"], project=save_dir, freeze=cfg["frozen_layers"], resume=resume)
     else:
         if checkpoint is not None:
             model = YOLO(checkpoint)
