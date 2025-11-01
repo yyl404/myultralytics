@@ -1,12 +1,9 @@
 import numpy as np
-import random
-import os
-import cv2
-import joblib
 import warnings
 from copy import deepcopy
 import math
 import time
+import joblib
 
 import torch
 import torch.nn as nn
@@ -34,9 +31,7 @@ from ultralytics.engine.distillation import (
     KDLoss,
 )
 from ultralytics.engine.vspreg import (
-    RealTimeMemoryMonitor,
     VSPRegLoss,
-    PCAHooker,
 )
 
 
@@ -52,100 +47,6 @@ class AntiForgetTrainer(BaseTrainer):
         """
         super().__init__(cfg, overrides, _callbacks)
 
-    def _do_pca(self):
-        # Create PCA Hooker
-        if self.args.projection_layers is not None:
-            projection_layers = self.args.projection_layers
-        else:
-            if isinstance(self.args.freeze, list):
-                projection_layers = [x for x in range(len(self.base_model.model)) if x not in self.args.freeze]
-            elif isinstance(self.args.freeze, int):
-                projection_layers = list(range(len(self.base_model.model))).remove(self.args.freeze)
-            else:
-                projection_layers = list(range(len(self.base_model.model)))
-        self.pca_hooker = PCAHooker(self.base_model, projection_layers, device=self.device)
-
-        if self.args.pca_cache_load_path:
-            LOGGER.info(f"Loading PCA cache from {self.args.pca_cache_load_path}")
-            if os.path.exists(self.args.pca_cache_load_path):
-                with open(self.args.pca_cache_load_path, "rb") as f:
-                    pca_cache = joblib.load(f)
-                components = {}
-                variances = {}
-                means = {}
-                for n, pca_operator in pca_cache.items():
-                    self.pca_hooker.set_pca_operator(n, pca_operator)
-                for n in self.pca_hooker.names:
-                    component_matrix, variance_array, mean_array = self.pca_hooker.get_pca_results(n)
-                    components[n] = component_matrix.to(self.device).detach()
-                    variances[n] = variance_array.to(self.device).detach()
-                    means[n] = mean_array.to(self.device).detach()
-                if self.args.pca_cache_save_path:
-                    LOGGER.info(f"Saving PCA cache to {self.args.pca_cache_save_path}")
-                    with open(self.args.pca_cache_save_path, "wb") as f:
-                        joblib.dump(pca_cache, f)
-                return components, variances, means
-            else:
-                LOGGER.warning(f"PCA cache {self.args.pca_cache_load_path} is not loaded because it does not exist")
-
-        memory_monitor = RealTimeMemoryMonitor(update_interval=0.2) # Monitor memory and CUDA memory usage
-        pbar = TQDM(range(self.args.pca_sample_num), desc="PCA computing", total=self.args.pca_sample_num)
-        memory_monitor.set_progress_bar(pbar)
-        memory_monitor.start_monitoring()
-
-        if self.args.sample_images is not None:
-            if isinstance(self.args.sample_images, list) or isinstance(self.args.sample_images, tuple):
-                sample_files = []
-                for _dir in self.args.sample_images:
-                    sample_files.extend(os.path.join(_dir, x) for x in os.listdir(_dir))
-            else:
-                sample_files = [os.path.join(self.args.sample_images, x) for x in os.listdir(self.args.sample_images)]
-            random.shuffle(sample_files)
-            sample_files = sample_files[:self.args.pca_sample_num]
-            for i in pbar:
-                image = cv2.imread(sample_files[i])
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                image = cv2.resize(image, (640, 640))
-                image = image.transpose(2, 0, 1) / 255.0
-                image = torch.from_numpy(image).float()
-                image = image.to(self.device)
-                
-                self.pca_hooker.register_hook()
-                with torch.no_grad():
-                    _ = self.base_model(image.unsqueeze(0))
-                self.pca_hooker.remove_handle_()
-        else:
-            LOGGER.warning("No sample images provided, using random images for PCA")
-            for i in pbar:
-                image = torch.randn(3, 640, 640).to(self.device)
-                self.pca_hooker.register_hook()
-                with torch.no_grad():
-                    _ = self.base_model(image.unsqueeze(0))
-                self.pca_hooker.remove_handle_()
-        
-        memory_monitor.stop_monitoring()
-        self.pca_hooker.clear_feature_cache()
-
-        components = {}
-        variances = {}
-        means = {}
-        if self.args.pca_cache_save_path:
-            pca_cache = {}
-        for n in self.pca_hooker.names:
-            if self.args.pca_cache_save_path:
-                pca_cache[n] = self.pca_hooker.get_pca_operator(n)
-            component_matrix, variance_array, mean_array = self.pca_hooker.get_pca_results(n)
-            components[n] = component_matrix.to(self.device).detach()
-            variances[n] = variance_array.to(self.device).detach()
-            means[n] = mean_array.to(self.device).detach()
-        
-        if self.args.pca_cache_save_path:
-            LOGGER.info(f"Saving PCA cache to {self.args.pca_cache_save_path}")
-            with open(self.args.pca_cache_save_path, "wb") as f:
-                joblib.dump(pca_cache, f)
-
-        return components, variances, means
-
     def _setup_train(self, world_size):
         """Build dataloaders and optimizer on correct rank process."""
         ckpt = self.setup_model()
@@ -157,9 +58,19 @@ class AntiForgetTrainer(BaseTrainer):
             self.base_model = deepcopy(self.model).eval()
             for p in self.base_model.parameters():
                 p.requires_grad_(False)
-            components, variances, biases = self._do_pca()
-            self.vspreg_loss = VSPRegLoss(self.model, self.base_model, module_names=self.pca_hooker.names,
-                                        components=components, variances=variances, means=biases)
+            components, variances, biases = {}, {}, {}
+            self.pca_cache = joblib.load(self.args.pca_cache_path)
+            for name in self.pca_cache.keys():
+                _components = []
+                _variances = []
+                _biases = []
+                for ig in range(len(self.pca_cache[name])):
+                    _components.append(self.pca_cache[name][ig].components_)
+                    _variances.append(self.pca_cache[name][ig].explained_variance_)
+                    _biases.append(self.pca_cache[name][ig].mean_)
+                components[name], variances[name], biases[name] = torch.stack(_components), torch.stack(_variances), torch.stack(_biases)
+            self.vspreg_loss = VSPRegLoss(self.model, self.base_model, module_names=self.pca_cache.keys(),
+                                          components=components, variances=variances, means=biases)
         # ============================== END: set up VSPReg loss =================================================
 
         # ============================== MODIFIED: set up KD loss ================================================
@@ -355,7 +266,7 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== MODIFIED: calculate VSPReg loss ===================================
                     if self.args.vspreg:
                         _vspreg_loss = self.vspreg_loss.get_loss()
-                        self.loss += _vspreg_loss
+                        self.loss += (_vspreg_loss * 1000)
                         loss_items = torch.cat([self.loss_items, torch.tensor([_vspreg_loss], device=self.loss_items.device)])
                     # ============================== END: calculate VSPReg loss ========================================
 

@@ -1,4 +1,5 @@
 import os
+from os import path as OSP
 import shutil
 from tqdm import tqdm
 import argparse
@@ -44,10 +45,10 @@ def read_labels_and_convert_class_id(labels_dir, class_id_map):
         转换后的标注文件字典 {label_file: converted_label_lines}
     """
     labels = {}
-    if os.path.exists(labels_dir):
+    if OSP.exists(labels_dir):
         for label_file in os.listdir(labels_dir):
             if label_file.endswith('.txt'):
-                label_path = os.path.join(labels_dir, label_file)
+                label_path = OSP.join(labels_dir, label_file)
                 with open(label_path, 'r') as f:
                     lines = f.readlines()
                 labels[label_file] = convert_class_id(lines, class_id_map)
@@ -59,7 +60,7 @@ def save_labels(labels, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     
     for label_file, lines in labels.items():
-        output_path = os.path.join(output_dir, label_file)
+        output_path = OSP.join(output_dir, label_file)
         with open(output_path, 'w') as f:
             f.writelines(lines)
 
@@ -79,12 +80,12 @@ def create_classes_expanded_dataset(cfg_source, class_id_map, save_dir, target_d
         生成的目标数据集配置文件路径
     """
     # 读取原始数据集配置
-    source_dataset_dir = os.path.dirname(cfg_source)
+    source_dataset_dir = OSP.dirname(cfg_source)
     cfg_source = YAML.load(cfg_source)
     
     # 创建目标数据集目录
-    target_dataset_dir = os.path.abspath(os.path.join(save_dir, target_dataset_name))
-    if os.path.exists(target_dataset_dir):
+    target_dataset_dir = OSP.abspath(OSP.join(save_dir, target_dataset_name))
+    if OSP.exists(target_dataset_dir):
         shutil.rmtree(target_dataset_dir)
     os.makedirs(target_dataset_dir, exist_ok=True)
     
@@ -92,24 +93,24 @@ def create_classes_expanded_dataset(cfg_source, class_id_map, save_dir, target_d
     for split in ['train', 'val', 'test']:
         if split in cfg_source:
             # 原始数据集图像目录
-            source_images = os.path.join(cfg_source['path'], cfg_source[split]) if 'path' in cfg_source.keys() else \
-                os.path.join(source_dataset_dir, cfg_source[split])
+            source_images = OSP.join(cfg_source['path'], cfg_source[split]) if 'path' in cfg_source.keys() else \
+                OSP.join(source_dataset_dir, cfg_source[split])
             
             # 目标图像目录
-            target_images = os.path.join(target_dataset_dir, f"images/{split}")
+            target_images = OSP.join(target_dataset_dir, f"images/{split}")
             os.makedirs(target_images, exist_ok=True)
             shutil.copytree(source_images, target_images, dirs_exist_ok=True)
             
             # 原始数据集标签目录
-            source_labels = os.path.join(cfg_source['path'], cfg_source[split].replace('images', 'labels')) if 'path' in cfg_source.keys() else \
-                os.path.join(source_dataset_dir, cfg_source[split].replace('images', 'labels'))
+            source_labels = OSP.join(cfg_source['path'], cfg_source[split].replace('images', 'labels')) if 'path' in cfg_source.keys() else \
+                OSP.join(source_dataset_dir, cfg_source[split].replace('images', 'labels'))
             
             # 目标标签目录
-            target_labels = os.path.join(target_dataset_dir, f"labels/{split}")
+            target_labels = OSP.join(target_dataset_dir, f"labels/{split}")
             os.makedirs(target_labels, exist_ok=True)
             
             # 转换标签的类别ID并保存
-            if os.path.exists(source_labels):
+            if OSP.exists(source_labels):
                 converted_labels = read_labels_and_convert_class_id(source_labels, class_id_map)
                 save_labels(converted_labels, target_labels)
     
@@ -120,7 +121,7 @@ def create_classes_expanded_dataset(cfg_source, class_id_map, save_dir, target_d
     for split in ['train', 'val', 'test']:
         if split in cfg_source:
             config[split] = f"images/{split}"
-    config_path = os.path.join(target_dataset_dir, 'dataconfig.yaml')
+    config_path = OSP.join(target_dataset_dir, 'dataconfig.yaml')
     YAML.save(data=config, file=config_path)
     return config_path
 
@@ -144,8 +145,8 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
     model_name = model_cfg.split(".")[0]
     model_cfg = yaml_model_load(model_cfg)
     model_cfg["nc"] = len(classes_names)
-    YAML.save(data=model_cfg, file=os.path.join(save_dir, f"{model_name}-nc{len(classes_names)}.yaml"))
-    new_model = YOLO(os.path.join(save_dir, f"{model_name}-nc{len(classes_names)}.yaml"))
+    YAML.save(data=model_cfg, file=OSP.join(save_dir, f"{model_name}-nc{len(classes_names)}.yaml"))
+    new_model = YOLO(OSP.join(save_dir, f"{model_name}-nc{len(classes_names)}.yaml"))
     new_weight = new_model.model.state_dict()
 
     # 权重迁移：分类层按映射迁移，其他层直接复制
@@ -172,7 +173,7 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
 
     new_model.model.load_state_dict(new_weight)
     new_model.model.names = {k: v for k, v in enumerate(classes_names)}
-    new_model.save(os.path.join(save_dir, output_name))
+    new_model.save(OSP.join(save_dir, output_name))
 
 
 def merge_labels(original_labels, pseudo_labels):
@@ -207,14 +208,14 @@ def merge_labels(original_labels, pseudo_labels):
 def create_pseudo_labels_dataset(teacher_model, base_class_id_map, new_class_id_map, cfg_source, save_dir, target_dataset_classes, conf_threshold=0.25):
     """生成带有伪标签的数据集
     """
-    source_dataset_dir = os.path.dirname(cfg_source)
+    source_dataset_dir = OSP.dirname(cfg_source)
     cfg_source = YAML.load(cfg_source)
 
     splits = ['train', 'val', 'test']
     for split in splits:
         if split in cfg_source:
-            source_images = os.path.join(cfg_source['path'], cfg_source[split]) if 'path' in cfg_source.keys() else \
-                    os.path.join(source_dataset_dir, cfg_source[split])
+            source_images = OSP.join(cfg_source['path'], cfg_source[split]) if 'path' in cfg_source.keys() else \
+                    OSP.join(source_dataset_dir, cfg_source[split])
             source_labels = source_images.replace('images', 'labels')
 
             # 1. 生成伪标注
@@ -226,7 +227,7 @@ def create_pseudo_labels_dataset(teacher_model, base_class_id_map, new_class_id_
                     pass # 遍历结果生成器的同时会自动保存结果文件
 
                 # 2. 将伪标签的类别ID转换为目标数据集的类别ID
-                pesudo_labels = read_labels_and_convert_class_id(os.path.join(save_dir, f"pseudo_labels/{split}/labels"), base_class_id_map)
+                pesudo_labels = read_labels_and_convert_class_id(OSP.join(save_dir, f"pseudo_labels/{split}/labels"), base_class_id_map)
             else:
                 pesudo_labels = {} # 非训练集不需要伪标注，直接为空
             
@@ -235,10 +236,10 @@ def create_pseudo_labels_dataset(teacher_model, base_class_id_map, new_class_id_
 
             # 4. 合并真实标注和伪标注并保存
             merged_labels = merge_labels(ground_truth_labels, pesudo_labels)
-            save_labels(merged_labels, os.path.join(save_dir, f"labels/{split}"))
+            save_labels(merged_labels, OSP.join(save_dir, f"labels/{split}"))
 
             # 5. 复制图像文件
-            images_output_dir = os.path.join(save_dir, f"images/{split}")
+            images_output_dir = OSP.join(save_dir, f"images/{split}")
             shutil.copytree(source_images, images_output_dir)
 
             # 6. 创建数据集配置文件
@@ -248,12 +249,12 @@ def create_pseudo_labels_dataset(teacher_model, base_class_id_map, new_class_id_
             for split in ['train', 'val', 'test']:
                 if split in cfg_source:
                     config[split] = f"images/{split}"
-            config_path = os.path.join(save_dir, f"dataconfig.yaml")
+            config_path = OSP.join(save_dir, f"dataconfig.yaml")
             YAML.save(data=config, file=config_path)
             
             # 删除临时生成的伪标注文件
-            if os.path.exists(os.path.join(save_dir, f"pseudo_labels")):
-                shutil.rmtree(os.path.join(save_dir, f"pseudo_labels"))
+            if OSP.exists(OSP.join(save_dir, f"pseudo_labels")):
+                shutil.rmtree(OSP.join(save_dir, f"pseudo_labels"))
 
 
 # ============================ VAE 回放相关 ============================
@@ -352,8 +353,8 @@ def build_vae_replay_dataset(
         新 dataconfig.yaml 路径
     """
     os.makedirs(save_dir, exist_ok=True)
-    out_root = os.path.join(save_dir, "training_dataset_with_pseudo_labels_replay")
-    if os.path.exists(out_root):
+    out_root = OSP.join(save_dir, "training_dataset_with_pseudo_labels_replay")
+    if OSP.exists(out_root):
         shutil.rmtree(out_root)
     os.makedirs(out_root, exist_ok=True)
 
@@ -362,15 +363,15 @@ def build_vae_replay_dataset(
     tfm = _prepare_transform(image_size)
 
     # 2) 遍历源目录，重构图像并保存到 out_root/images/train
-    images_out = os.path.join(out_root, "images", "train")
-    labels_out = os.path.join(out_root, "labels", "train")
+    images_out = OSP.join(out_root, "images", "train")
+    labels_out = OSP.join(out_root, "labels", "train")
     os.makedirs(images_out, exist_ok=True)
     os.makedirs(labels_out, exist_ok=True)
 
     def _iter_images(root):
         for name in os.listdir(root):
             if name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")):
-                yield os.path.join(root, name)
+                yield OSP.join(root, name)
 
     for img_path in tqdm(list(_iter_images(replay_source_images)), desc="VAE replay reconstruct"):
         try:
@@ -388,36 +389,36 @@ def build_vae_replay_dataset(
             recon_denorm = torch.clamp(recon_full * std + mean, 0, 1)
             recon_np = (recon_denorm[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             recon_bgr = cv2.cvtColor(recon_np, cv2.COLOR_RGB2BGR)
-            out_name = os.path.basename(img_path)
-            out_img_path = os.path.join(images_out, out_name)
+            out_name = OSP.basename(img_path)
+            out_img_path = OSP.join(images_out, out_name)
             cv2.imwrite(out_img_path, recon_bgr)
         except Exception:
             continue
 
     # 3) 复制原数据集其余 split，建立基础 yaml（沿用 create_pseudo_labels_dataset 的风格）
-    source_dataset_dir = os.path.dirname(cfg_source)
+    source_dataset_dir = OSP.dirname(cfg_source)
     cfg = YAML.load(cfg_source)
     for split in ["val", "test"]:
         if split in cfg:
-            src_images = os.path.join(cfg.get("path", source_dataset_dir), cfg[split]) if "path" in cfg.keys() else os.path.join(source_dataset_dir, cfg[split])
+            src_images = OSP.join(cfg.get("path", source_dataset_dir), cfg[split]) if "path" in cfg.keys() else OSP.join(source_dataset_dir, cfg[split])
             src_labels = src_images.replace("images", "labels")
-            os.makedirs(os.path.join(out_root, "images", split), exist_ok=True)
-            os.makedirs(os.path.join(out_root, "labels", split), exist_ok=True)
-            if os.path.exists(src_images):
-                shutil.copytree(src_images, os.path.join(out_root, "images", split), dirs_exist_ok=True)
-            if os.path.exists(src_labels):
-                shutil.copytree(src_labels, os.path.join(out_root, "labels", split), dirs_exist_ok=True)
+            os.makedirs(OSP.join(out_root, "images", split), exist_ok=True)
+            os.makedirs(OSP.join(out_root, "labels", split), exist_ok=True)
+            if OSP.exists(src_images):
+                shutil.copytree(src_images, OSP.join(out_root, "images", split), dirs_exist_ok=True)
+            if OSP.exists(src_labels):
+                shutil.copytree(src_labels, OSP.join(out_root, "labels", split), dirs_exist_ok=True)
 
     # 4) 用教师模型对重构的 train 图像打伪标签（保存到 labels/train）并做类别映射
     results = base_model.predict(images_out, conf=conf_threshold, save_txt=True, save_conf=False, stream=True,
                                  project=out_root, name=f"pseudo_labels/train", verbose=False)
     for _ in tqdm(results, desc="Generate pseudo labels for replay", ncols=80):
         pass
-    pseudo_labels_src = os.path.join(out_root, "pseudo_labels", "train", "labels")
-    if os.path.exists(pseudo_labels_src):
+    pseudo_labels_src = OSP.join(out_root, "pseudo_labels", "train", "labels")
+    if OSP.exists(pseudo_labels_src):
         converted = read_labels_and_convert_class_id(pseudo_labels_src, base_class_id_map)
         save_labels(converted, labels_out)
-        shutil.rmtree(os.path.join(out_root, "pseudo_labels"))
+        shutil.rmtree(OSP.join(out_root, "pseudo_labels"))
 
     # 5) 写 dataconfig.yaml
     config = {
@@ -426,7 +427,7 @@ def build_vae_replay_dataset(
     for split in ["train", "val", "test"]:
         if split in cfg:
             config[split] = f"images/{split}"
-    data_yaml = os.path.join(out_root, "dataconfig.yaml")
+    data_yaml = OSP.join(out_root, "dataconfig.yaml")
     YAML.save(data=config, file=data_yaml)
     return data_yaml
 
@@ -442,18 +443,74 @@ def main(args):
         class_id_map = {}
         for i, cls in enumerate(source_classes):
             class_id_map[i] = model_classes.index(cls)
-            
-        create_classes_expanded_dataset(args.data_cfg, class_id_map, args.save_dir, args.target_dataset_name, model_classes)
+
+        root_dir, dataset_name = OSP.split(args.save_dir)
+        create_classes_expanded_dataset(args.data_cfg, class_id_map, root_dir, dataset_name, model_classes)
+        return 0
+
+    if args.expand_detection_head:
+        base_model = YOLO(args.model_path)
+        base_classes = [base_model.names[i] for i in sorted(base_model.names.keys())]
+        
+        data_cfg = YAML.load(args.data_cfg)
+        new_classes = [data_cfg["names"][i] for i in sorted(data_cfg["names"].keys())]
+
+        all_classes = list(set(base_classes).union(new_classes))
+        
+        base_class_id_map = {}
+        for i, cls in enumerate(base_classes):
+            base_class_id_map[i] = all_classes.index(cls)
+
+        new_class_id_map = {}
+        for i, cls in enumerate(new_classes):
+            new_class_id_map[i] = all_classes.index(cls)
+        
+        root_dir, model_name = OSP.split(args.save_path)
+        expand_detection_head(args.model_path, args.model_cfg, base_class_id_map, all_classes,
+                              root_dir, model_name)
+        return 0
+    
+    if args.create_pseudo_labels_dataset:
+        teacher_model = YOLO(args.model_path)
+        base_classes = [teacher_model.names[i] for i in sorted(teacher_model.names.keys())]
+
+        data_cfg = YAML.load(args.data_cfg)
+        new_classes = [data_cfg["names"][i] for i in sorted(data_cfg["names"].keys())]
+
+        all_classes = list(set(base_classes).union(new_classes))
+
+        base_class_id_map = {}
+        for i, cls in enumerate(base_classes):
+            base_class_id_map[i] = all_classes.index(cls)
+
+        new_class_id_map = {}
+        for i, cls in enumerate(new_classes):
+            new_class_id_map[i] = all_classes.index(cls)
+        
+        if OSP.exists(args.save_dir):
+            shutil.rmtree(args.save_dir)
+        
+        root_dir, model_name = OSP.split(args.save_dir)
+        create_pseudo_labels_dataset(teacher_model, base_class_id_map, new_class_id_map, 
+                                     args.data_cfg,
+                                     args.save_dir, all_classes, args.conf_threshold)
+        return 0
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data_cfg", type=str, help="Data config path")
+    parser.add_argument("--model_path", type=str, help="Model path")
+    parser.add_argument("--save_dir", type=str, help="Save directory")
     # 转换数据集类别ID
     parser.add_argument("--convert_dataset_class_id", action="store_true", help="Convert dataset class id")
-    parser.add_argument("--data_cfg", type=str, required=True, help="Data config path")
-    parser.add_argument("--model_path", type=str, required=True, help="Model path")
-    parser.add_argument("--save_dir", type=str, required=True, help="Save directory")
-    parser.add_argument("--target_dataset_name", type=str, required=True, help="Target dataset name")
-    args = parser.parse_args()
+    # 合并增量类别并扩展检测头
+    parser.add_argument("--expand_detection_head", action="store_true", help="Expand detection head")
+    parser.add_argument("--model_cfg", type=str, help="Model config path")
+    parser.add_argument("--save_path", type=str, help="Save path")
+    # 创建伪标签数据集
+    parser.add_argument("--create_pseudo_labels_dataset", action="store_true", help="Create pseudo labels dataset")
+    parser.add_argument("--conf_threshold", type=float, default=0.25, help="Confidence threshold")
 
+    args = parser.parse_args()
     main(args)

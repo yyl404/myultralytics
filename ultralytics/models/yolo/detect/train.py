@@ -4,21 +4,16 @@ import math
 import random
 from copy import copy
 from typing import Any, Dict, List, Optional
-import os
-import cv2
-import joblib
 
 import numpy as np
-import torch
 import torch.nn as nn
 
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.engine.antiforget import AntiForgetTrainer
-from ultralytics.engine.vspreg import RealTimeMemoryMonitor, PCAHooker
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import LOGGER, RANK, TQDM, DEFAULT_CFG
+from ultralytics.utils import LOGGER, RANK, DEFAULT_CFG
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels, plot_results
 from ultralytics.utils.torch_utils import de_parallel, torch_distributed_zero_first
@@ -224,195 +219,9 @@ class DetectionTrainer(BaseTrainer):
         return super().auto_batch(max_num_obj)
 
 
-class DetectionPCAHooker(PCAHooker):
-    def __init__(self, model, layers, bboxes=None, device="cuda", check=False):
-        super().__init__(model, layers, device, check)
-        self.bboxes = bboxes
-        
-    def set_bboxes(self, bboxes):
-        self.bboxes = bboxes
-
-    def _get_sample_feature_indices(self, bs, h_out, w_out):
-        """Use tensor operation to accelerate the extraction of feature indices within bounding boxes
-        """
-        # Collect all bounding box information
-        all_bboxes = []
-        batch_ids = []
-        for batch_id, _bboxes in enumerate(self.bboxes):
-            for _bbox in _bboxes:
-                all_bboxes.append(_bbox)
-                batch_ids.append(batch_id)
-        
-        # Convert to tensor for vectorized calculation
-        bbox_tensor = torch.tensor(all_bboxes, device=self.device)  # [N, 4]
-        batch_tensor = torch.tensor(batch_ids, device=self.device)  # [N]
-        
-        # Scale bbox coordinates to feature map size
-        feat_coords = bbox_tensor * torch.tensor([w_out, h_out, w_out, h_out], device=self.device)
-        feat_x_min = torch.clamp(feat_coords[:, 0].int(), 0, w_out-1)
-        feat_y_min = torch.clamp(feat_coords[:, 1].int(), 0, h_out-1)
-        feat_x_max = torch.clamp(feat_coords[:, 2].int(), 0, w_out-1)
-        feat_y_max = torch.clamp(feat_coords[:, 3].int(), 0, h_out-1)
-        
-        # Create coordinate grids
-        h_indices = torch.arange(h_out, device=self.device)
-        w_indices = torch.arange(w_out, device=self.device)
-        h_grid, w_grid = torch.meshgrid(h_indices, w_indices, indexing='ij')
-        h_flat = h_grid.flatten()  # [h_out*w_out]
-        w_flat = w_grid.flatten()  # [h_out*w_out]
-        
-        # Use broadcasting for vectorized mask calculation
-        # Expand dimensions to support broadcasting: [N, 1] and [1, h_out*w_out]
-        feat_y_min_exp = feat_y_min.unsqueeze(1)  # [N, 1]
-        feat_y_max_exp = feat_y_max.unsqueeze(1)  # [N, 1]
-        feat_x_min_exp = feat_x_min.unsqueeze(1)  # [N, 1]
-        feat_x_max_exp = feat_x_max.unsqueeze(1)  # [N, 1]
-        
-        h_flat_exp = h_flat.unsqueeze(0)  # [1, h_out*w_out]
-        w_flat_exp = w_flat.unsqueeze(0)  # [1, h_out*w_out]
-        
-        # Create mask for all bounding boxes [N, h_out*w_out]
-        mask = ((h_flat_exp >= feat_y_min_exp) & (h_flat_exp <= feat_y_max_exp) & 
-                (w_flat_exp >= feat_x_min_exp) & (w_flat_exp <= feat_x_max_exp))
-        
-        # Get all valid coordinate indices
-        valid_coords = torch.nonzero(mask, as_tuple=False)  # [M, 2] where M is number of valid pixels
-        
-        if len(valid_coords) == 0:
-            return
-        
-        # Calculate feature indices
-        bbox_idx = valid_coords[:, 0]  # bbox indices
-        coord_idx = valid_coords[:, 1]  # coordinate indices
-        
-        # Get corresponding coordinates
-        valid_h = h_flat[coord_idx]
-        valid_w = w_flat[coord_idx]
-        valid_batch = batch_tensor[bbox_idx]
-        
-        # Calculate final feature indices
-        sample_feature_indices = valid_batch * h_out * w_out + valid_h * w_out + valid_w
-
-        # If too many features, randomly sample to accelerate the PCA computation
-        if len(sample_feature_indices) > 100:
-            sampled_indices = torch.randperm(len(sample_feature_indices), device=self.device)[:100]
-            sample_feature_indices = sample_feature_indices[sampled_indices]
-        
-        return sample_feature_indices
-
-
 class AntiForgetDetectionTrainer(AntiForgetTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         super().__init__(cfg, overrides, _callbacks)
-
-    def _do_pca(self):
-        # Create PCA Hooker
-        if self.args.projection_layers is not None:
-            projection_layers = self.args.projection_layers
-        else:
-            if isinstance(self.args.freeze, list):
-                projection_layers = [x for x in range(len(self.base_model.model)) if x not in self.args.freeze]
-            elif isinstance(self.args.freeze, int):
-                projection_layers = list(range(len(self.base_model.model)))
-                projection_layers.remove(self.args.freeze)
-            else:
-                projection_layers = list(range(len(self.base_model.model)))
-        self.pca_hooker = DetectionPCAHooker(self.base_model, projection_layers, device=self.device)
-
-        if self.args.pca_cache_load_path:
-            LOGGER.info(f"Loading PCA cache from {self.args.pca_cache_load_path}")
-            if os.path.exists(self.args.pca_cache_load_path):
-                with open(self.args.pca_cache_load_path, "rb") as f:
-                    pca_cache = joblib.load(f)
-                components = {}
-                variances = {}
-                means = {}
-                for n, pca_operator in pca_cache.items():
-                    self.pca_hooker.set_pca_operator(n, pca_operator)
-                for n in self.pca_hooker.names:
-                    component_matrix, variance_array, mean_array = self.pca_hooker.get_pca_results(n)
-                    components[n] = component_matrix.to(self.device).detach()
-                    variances[n] = variance_array.to(self.device).detach()
-                    means[n] = mean_array.to(self.device).detach()
-                if self.args.pca_cache_save_path:
-                    LOGGER.info(f"Saving PCA cache to {self.args.pca_cache_save_path}")
-                    with open(self.args.pca_cache_save_path, "wb") as f:
-                        joblib.dump(pca_cache, f)
-                return components, variances, means
-            else:
-                LOGGER.warning(f"PCA cache {self.args.pca_cache_load_path} is not loaded because it does not exist")
-        
-        if self.args.sample_images is None or self.args.sample_labels is None:
-            LOGGER.warning("Insufficient data(images and labels) for local PCA, fallback to global PCA")
-            return super()._do_pca()
-        
-        if isinstance(self.args.sample_images, list) or isinstance(self.args.sample_images, tuple):
-            sample_files = []
-            for _dir_img, _dir_label in zip(self.args.sample_images, self.args.sample_labels):
-                sample_files.extend({
-                    "image_file": os.path.join(_dir_img, x),
-                    "label_file": os.path.join(_dir_label, x.replace(".jpg", ".txt"))
-                } for x in os.listdir(_dir_img))
-        else:
-            sample_files = [
-                {
-                    "image_file": os.path.join(self.args.sample_images, x),
-                    "label_file": os.path.join(self.args.sample_labels, os.path.splitext(x)[0] + ".txt")
-                } for x in os.listdir(self.args.sample_images)
-            ]
-        random.shuffle(sample_files)
-        sample_files = sample_files[:self.args.pca_sample_num]
-        
-        memory_monitor = RealTimeMemoryMonitor(update_interval=0.2)
-        pbar = TQDM(sample_files, desc="PCA computing", total=len(sample_files))
-        memory_monitor.set_progress_bar(pbar)
-        memory_monitor.start_monitoring()
-
-        for sample_file in pbar:
-            image = cv2.imread(sample_file["image_file"])
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            image = cv2.resize(image, (640, 640))
-            image = image.transpose(2, 0, 1) / 255.0
-            image = torch.from_numpy(image).float()
-            image = image.to(self.device)
-
-            bboxes = []
-            with open(sample_file["label_file"], "r") as f:
-                labels = f.readlines()
-                for _label in labels:
-                    _label = _label.strip().split()
-                    x, y, w, h = float(_label[1]), float(_label[2]), float(_label[3]), float(_label[4])
-                    x_min, y_min, x_max, y_max = x - w/2, y - h/2, x + w/2, y + h/2
-                    bboxes.append([x_min, y_min, x_max, y_max])
-            
-            self.pca_hooker.set_bboxes([bboxes])
-            self.pca_hooker.register_hook()
-            with torch.no_grad():
-                _ = self.base_model(image.unsqueeze(0))
-            self.pca_hooker.remove_handle_()
-
-        memory_monitor.stop_monitoring()
-        self.pca_hooker.clear_feature_cache()
-
-        components = {}
-        variances = {}
-        means = {}
-        if self.args.pca_cache_save_path:
-            pca_cache = {}
-        for n in self.pca_hooker.names:
-            if self.args.pca_cache_save_path:
-                pca_cache[n] = self.pca_hooker.get_pca_operator(n)
-            component_matrix, variance_array, mean_array = self.pca_hooker.get_pca_results(n)
-            components[n] = component_matrix.to(self.device).detach()
-            variances[n] = variance_array.to(self.device).detach()
-            means[n] = mean_array.to(self.device).detach()
-        
-        if self.args.pca_cache_save_path:
-            LOGGER.info(f"Saving PCA cache to {self.args.pca_cache_save_path}")
-            with open(self.args.pca_cache_save_path, "wb") as f:
-                joblib.dump(pca_cache, f)
-
-        return components, variances, means
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: Optional[int] = None):
         """
@@ -509,7 +318,13 @@ class AntiForgetDetectionTrainer(AntiForgetTrainer):
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "vsp_loss", "kd_loss"
+        self.loss_names = ["box_loss", "cls_loss", "dfl_loss"]
+        
+        if self.args.vspreg:
+            self.loss_names.append("vsp_loss")
+        if self.args.kd:
+            self.loss_names.append("kd_loss")
+        self.loss_names = tuple(self.loss_names)
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

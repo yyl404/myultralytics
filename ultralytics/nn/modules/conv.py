@@ -171,6 +171,9 @@ class DecomposeConv(nn.Module):
         cr (int, optional): Number of compressed channels.
         linear_first (bool): Whether the first convolution is 1x1 convolution(True/False represent different decomposition perspective).
     """
+
+    default_act = nn.SiLU()  # default activation
+
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, cr=None, linear_first=True):
         super().__init__()
         self.linear_first = linear_first

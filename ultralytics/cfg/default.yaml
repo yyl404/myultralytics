@@ -127,7 +127,7 @@ cfg: # (str, optional) for overriding defaults.yaml
 tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yaml]
 
 # Distillation settings --------------------------------------------------------------------------------------------------
-kd: True # (bool) whether to use knowledge distillation
+kd: False # (bool) whether to use knowledge distillation
 distill_layers: None # (list[str], optional)
 distiller: "mgd" # (str) distiller type, choices=[mgd, cwdf, at, atm, skd, pkd]
 
@@ -137,5 +137,4 @@ projection_layers: None # (list[str], optional)
 sample_images: None # (str, optional)
 sample_labels: None # (str, optional)
 pca_sample_num: 100 # (int)
-pca_cache_load_path: None # (str, optional)
-pca_cache_save_path: None # (str, optional)
+pca_cache_path: None # (str, optional)
