@@ -251,6 +251,9 @@ class PCAHooker:
                     raise RuntimeError(f"Sample feature indices out of range: {sample_feature_indices.max()} >= {feat_reshaped.shape[2]}")
                 if sample_feature_indices.min() < 0:
                     raise RuntimeError(f"Sample feature indices out of range: {sample_feature_indices.min()} < 0")
+                if sample_feature_indices.shape[0] == 0:
+                    # Some batches may have no bounding boxes, so we need to return here
+                    return
                 feat_sampled = feat_reshaped[:, :, sample_feature_indices]
                 # unfold true: [g, c_in//g*k*k, len(sample_feature_indices)] | unfold false: [g, c_in//g, len(sample_feature_indices)]
                 
@@ -346,6 +349,10 @@ class PCAHookerWithBboxes(PCAHooker):
                 all_bboxes.append(_bbox)
                 batch_ids.append(_batch_id)
         
+        # If boxes in this paticular batch is empty, return an empty tensor
+        if len(all_bboxes) == 0:
+            return torch.tensor([], device=self.device)
+
         # Convert to tensor for vectorized calculation
         bbox_tensor = torch.tensor(all_bboxes, device=self.device)  # [N, 4]
         

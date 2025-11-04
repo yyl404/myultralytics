@@ -1,13 +1,13 @@
-# 训练基础模型
-python tools/train.py --model yolov8l.yaml \
-    --data data/VOC_inc_15_1x5/task_1_cls_15/dataset.yaml \
-    --save_path runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/best.pt \
-    --epochs 100 \
-    --batch_size 16 \
-    --imgsz 640 \
-    --workers 8 \
-    --device 0 \
-    --project runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1
+# # 训练基础模型
+# python tools/train.py --model yolov8l.yaml \
+#     --data data/VOC_inc_15_1x5/task_1_cls_15/dataset.yaml \
+#     --save_path runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/best.pt \
+#     --epochs 100 \
+#     --batch_size 16 \
+#     --imgsz 640 \
+#     --workers 8 \
+#     --device 0 \
+#     --project runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1
 
 # 用前序任务模型生成增量数据集上的伪标签（一定要用前序任务模型而不是前序任务模型检测头扩展后的模型，否则新增的检测通道参数是随机初始化的，会生成错误的标签）
 python tools/incremental_utils.py --create_pseudo_labels_dataset --data_cfg data/VOC_inc_15_1x5/task_2_cls_1/dataset.yaml \
@@ -41,8 +41,8 @@ rm -r runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_val_fullset
 
 # 用PCA分析前序任务模型各层的输入分布
 python tools/pca.py --model runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/task-1-best_expanded.pt \
-    --sample_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/images/val \
-    --label_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/labels/val \
+    --sample_dir data/VOC_inc_15_1x5/task_1_cls_15/images/val \
+    --label_dir data/VOC_inc_15_1x5/task_1_cls_15/labels/val \
     --save_path runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/pca_cache.joblib --unfold
 
 # 使用Antiforget训练器训练当前任务模型
@@ -91,8 +91,8 @@ rm -r runs/yolov8l_voc_inc_15_1x5_fromscratch/task-3/dataset_val_fullset
 
 # 用PCA分析前序任务模型各层的输入分布
 python tools/pca.py --model runs/yolov8l_voc_inc_15_1x5_fromscratch/task-3/task-2-best_expanded.pt \
-    --sample_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/images/val \
-    --label_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/labels/val \
+    --sample_dir data/VOC_inc_15_1x5/task_1_cls_15/images/val data/VOC_inc_15_1x5/task_2_cls_1/images/val \
+    --label_dir data/VOC_inc_15_1x5/task_1_cls_15/labels/val data/VOC_inc_15_1x5/task_2_cls_1/labels/val \
     --save_path runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/pca_cache.joblib --unfold
 
 # 使用Antiforget训练器训练当前任务模型
@@ -141,8 +141,8 @@ rm -r runs/yolov8l_voc_inc_15_1x5_fromscratch/task-4/dataset_val_fullset
 
 # 用PCA分析前序任务模型各层的输入分布
 python tools/pca.py --model runs/yolov8l_voc_inc_15_1x5_fromscratch/task-4/task-3-best_expanded.pt \
-    --sample_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-3/dataset_train/images/val \
-    --label_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-3/dataset_train/labels/val \
+    --sample_dir data/VOC_inc_15_1x5/task_1_cls_15/images/val data/VOC_inc_15_1x5/task_2_cls_1/images/val data/VOC_inc_15_1x5/task_3_cls_1/images/val \
+    --label_dir data/VOC_inc_15_1x5/task_1_cls_15/labels/val data/VOC_inc_15_1x5/task_2_cls_1/labels/val data/VOC_inc_15_1x5/task_3_cls_1/labels/val \
     --save_path runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/pca_cache.joblib --unfold
 
 # 使用Antiforget训练器训练当前任务模型
@@ -191,8 +191,8 @@ rm -r runs/yolov8l_voc_inc_15_1x5_fromscratch/task-5/dataset_val_fullset
 
 # 用PCA分析前序任务模型各层的输入分布
 python tools/pca.py --model runs/yolov8l_voc_inc_15_1x5_fromscratch/task-5/task-4-best_expanded.pt \
-    --sample_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-3/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-4/dataset_train/images/val \
-    --label_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-3/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-4/dataset_train/labels/val \
+    --sample_dir data/VOC_inc_15_1x5/task_1_cls_15/images/val data/VOC_inc_15_1x5/task_2_cls_1/images/val data/VOC_inc_15_1x5/task_3_cls_1/images/val data/VOC_inc_15_1x5/task_4_cls_1/images/val \
+    --label_dir data/VOC_inc_15_1x5/task_1_cls_15/labels/val data/VOC_inc_15_1x5/task_2_cls_1/labels/val data/VOC_inc_15_1x5/task_3_cls_1/labels/val data/VOC_inc_15_1x5/task_4_cls_1/labels/val \
     --save_path runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/pca_cache.joblib --unfold
 
 # 使用Antiforget训练器训练当前任务模型
@@ -241,8 +241,8 @@ rm -r runs/yolov8l_voc_inc_15_1x5_fromscratch/task-6/dataset_val_fullset
 
 # 用PCA分析前序任务模型各层的输入分布
 python tools/pca.py --model runs/yolov8l_voc_inc_15_1x5_fromscratch/task-6/task-5-best_expanded.pt \
-    --sample_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-3/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-4/dataset_train/images/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-5/dataset_train/images/val \
-    --label_dir runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-2/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-3/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-4/dataset_train/labels/val runs/yolov8l_voc_inc_15_1x5_fromscratch/task-5/dataset_train/labels/val \
+    --sample_dir data/VOC_inc_15_1x5/task_1_cls_15/images/val data/VOC_inc_15_1x5/task_2_cls_1/images/val data/VOC_inc_15_1x5/task_3_cls_1/images/val data/VOC_inc_15_1x5/task_4_cls_1/images/val data/VOC_inc_15_1x5/task_5_cls_1/images/val \
+    --label_dir data/VOC_inc_15_1x5/task_1_cls_15/labels/val data/VOC_inc_15_1x5/task_2_cls_1/labels/val data/VOC_inc_15_1x5/task_3_cls_1/labels/val data/VOC_inc_15_1x5/task_4_cls_1/labels/val data/VOC_inc_15_1x5/task_5_cls_1/labels/val \
     --save_path runs/yolov8l_voc_inc_15_1x5_fromscratch/task-1/pca_cache.joblib --unfold
 
 # 使用Antiforget训练器训练当前任务模型
