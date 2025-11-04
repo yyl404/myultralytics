@@ -1,7 +1,7 @@
 """
 Visualize the projection of kernel updates on PCA components.
 
-This script provides three visualization stages for analyzing incremental learning:
+This script provides four visualization stages for analyzing incremental learning:
     Stage 1: Variance and weight update projection histograms
         - Shows PCA explained variance, rotated means, and cosine similarities
         - Generates histogram plots for each module
@@ -12,38 +12,48 @@ This script provides three visualization stages for analyzing incremental learni
         - Analyzes value shifts between base and incremental models
         - Requires sample images and optionally label files for bounding box selection
         - Generates horizontal bar charts showing value shift statistics
+    Stage 4: Input and kernel projection length histograms
+        - Projects base_input and input_shift onto PCA components
+        - Shows projection lengths as histograms with kernel projection overlays
+        - Requires Stage 3 to run first (uses same sample data)
+        - Generates stacked histogram plots for each module
 
 Usage:
     # Full analysis with all stages (default)
-    python proj_vis.py --pca_cache_path <pca_cache_path> \
+    python vis.py --pca_cache_path <pca_cache_path> \
         --base_model <base_model> --incremental_model <incremental_model> \
         --save_dir <save_dir>
     
     # Only Stage 3 (value shift analysis)
-    python proj_vis.py --pca_cache_path <pca_cache_path> \
+    python vis.py --pca_cache_path <pca_cache_path> \
         --base_model <base_model> --incremental_model <incremental_model> \
         --save_dir <save_dir> --stages 3 --sample_dir <sample_dir> [--label_dir <label_dir>]
     
     # Only Stage 1 and 2 (visualization without value shift)
-    python proj_vis.py --pca_cache_path <pca_cache_path> \
+    python vis.py --pca_cache_path <pca_cache_path> \
         --base_model <base_model> --incremental_model <incremental_model> \
         --save_dir <save_dir> --stages 1 2
+    
+    # Only Stage 4 (requires Stage 3 data, but can run separately if Stage 3 ran before)
+    python vis.py --pca_cache_path <pca_cache_path> \
+        --base_model <base_model> --incremental_model <incremental_model> \
+        --save_dir <save_dir> --stages 3 4 --sample_dir <sample_dir>
 
 Examples:
     # Full analysis
-    python proj_vis.py \
+    python vis.py \
         --pca_cache_path runs/yolov8l_voc_inc_15_5_fromscratch/task-1/pca_cache.joblib \
         --base_model runs/yolov8l_voc_inc_15_5_fromscratch/task-1/best.pt \
         --incremental_model runs/yolov8l_voc_inc_15_5_fromscratch/task-2/best.pt \
-        --save_dir runs/yolov8l_voc_inc_15_5_fromscratch/proj_vis_model_2-1 \
+        --save_dir runs/yolov8l_voc_inc_15_5_fromscratch/vis_model_2-1 \
         --sample_dir data/val/images --label_dir data/val/labels
     
     # Only value shift analysis with detailed visualization
-    python proj_vis.py \
+    python vis.py \
         --pca_cache_path runs/yolov8l_voc_inc_15_5_fromscratch/task-1/pca_cache.joblib \
         --base_model runs/yolov8l_voc_inc_15_5_fromscratch/task-1/best.pt \
         --incremental_model runs/yolov8l_voc_inc_15_5_fromscratch/task-2/best.pt \
-        --save_dir runs/yolov8l_voc_inc_15_5_fromscratch/proj_vis_model_2-1 \
+        --save_dir runs/yolov8l_voc_inc_15_5_fromscratch/vis_model_2-1 \
         --stages 3 --sample_dir data/val/images --sample_num 200
 
 Required Arguments:
@@ -56,8 +66,10 @@ Optional Arguments:
                   Required for Stages 1, 2, and 3.
     --incremental_model: Path to the incremental model checkpoint file (.pt format).
                         Required for Stages 1, 2, and 3.
-    --stages: List of stages to enable. Options: 1 (histograms), 2 (polar plots), 3 (value shift).
-             Default: [1, 2, 3] (all stages).
+    --stages: List of stages to enable. Options: 1 (histograms), 2 (polar plots), 
+             3 (value shift), 4 (input/kernel projections).
+             Default: [1, 2, 3, 4] (all stages).
+             Note: Stage 4 requires Stage 3 to run first.
     --unfold: If set, use unfolded kernel representation [c_out, c_in*k[0]*k[1]].
               Otherwise use [c_out*k[0]*k[1], c_in]. Default: False.
     --detailed: If set, plot detailed per-kernel curves in histograms. Default: False.
@@ -77,11 +89,15 @@ Output:
     
     For Stage 3:
         - value_shift_analysis.png: Horizontal bar chart showing value shift statistics across modules
+    
+    For Stage 4:
+        - <module_name>_value_shift_proj_histogram.png: Stacked histograms showing input and kernel projections
 
 Notes:
     - Models are automatically moved to CUDA if available, otherwise CPU is used.
     - For grouped convolutions, separate plots are generated for each group.
     - Stage 3 requires both models and sample images to function properly.
+    - Stage 4 requires Stage 3 to run first (shares the same sample processing).
     - Supported image formats: jpg, png, jpeg, bmp (case-insensitive).
 """
 
@@ -104,12 +120,44 @@ from torch import nn
 
 from ultralytics import YOLO
 
-# Constants
-MILESTONES = [0.75, 0.90, 0.95, 0.99]
-MILESTONE_COLORS = ['red', 'orange', 'green', 'purple']
-IMAGE_EXTENSIONS = ['jpg', 'png', 'jpeg', 'bmp']
-DEFAULT_IMAGE_SIZE = (640, 640)
-MAX_POLAR_GROUPS = 8
+# ============================================================================
+# Configuration Constants
+# ============================================================================
+
+class VisualizationConfig:
+    """Configuration constants for visualization."""
+    # PCA milestones
+    MILESTONES = [0.75, 0.90, 0.95, 0.99]
+    MILESTONE_COLORS = ['red', 'orange', 'green', 'purple']
+    
+    # Image processing
+    IMAGE_EXTENSIONS = ['jpg', 'png', 'jpeg', 'bmp']
+    DEFAULT_IMAGE_SIZE = (640, 640)
+    
+    # Visualization limits
+    MAX_POLAR_GROUPS = 8
+    
+    # Output file naming templates
+    FILENAME_TEMPLATES = {
+        'stage1_histogram': '{module_name}_histogram.png',
+        'stage2_polar': '{module_name}_polar_projection.png',
+        'stage3_value_shift': 'value_shift_analysis.png',
+        'stage4_proj_histogram': '{module_name}_value_shift_proj_histogram.png',
+    }
+    
+    # Plot styling
+    PLOT_DPI = 300
+    PLOT_FIGSIZE_STAGE1 = (15, 12)  # Base size, multiplied by num_groups
+    PLOT_FIGSIZE_STAGE2 = (6, 6)  # Per subplot
+    PLOT_FIGSIZE_STAGE3 = (12, 8)  # Base size, adjusted by num_modules
+    PLOT_FIGSIZE_STAGE4 = (15, 12)
+
+# Global config instance for backward compatibility
+MILESTONES = VisualizationConfig.MILESTONES
+MILESTONE_COLORS = VisualizationConfig.MILESTONE_COLORS
+IMAGE_EXTENSIONS = VisualizationConfig.IMAGE_EXTENSIONS
+DEFAULT_IMAGE_SIZE = VisualizationConfig.DEFAULT_IMAGE_SIZE
+MAX_POLAR_GROUPS = VisualizationConfig.MAX_POLAR_GROUPS
 
 
 def flatten_kernel(module, unfold=False, zeros=False):
@@ -405,6 +453,77 @@ def cal_value_shift(base_input, incremental_input, base_output, incremental_outp
     return kernel_update_mult_input, base_kernel_mult_input_shift, kernel_update_mult_input_shift
 
 
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def _to_numpy(tensor_or_array):
+    """Convert tensor to numpy array if needed, otherwise return as-is.
+    
+    Args:
+        tensor_or_array: torch.Tensor or numpy array
+    
+    Returns:
+        numpy array
+    """
+    if isinstance(tensor_or_array, torch.Tensor):
+        return tensor_or_array.cpu().numpy()
+    return np.array(tensor_or_array)
+
+
+def _get_save_path(save_dir, template_key, module_name=None):
+    """Generate save path for plots using configured templates.
+    
+    Args:
+        save_dir: Directory to save the plot
+        template_key: Key in FILENAME_TEMPLATES
+        module_name: Optional module name for template substitution
+    
+    Returns:
+        Path object for saving
+    """
+    template = VisualizationConfig.FILENAME_TEMPLATES[template_key]
+    filename = template.format(module_name=module_name) if module_name else template
+    save_path = Path(save_dir) / filename
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    return save_path
+
+
+def _draw_milestone_lines(ax, milestones, milestones_indices, num_components):
+    """Draw vertical milestone lines on axes.
+    
+    Args:
+        ax: Matplotlib axes object
+        milestones: List of milestone thresholds
+        milestones_indices: List of milestone indices
+        num_components: Total number of components (for legend percentage)
+    """
+    for i, (milestone, milestone_idx) in enumerate(zip(milestones, milestones_indices)):
+        color = VisualizationConfig.MILESTONE_COLORS[i]
+        ax.axvline(x=milestone_idx, color=color, linestyle='--', linewidth=2, alpha=0.7)
+
+
+def _create_milestone_legend_elements(milestones, milestones_indices, num_components):
+    """Create legend elements for milestones.
+    
+    Args:
+        milestones: List of milestone thresholds
+        milestones_indices: List of milestone indices
+        num_components: Total number of components
+    
+    Returns:
+        List of legend elements
+    """
+    elements = []
+    for i, (milestone, milestone_idx) in enumerate(zip(milestones, milestones_indices)):
+        idx_ratio_pct = (milestone_idx / max(1, num_components)) * 100
+        elements.append(
+            plt.Line2D([0], [0], color=VisualizationConfig.MILESTONE_COLORS[i], 
+                      linestyle='--', label=f'{int(milestone*100)}% @ idx {milestone_idx} ({idx_ratio_pct:.0f}%)')
+        )
+    return elements
+
+
 def _calculate_milestone_indices(variances_cumsum_ratio, milestones):
     """Calculate milestone indices from cumulative variance ratios.
     
@@ -424,6 +543,84 @@ def _calculate_milestone_indices(variances_cumsum_ratio, milestones):
     return milestones_indices
 
 
+def _normalize_pca_operator_to_list(pca_operator):
+    """Normalize PCA operator to list format for consistent processing.
+    
+    Args:
+        pca_operator: PCA operator or list of PCA operators
+    
+    Returns:
+        Tuple of (num_groups, pca_list)
+    """
+    if isinstance(pca_operator, list):
+        return len(pca_operator), pca_operator
+    return 1, [pca_operator]
+
+
+def _get_group_kernel_update(kernel_update, group_idx, num_groups):
+    """Extract kernel update for a specific group.
+    
+    Args:
+        kernel_update: Kernel update tensor or list of tensors
+        group_idx: Group index
+        num_groups: Total number of groups
+    
+    Returns:
+        Group kernel update tensor or None
+    """
+    if kernel_update is None:
+        return None
+    if isinstance(kernel_update, list):
+        return kernel_update[group_idx] if group_idx < len(kernel_update) else None
+    return kernel_update if num_groups == 1 else None
+
+
+def _calculate_group_pca_statistics(group_pca, group_kernel_update, device, milestones):
+    """Calculate PCA statistics for a single group.
+    
+    Args:
+        group_pca: PCA operator for this group
+        group_kernel_update: Kernel update tensor for this group (can be None)
+        device: Device for computation
+        milestones: List of milestone thresholds
+    
+    Returns:
+        Tuple of (variances, means_rotated, milestones_indices, 
+                 cosine_similarity_windowed, cosine_similarity_cumsum, kernel_update)
+    """
+    # Calculate variances and milestones
+    variances = group_pca.explained_variance_.to(device)
+    variances_cumsum = torch.cumsum(variances, dim=0)
+    variances_cumsum_ratio = variances_cumsum / variances_cumsum[-1]
+    milestones_indices = _calculate_milestone_indices(variances_cumsum_ratio, milestones)
+    
+    # Calculate means in rotated space
+    means = group_pca.mean_.to(device)
+    components = F.normalize(group_pca.components_.to(device), p=2, dim=1)
+    means_rotated = torch.matmul(means.unsqueeze(0), components.T).squeeze(0)
+    
+    # Process kernel updates if available
+    if group_kernel_update is not None and group_kernel_update.shape[0] > 0:
+        # Calculate kernel update projections
+        proj = torch.matmul(group_kernel_update, components.T)
+        kernel_norms = torch.norm(group_kernel_update, p=2, dim=1, keepdim=True) + 1e-12
+        cosine_similarity = proj / kernel_norms
+        cosine_similarity_cumsum = (cosine_similarity ** 2).cumsum(dim=1).sqrt()
+        
+        # Window size is always 1 (optimized in window_cumsum)
+        cosine_similarity_windowed = window_cumsum(
+            cosine_similarity ** 2, window=1, dim=1
+        ).sqrt()
+        
+        return (variances, means_rotated, milestones_indices,
+                cosine_similarity_windowed, cosine_similarity_cumsum, group_kernel_update)
+    else:
+        # PCA-only analysis: create dummy data
+        dummy_cosine_similarity_windowed = torch.zeros(1, len(variances), device=device)
+        return (variances, means_rotated, milestones_indices,
+                dummy_cosine_similarity_windowed, None, None)
+
+
 def _calculate_pca_statistics(pca_operator, kernel_update, device, milestones):
     """Calculate PCA statistics for each group.
     
@@ -438,13 +635,7 @@ def _calculate_pca_statistics(pca_operator, kernel_update, device, milestones):
                         cosine_similarity_windowed_list, cosine_similarity_cumsum_list,
                         kernel_update_list)
     """
-    # Normalize to list format
-    if isinstance(pca_operator, list):
-        num_groups = len(pca_operator)
-        pca_list = pca_operator
-    else:
-        num_groups = 1
-        pca_list = [pca_operator]
+    num_groups, pca_list = _normalize_pca_operator_to_list(pca_operator)
     
     variances_list = []
     means_rotated_list = []
@@ -455,55 +646,18 @@ def _calculate_pca_statistics(pca_operator, kernel_update, device, milestones):
     
     for group_idx in range(num_groups):
         group_pca = pca_list[group_idx]
+        group_kernel_update = _get_group_kernel_update(kernel_update, group_idx, num_groups)
         
-        # Calculate variances and milestones
-        variances = group_pca.explained_variance_.to(device)
-        variances_cumsum = torch.cumsum(variances, dim=0)
-        variances_cumsum_ratio = variances_cumsum / variances_cumsum[-1]
-        milestones_indices = _calculate_milestone_indices(variances_cumsum_ratio, milestones)
-        
-        # Calculate means
-        means = group_pca.mean_.to(device)
-        components = F.normalize(group_pca.components_.to(device), p=2, dim=1)
-        means_rotated = torch.matmul(means.unsqueeze(0), components.T).squeeze(0)
+        (variances, means_rotated, milestones_indices,
+         cosine_similarity_windowed, cosine_similarity_cumsum, kernel_upd) = \
+            _calculate_group_pca_statistics(group_pca, group_kernel_update, device, milestones)
         
         variances_list.append(variances)
         means_rotated_list.append(means_rotated)
         milestones_indices_list.append(milestones_indices)
-        
-        # Process kernel updates if available
-        if kernel_update is not None:
-            if isinstance(kernel_update, list):
-                group_kernel_update = kernel_update[group_idx]
-            else:
-                group_kernel_update = kernel_update
-            
-            if group_kernel_update is not None and group_kernel_update.shape[0] > 0:
-                # Calculate kernel update projections
-                proj = torch.matmul(group_kernel_update, components.T)
-                kernel_norms = torch.norm(group_kernel_update, p=2, dim=1, keepdim=True) + 1e-12
-                cosine_similarity = proj / kernel_norms
-                cosine_similarity_cumsum = (cosine_similarity ** 2).cumsum(dim=1).sqrt()
-                
-                # Window size is always 1 (optimized in window_cumsum)
-                window_size = 1
-                cosine_similarity_windowed = window_cumsum(
-                    cosine_similarity ** 2, window=window_size, dim=1
-                ).sqrt()
-                
-                cosine_similarity_windowed_list.append(cosine_similarity_windowed)
-                cosine_similarity_cumsum_list.append(cosine_similarity_cumsum)
-                kernel_update_list.append(group_kernel_update)
-            else:
-                cosine_similarity_windowed_list.append(None)
-                cosine_similarity_cumsum_list.append(None)
-                kernel_update_list.append(None)
-        else:
-            # PCA-only analysis: create dummy data
-            dummy_cosine_similarity_windowed = torch.zeros(1, len(variances), device=device)
-            cosine_similarity_windowed_list.append(dummy_cosine_similarity_windowed)
-            cosine_similarity_cumsum_list.append(None)
-            kernel_update_list.append(None)
+        cosine_similarity_windowed_list.append(cosine_similarity_windowed)
+        cosine_similarity_cumsum_list.append(cosine_similarity_cumsum)
+        kernel_update_list.append(kernel_upd)
     
     return (variances_list, means_rotated_list, milestones_indices_list,
             cosine_similarity_windowed_list, cosine_similarity_cumsum_list,
@@ -589,9 +743,7 @@ def plot_histogram(cosine_similarity_windowed_list, variances_list, means_rotate
                         ax_sim.plot(x, cosines_np_mag[idx], color=color, linewidth=1.0, alpha=0.6)
 
         # Milestone vertical lines
-        for i, (milestone, milestone_idx) in enumerate(zip(milestones, milestones_indices)):
-            color = MILESTONE_COLORS[i]
-            ax_var.axvline(x=milestone_idx, color=color, linestyle='--', linewidth=2, alpha=0.7)
+        _draw_milestone_lines(ax_var, milestones, milestones_indices, len(variances_np))
 
         # Axis labels for top row
         if group_idx == 0:
@@ -608,12 +760,7 @@ def plot_histogram(cosine_similarity_windowed_list, variances_list, means_rotate
                          label='Explained Variance'),
         ]
         num_components = len(variances_np)
-        for i, (milestone, milestone_idx) in enumerate(zip(milestones, milestones_indices)):
-            idx_ratio_pct = (milestone_idx / max(1, num_components)) * 100
-            legend_elements.append(
-                plt.Line2D([0], [0], color=MILESTONE_COLORS[i], linestyle='--',
-                           label=f'{int(milestone*100)}% @ idx {milestone_idx} ({idx_ratio_pct:.0f}%)')
-            )
+        legend_elements.extend(_create_milestone_legend_elements(milestones, milestones_indices, num_components))
         if np.any(cosine_sim_mean != 0):
             legend_elements.extend([
                 plt.Line2D([0], [0], color='red', marker='o', linestyle='-',
@@ -626,9 +773,7 @@ def plot_histogram(cosine_similarity_windowed_list, variances_list, means_rotate
         # Bottom row: means in rotated space
         ax_mean.bar(x, -means_rotated_np, alpha=0.7, color='lightcoral',
                    edgecolor='darkred', linewidth=0.5)
-        for i, (milestone, milestone_idx) in enumerate(zip(milestones, milestones_indices)):
-            ax_mean.axvline(x=milestone_idx, color=MILESTONE_COLORS[i],
-                           linestyle='--', linewidth=2, alpha=0.7)
+        _draw_milestone_lines(ax_mean, milestones, milestones_indices, len(variances_np))
         ax_mean.set_xlabel('PCA Component Index')
         if group_idx == 0:
             ax_mean.set_ylabel('Means in Rotated Space (Negative)')
@@ -645,9 +790,8 @@ def plot_histogram(cosine_similarity_windowed_list, variances_list, means_rotate
     plt.tight_layout()
     
     # Save the plot
-    save_path = Path(save_dir) / f"{module_name}_histogram.png"
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    save_path = _get_save_path(save_dir, 'stage1_histogram', module_name)
+    plt.savefig(save_path, dpi=VisualizationConfig.PLOT_DPI, bbox_inches='tight')
     plt.close()
 
 
@@ -755,9 +899,8 @@ def plot_polar(cosine_similarity_cumsum_list, kernel_update_list, module_name,
     plt.tight_layout()
     
     # Save the plot
-    save_path = Path(save_dir) / f"{module_name}_polar_projection.png"
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    save_path = _get_save_path(save_dir, 'stage2_polar', module_name)
+    plt.savefig(save_path, dpi=VisualizationConfig.PLOT_DPI, bbox_inches='tight')
     plt.close()
 
 
@@ -942,12 +1085,208 @@ def plot_value_shift_bars(module_means, save_dir, xlim_main=None, xlim_kernel_up
     plt.tight_layout(rect=[0.2, 0, 0.98, 0.98])  # [left, bottom, right, top]
     
     # Save figure with padding to ensure labels are not clipped
-    save_path = Path(save_dir) / "value_shift_analysis.png"
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=300, bbox_inches='tight', pad_inches=0.15)
+    save_path = _get_save_path(save_dir, 'stage3_value_shift')
+    plt.savefig(save_path, dpi=VisualizationConfig.PLOT_DPI, bbox_inches='tight', pad_inches=0.15)
     plt.close()
     
     print(f"Saved value shift analysis to {save_path}")
+
+
+def plot_value_shift_proj_histogram(base_input_proj, input_shift_proj, kernel_update_proj, 
+                          base_kernel_proj, variances, module_name, milestones, 
+                          milestones_indices, save_dir):
+    """Plot Stage 4 histogram showing input projections and kernel projections on PCA components.
+    
+    Creates two stacked subplots:
+    - Top: base_input projection lengths (bars) + kernel_update and base_kernel projections (lines)
+    - Bottom: input_shift projection lengths (bars) + kernel_update and base_kernel projections (lines)
+    
+    Args:
+        base_input_proj: Projection lengths of base_input on PCA components [n_components]
+        input_shift_proj: Projection lengths of input_shift on PCA components [n_components]
+        kernel_update_proj: Projection lengths of kernel_update on PCA components [n_components]
+        base_kernel_proj: Projection lengths of base_kernel on PCA components [n_components]
+        variances: Explained variances [n_components]
+        module_name: Name of the module
+        milestones: List of milestone thresholds
+        milestones_indices: List of milestone indices
+        save_dir: Directory to save the plot
+    """
+    # Convert to numpy if needed
+    variances_np = _to_numpy(variances)
+    base_input_proj = _to_numpy(base_input_proj)
+    input_shift_proj = _to_numpy(input_shift_proj)
+    kernel_update_proj = _to_numpy(kernel_update_proj)
+    base_kernel_proj = _to_numpy(base_kernel_proj)
+    
+    n_components = len(variances_np)
+    x = np.arange(n_components)
+    
+    # Create figure with 2 subplots stacked vertically
+    fig, axes = plt.subplots(2, 1, figsize=(15, 12), squeeze=False)
+    
+    # Top subplot: base_input projection
+    ax_base = axes[0, 0]
+    ax_base_kernel = ax_base.twinx()
+    
+    # Plot base_input projection bars
+    ax_base.bar(x, base_input_proj, alpha=0.7, color='skyblue', edgecolor='navy', linewidth=0.5,
+                label='Base Input Projection')
+    
+    # Plot kernel projection lines on secondary axis
+    ax_base_kernel.plot(x, kernel_update_proj, 'o-', color='red', linewidth=2, markersize=4,
+                       alpha=0.9, label='Kernel Update Projection')
+    ax_base_kernel.plot(x, base_kernel_proj, 's-', color='green', linewidth=2, markersize=4,
+                       alpha=0.9, label='Base Kernel Projection')
+    
+    # Add milestone vertical lines
+    _draw_milestone_lines(ax_base, milestones, milestones_indices, n_components)
+    
+    # Set labels and colors
+    ax_base.set_ylabel('Base Input Projection Length', color='blue', fontsize=12)
+    ax_base.tick_params(axis='y', labelcolor='blue')
+    ax_base_kernel.set_ylabel('Kernel Projection Length', color='red', fontsize=12)
+    ax_base_kernel.tick_params(axis='y', labelcolor='red')
+    ax_base.set_xlabel('PCA Component Index')
+    ax_base.grid(True, alpha=0.3)
+    
+    # Legend for top subplot
+    legend_elements_base = [
+        plt.Rectangle((0, 0), 1, 1, facecolor='skyblue', alpha=0.7,
+                     label='Base Input Projection'),
+    ]
+    legend_elements_base.extend(_create_milestone_legend_elements(milestones, milestones_indices, n_components))
+    legend_elements_base.extend([
+        plt.Line2D([0], [0], color='red', marker='o', linestyle='-',
+                  label='Kernel Update Projection'),
+        plt.Line2D([0], [0], color='green', marker='s', linestyle='-',
+                  label='Base Kernel Projection'),
+    ])
+    ax_base.legend(handles=legend_elements_base, loc='upper right', fontsize=10)
+    
+    # Bottom subplot: input_shift projection
+    ax_shift = axes[1, 0]
+    ax_shift_kernel = ax_shift.twinx()
+    
+    # Plot input_shift projection bars
+    ax_shift.bar(x, input_shift_proj, alpha=0.7, color='lightcoral', edgecolor='darkred', 
+                 linewidth=0.5, label='Input Shift Projection')
+    
+    # Plot kernel projection lines on secondary axis (same as top)
+    ax_shift_kernel.plot(x, kernel_update_proj, 'o-', color='red', linewidth=2, markersize=4,
+                        alpha=0.9, label='Kernel Update Projection')
+    ax_shift_kernel.plot(x, base_kernel_proj, 's-', color='green', linewidth=2, markersize=4,
+                        alpha=0.9, label='Base Kernel Projection')
+    
+    # Add milestone vertical lines
+    _draw_milestone_lines(ax_shift, milestones, milestones_indices, n_components)
+    
+    # Set labels and colors
+    ax_shift.set_ylabel('Input Shift Projection Length', color='darkred', fontsize=12)
+    ax_shift.tick_params(axis='y', labelcolor='darkred')
+    ax_shift_kernel.set_ylabel('Kernel Projection Length', color='red', fontsize=12)
+    ax_shift_kernel.tick_params(axis='y', labelcolor='red')
+    ax_shift.set_xlabel('PCA Component Index')
+    ax_shift.grid(True, alpha=0.3)
+    
+    # Legend for bottom subplot
+    legend_elements_shift = [
+        plt.Rectangle((0, 0), 1, 1, facecolor='lightcoral', alpha=0.7,
+                     label='Input Shift Projection'),
+    ]
+    legend_elements_shift.extend(_create_milestone_legend_elements(milestones, milestones_indices, n_components))
+    legend_elements_shift.extend([
+        plt.Line2D([0], [0], color='red', marker='o', linestyle='-',
+                  label='Kernel Update Projection'),
+        plt.Line2D([0], [0], color='green', marker='s', linestyle='-',
+                  label='Base Kernel Projection'),
+    ])
+    ax_shift.legend(handles=legend_elements_shift, loc='upper right', fontsize=10)
+    
+    # Set title
+    plt.suptitle(f'Input and Kernel Projections on PCA Components\nModule: {module_name}',
+                fontsize=16)
+    plt.tight_layout()
+    
+    # Save the plot
+    save_path = _get_save_path(save_dir, 'stage4_proj_histogram', module_name)
+    plt.savefig(save_path, dpi=VisualizationConfig.PLOT_DPI, bbox_inches='tight')
+    plt.close()
+
+
+def _run_value_shift_proj_analysis(mean_pc_projection_norms, pca_cache, args, device, module_filter=None):
+    """Run value shift projection analysis and generate plots.
+    
+    Args:
+        mean_pc_projection_norms: Dictionary mapping module names to their mean principal component
+                                  projection norms (L2 norms of projections onto each PC)
+        pca_cache: PCA cache dictionary
+        args: Command line arguments
+        device: Device for computation
+        module_filter: Filter for modules to visualize. Can be:
+            - None: visualize all modules
+            - String "model start:end": match modules with prefix "model.i" where i in [start, end)
+            - String "start:end": index range (e.g., "0:10" for first 10 layers)
+            - String "start:": from start index to end
+            - String ":end": from beginning to end index
+            - String: single module name or pattern (supports wildcards with '*')
+            - List of strings: module names to include (supports wildcards and all above formats)
+    """
+    print("\nStage 4: Starting projection length analysis...")
+    
+    if not mean_pc_projection_norms:
+        print("Warning: No Stage 4 data available. Skipping Stage 4.")
+        return
+    
+    # Filter modules if filter is provided
+    all_module_names = sorted(mean_pc_projection_norms.keys())
+    if module_filter is None:
+        module_names_to_process = all_module_names
+    else:
+        module_names_to_process = _filter_modules(all_module_names, module_filter)
+        if not module_names_to_process:
+            print(f"Warning: No modules match the filter '{module_filter}'. Using all modules.")
+            module_names_to_process = all_module_names
+        else:
+            print(f"Filtered to {len(module_names_to_process)}/{len(all_module_names)} modules based on filter: {module_filter}")
+    
+    print(f"Generating Stage 4 plots for {len(module_names_to_process)} modules...")
+    
+    for module_name in tqdm(module_names_to_process, desc="Generating Stage 4 plots"):
+        if module_name not in pca_cache:
+            warnings.warn(f"Module {module_name} not found in PCA cache. Skipping.")
+            continue
+        
+        pca_operator = pca_cache[module_name]
+        
+        # Get PCA statistics
+        if isinstance(pca_operator, list):
+            pca_op = pca_operator[0]  # Use first group
+        else:
+            pca_op = pca_operator
+        
+        if not hasattr(pca_op, 'explained_variance_'):
+            warnings.warn(f"Module {module_name} PCA operator missing explained_variance_. Skipping.")
+            continue
+        
+        # Calculate variances and stored projections onto principal components
+        variances = pca_op.explained_variance_.to(device)
+        variances_cumsum = torch.cumsum(variances, dim=0)
+        variances_cumsum_ratio = variances_cumsum / variances_cumsum[-1]
+        milestones_indices = _calculate_milestone_indices(variances_cumsum_ratio, MILESTONES)
+        
+        # Get mean projection norms for this module
+        pc_projection_norms = mean_pc_projection_norms[module_name]
+        base_input_proj = pc_projection_norms['base_input_proj']
+        input_shift_proj = pc_projection_norms['input_shift_proj']
+        kernel_update_proj = pc_projection_norms['kernel_update_proj']
+        base_kernel_proj = pc_projection_norms['base_kernel_proj']
+        
+        # Plot histogram
+        plot_value_shift_proj_histogram(
+            base_input_proj, input_shift_proj, kernel_update_proj, base_kernel_proj,
+            variances, module_name, MILESTONES, milestones_indices, args.save_dir
+        )
 
 
 def _load_sample_images(sample_dirs, sample_num):
@@ -963,11 +1302,20 @@ def _load_sample_images(sample_dirs, sample_num):
     sample_files = []
     dirs = sample_dirs if isinstance(sample_dirs, (list, tuple)) else [sample_dirs]
     
+    # Build patterns for glob - more efficient than multiple glob calls
+    patterns = []
     for directory in dirs:
-        for ext in IMAGE_EXTENSIONS:
-            sample_files.extend(glob.glob(os.path.join(directory, f'*.{ext.lower()}')))
-            sample_files.extend(glob.glob(os.path.join(directory, f'*.{ext.upper()}')))
+        for ext in VisualizationConfig.IMAGE_EXTENSIONS:
+            # Use case-insensitive pattern matching
+            patterns.append(os.path.join(directory, f'*.{ext.lower()}'))
+            patterns.append(os.path.join(directory, f'*.{ext.upper()}'))
     
+    # Collect all matching files
+    for pattern in patterns:
+        sample_files.extend(glob.glob(pattern))
+    
+    # Remove duplicates and shuffle
+    sample_files = list(set(sample_files))  # Remove duplicates
     random.shuffle(sample_files)
     return sample_files[:sample_num]
 
@@ -1049,10 +1397,103 @@ def _preprocess_image(image_path, device):
     return image.unsqueeze(0)
 
 
+def _calculate_projection_lengths(input_tensor, kernel_tensor, pca_components, unfold=False):
+    """Calculate projection lengths of input and kernel on PCA components.
+    
+    Args:
+        input_tensor: Input tensor [bs, c_in, h_in, w_in]
+        kernel_tensor: Kernel tensor [c_out, c_in*k[0]*k[1]] (unfold=True) or 
+                      [c_out*k[0]*k[1], c_in] (unfold=False)
+        pca_components: PCA components [n_components, feature_dim]
+        unfold: Whether kernel uses unfolded representation
+    
+    Returns:
+        Tuple of (input_proj_lengths, kernel_proj_lengths)
+        - input_proj_lengths: [n_components] - projection lengths of input on each component
+        - kernel_proj_lengths: [n_components] - projection lengths of kernel on each component
+    """
+    device = input_tensor.device
+    bs, c_in, h_in, w_in = input_tensor.shape
+    
+    # Reshape input to [bs*h_in*w_in, c_in] for projection
+    input_reshaped = input_tensor.permute(0, 2, 3, 1).reshape(-1, c_in)  # [bs*h_in*w_in, c_in]
+    
+    # Center input (subtract mean if needed, but PCA components are already centered)
+    # Project input to PCA components: [bs*h_in*w_in, c_in] @ [c_in, n_components] = [bs*h_in*w_in, n_components]
+    # Standard case: PCA on input channels
+    input_proj = torch.matmul(input_reshaped, pca_components.T)  # [bs*h_in*w_in, n_components]
+    # Calculate projection lengths (L2 norm across samples)
+    input_proj_lengths = torch.norm(input_proj, p=2, dim=1)  # [bs*h_in*w_in]
+    
+    # Project kernel to PCA components
+    if unfold:
+        # kernel_tensor: [c_out, c_in*k[0]*k[1]]
+        # pca_components: [n_components, c_in*k[0]*k[1]]
+        kernel_proj = torch.matmul(kernel_tensor, pca_components.T)  # [c_out, n_components]
+        kernel_proj_lengths = torch.norm(kernel_proj, p=2, dim=1)  # [c_out*k[0]*k[1]]
+    else:
+        # kernel_tensor: [c_out*k[0]*k[1], c_in]
+        # pca_components: [n_components, c_in]
+        kernel_proj = torch.matmul(kernel_tensor, pca_components.T)  # [c_out*k[0]*k[1], n_components]
+        kernel_proj_lengths = torch.norm(kernel_proj, p=2, dim=1)  # [c_out*k[0]*k[1]]
+    
+    return input_proj_lengths, kernel_proj_lengths
+
+
+def _extract_tensor_from_hook_output(hook_output):
+    """Extract tensor from hook output (handles tuple or single tensor).
+    
+    Args:
+        hook_output: Output from forward hook (can be tuple or tensor)
+    
+    Returns:
+        Tensor
+    """
+    return hook_output[0] if isinstance(hook_output, tuple) else hook_output
+
+
+def _get_single_group_kernel(kernel, group_idx=0):
+    """Extract single group kernel from grouped convolution result.
+    
+    Args:
+        kernel: Kernel tensor or list of kernels
+        group_idx: Group index to extract (default: 0)
+    
+    Returns:
+        Single kernel tensor
+    """
+    if isinstance(kernel, list):
+        return kernel[group_idx] if group_idx < len(kernel) else kernel[0]
+    return kernel
+
+
+def _validate_module_data(base_name, incremental_name, intermediate_results):
+    """Validate module data availability and consistency.
+    
+    Args:
+        base_name: Base module name
+        incremental_name: Incremental module name
+        intermediate_results: Dictionary containing intermediate results
+    
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if base_name != incremental_name:
+        return False, f"Module names do not match: {base_name} vs {incremental_name}"
+    
+    if base_name not in intermediate_results["base_model"]:
+        return False, f"Module {base_name} not found in base model hooks"
+    
+    if base_name not in intermediate_results["incremental_model"]:
+        return False, f"Module {base_name} not found in incremental model hooks"
+    
+    return True, None
+
+
 def _process_module_for_value_shift(base_name, base_module, incremental_name,
                                    incremental_module, intermediate_results,
                                    base_input, incremental_input, base_output,
-                                   incremental_output, bboxes, save_dir):
+                                   incremental_output, bboxes, save_dir, pca_operator=None, unfold=False):
     """Process a single module for value shift analysis.
     
     Args:
@@ -1067,29 +1508,29 @@ def _process_module_for_value_shift(base_name, base_module, incremental_name,
         incremental_output: Incremental model output (extracted from intermediate_results)
         bboxes: Bounding boxes
         save_dir: Save directory
+        pca_operator: PCA operator for Stage 4 calculations (optional)
+        unfold: Whether to use unfolded kernel representation
     
     Returns:
-        Tuple of four mean absolute values: (kernel_update_mult_input, 
-        base_kernel_mult_input_shift, kernel_update_mult_input_shift, 
-        kernel_update_abs_mean, input_update_abs_mean) or None if error
+        Tuple of (value_shift_stats, pc_projection_norms) or None if error
+        - value_shift_stats: (kernel_update_mult_input, base_kernel_mult_input_shift, 
+                            kernel_update_mult_input_shift, kernel_update_abs_mean, input_update_abs_mean)
+        - pc_projection_norms: (base_input_proj, input_shift_proj, kernel_update_proj, base_kernel_proj) or None
+            Each element is the L2 norm of projections onto principal components [n_components]
     """
-    if base_name != incremental_name:
-        warnings.warn(f"Module names do not match: {base_name} vs {incremental_name}")
+    # Validate module data
+    is_valid, error_msg = _validate_module_data(base_name, incremental_name, intermediate_results)
+    if not is_valid:
+        if error_msg:
+            warnings.warn(error_msg)
         return None
     
-    if base_name not in intermediate_results["base_model"]:
-        return None
-    
-    if base_name not in intermediate_results["incremental_model"]:
-        warnings.warn(f"Module {base_name} not found in incremental model hooks")
-        return None
-    
+    # Extract tensors from hook outputs
     base_input_raw = intermediate_results["base_model"][base_name]["input"]
     incremental_input_raw = intermediate_results["incremental_model"][base_name]["input"]
     
-    base_input = base_input_raw[0] if isinstance(base_input_raw, tuple) else base_input_raw
-    incremental_input = (incremental_input_raw[0] if isinstance(incremental_input_raw, tuple)
-                        else incremental_input_raw)
+    base_input = _extract_tensor_from_hook_output(base_input_raw)
+    incremental_input = _extract_tensor_from_hook_output(incremental_input_raw)
     
     base_output = intermediate_results["base_model"][base_name]["output"]
     incremental_output = intermediate_results["incremental_model"][base_name]["output"]
@@ -1105,15 +1546,13 @@ def _process_module_for_value_shift(base_name, base_module, incremental_name,
                         f"{base_output.shape} vs {incremental_output.shape}")
         return None
     
-    # Flatten kernels
-    base_kernel = flatten_kernel(base_module)
-    incremental_kernel = flatten_kernel(incremental_module)
+    # Flatten kernels (for Stage 3, use default unfold=False)
+    base_kernel = flatten_kernel(base_module, unfold=False)
+    incremental_kernel = flatten_kernel(incremental_module, unfold=False)
     
     # Handle grouped convolutions (take first group for now)
-    if isinstance(base_kernel, list):
-        base_kernel = base_kernel[0]
-    if isinstance(incremental_kernel, list):
-        incremental_kernel = incremental_kernel[0]
+    base_kernel = _get_single_group_kernel(base_kernel)
+    incremental_kernel = _get_single_group_kernel(incremental_kernel)
     
     # Calculate value shift
     kernel_update_mult_input, base_kernel_mult_input_shift, kernel_update_mult_input_shift = \
@@ -1131,17 +1570,61 @@ def _process_module_for_value_shift(base_name, base_module, incremental_name,
     input_update_abs_mean = torch.mean(torch.abs(input_update)).item()
     # input_update_abs_mean = 0.
     
-    # Return mean absolute values
-    return (
+    # Stage 4: Calculate projection lengths on PCA components
+    pc_projection_norms = None
+    if pca_operator is not None:
+        # Get PCA components (use first group for grouped convolutions)
+        _, pca_list = _normalize_pca_operator_to_list(pca_operator)
+        pca_op = pca_list[0]
+        
+        if hasattr(pca_op, 'components_'):
+            components = F.normalize(pca_op.components_.to(base_input.device), p=2, dim=1)
+            
+            # Calculate input shift
+            input_shift = incremental_input - base_input
+            
+            # Re-flatten kernels with correct unfold parameter for Stage 4
+            base_kernel_stage4 = flatten_kernel(base_module, unfold=unfold)
+            incremental_kernel_stage4 = flatten_kernel(incremental_module, unfold=unfold)
+            
+            # Handle grouped convolutions
+            base_kernel_stage4 = _get_single_group_kernel(base_kernel_stage4)
+            incremental_kernel_stage4 = _get_single_group_kernel(incremental_kernel_stage4)
+            
+            # Calculate kernel update
+            kernel_update_stage4 = incremental_kernel_stage4 - base_kernel_stage4
+            
+            # Calculate projections
+            base_input_proj, base_kernel_proj = _calculate_projection_lengths(
+                base_input, base_kernel_stage4, components, unfold
+            )
+            input_shift_proj, _ = _calculate_projection_lengths(
+                input_shift, torch.zeros_like(base_kernel_stage4), components, unfold
+            )
+            _, kernel_update_proj = _calculate_projection_lengths(
+                torch.zeros_like(base_input), kernel_update_stage4, components, unfold
+            )
+            
+            pc_projection_norms = (
+                base_input_proj.cpu().numpy(),
+                input_shift_proj.cpu().numpy(),
+                kernel_update_proj.cpu().numpy(),
+                base_kernel_proj.cpu().numpy()
+            )
+    
+    # Return mean absolute values and Stage 4 data
+    value_shift_stats = (
         torch.mean(torch.abs(kernel_update_mult_input)).item(),
         torch.mean(torch.abs(base_kernel_mult_input_shift)).item(),
         torch.mean(torch.abs(kernel_update_mult_input_shift)).item(),
         kernel_update_abs_mean,
         input_update_abs_mean
     )
+    
+    return (value_shift_stats, pc_projection_norms)
 
 
-def _run_value_shift_analysis(base_model, incremental_model, args, device):
+def _run_value_shift_analysis(base_model, incremental_model, args, device, pca_cache=None, module_filter=None):
     """Run value shift analysis (Stage 3).
     
     Args:
@@ -1149,6 +1632,12 @@ def _run_value_shift_analysis(base_model, incremental_model, args, device):
         incremental_model: Incremental model
         args: Command line arguments
         device: Device for computation
+        pca_cache: PCA cache dictionary for Stage 4 (optional)
+        module_filter: Parsed module filter (optional, can be string or list)
+    
+    Returns:
+        Dictionary mapping module names to their statistics (for Stage 3)
+        Dictionary mapping module names to their Stage 4 projection data (for Stage 4)
     """
     print("\nStage 3: Starting value shift analysis...")
     
@@ -1180,6 +1669,19 @@ def _run_value_shift_analysis(base_model, incremental_model, args, device):
         for name in intermediate_results["base_model"].keys()
     }
     
+    # Initialize Stage 4 accumulator if needed
+    stage4_enabled = (4 in set(args.stages)) if hasattr(args, 'stages') else False
+    module_pc_projection_norms = {}
+    if stage4_enabled and pca_cache is not None:
+        for name in intermediate_results["base_model"].keys():
+            if name in pca_cache:
+                module_pc_projection_norms[name] = {
+                    'base_input_proj': [],
+                    'input_shift_proj': [],
+                    'kernel_update_proj': [],
+                    'base_kernel_proj': []
+                }
+    
     # Process each sample
     sample_pbar = tqdm(range(len(sample_files)), desc="Processing samples for value shift analysis")
     for i in sample_pbar:
@@ -1203,19 +1705,36 @@ def _run_value_shift_analysis(base_model, incremental_model, args, device):
             if base_name not in intermediate_results["base_model"].keys():
                 continue
 
+            # Get PCA operator for Stage 4 if needed
+            pca_operator = None
+            if stage4_enabled and pca_cache is not None and base_name in pca_cache:
+                pca_operator = pca_cache[base_name]
+
             result = _process_module_for_value_shift(
                 base_name, base_module, inc_name, inc_module, intermediate_results,
-                None, None, None, None, bboxes, args.save_dir
+                None, None, None, None, bboxes, args.save_dir,
+                pca_operator=pca_operator, unfold=args.unfold
             )
             
             if result is not None:
+                (value_shift_stats, pc_projection_norms) = result
                 kernel_update_mult_input, base_kernel_mult_input_shift, kernel_update_mult_input_shift,\
-                     kernel_update_abs_mean, input_update_abs_mean = result
+                     kernel_update_abs_mean, input_update_abs_mean = value_shift_stats
+                
+                # Stage 3 statistics
                 module_stats[base_name]['kernel_update_mult_input'].append(kernel_update_mult_input)
                 module_stats[base_name]['base_kernel_mult_input_shift'].append(base_kernel_mult_input_shift)
                 module_stats[base_name]['kernel_update_mult_input_shift'].append(kernel_update_mult_input_shift)
                 module_stats[base_name]['kernel_update_abs_mean'].append(kernel_update_abs_mean)
                 module_stats[base_name]['input_update_abs_mean'].append(input_update_abs_mean)
+                
+                # Stage 4 statistics: accumulate principal component projection norms
+                if stage4_enabled and pc_projection_norms is not None and base_name in module_pc_projection_norms:
+                    base_input_proj, input_shift_proj, kernel_update_proj, base_kernel_proj = pc_projection_norms
+                    module_pc_projection_norms[base_name]['base_input_proj'].append(base_input_proj)
+                    module_pc_projection_norms[base_name]['input_shift_proj'].append(input_shift_proj)
+                    module_pc_projection_norms[base_name]['kernel_update_proj'].append(kernel_update_proj)
+                    module_pc_projection_norms[base_name]['base_kernel_proj'].append(base_kernel_proj)
             
             module_stats[base_name]["call_idx"] = intermediate_results['base_model'][base_name]["call_idx"]
     
@@ -1259,17 +1778,26 @@ def _run_value_shift_analysis(base_model, incremental_model, args, device):
             except ValueError:
                 warnings.warn(f"Invalid xlim_kernel_update format: {args.xlim_kernel_update}. Expected 'min,max'. Using auto scale.")
         
-        # Parse module_filter if provided
-        module_filter = None
-        if args.module_filter is not None:
-            # Check if it's a comma-separated list of patterns
-            if ',' in args.module_filter:
-                module_filter = [pattern.strip() for pattern in args.module_filter.split(',')]
-            else:
-                module_filter = args.module_filter
-        
+        # Use parsed module_filter if provided, otherwise use args.module_filter
+        filter_to_use = module_filter if module_filter is not None else args.module_filter
         plot_value_shift_bars(module_means, args.save_dir, xlim_main=xlim_main, 
-                              xlim_kernel_update=xlim_kernel_update, module_filter=module_filter)
+                              xlim_kernel_update=xlim_kernel_update, module_filter=filter_to_use)
+    
+    # Calculate mean principal component projection norms across samples
+    mean_pc_projection_norms = {}
+    if stage4_enabled:
+        for name in module_pc_projection_norms:
+            num_samples = len(module_pc_projection_norms[name]['base_input_proj'])
+            if num_samples > 0:
+                # Average across samples: mean L2 norms of projections onto each principal component
+                mean_pc_projection_norms[name] = {
+                    'base_input_proj': np.mean(module_pc_projection_norms[name]['base_input_proj'], axis=0),
+                    'input_shift_proj': np.mean(module_pc_projection_norms[name]['input_shift_proj'], axis=0),
+                    'kernel_update_proj': np.mean(module_pc_projection_norms[name]['kernel_update_proj'], axis=0),
+                    'base_kernel_proj': np.mean(module_pc_projection_norms[name]['base_kernel_proj'], axis=0)
+                }
+    
+    return module_means, mean_pc_projection_norms
 
 
 def _process_modules_for_pca_visualization(modules_to_process, pca_cache, args,
@@ -1277,14 +1805,16 @@ def _process_modules_for_pca_visualization(modules_to_process, pca_cache, args,
     """Process modules for PCA visualization (Stages 1 and 2).
     
     Args:
-        modules_to_process: Iterable of modules to process
+        modules_to_process: Iterable of modules to process (may be filtered)
         pca_cache: PCA cache dictionary
         args: Command line arguments
         enabled_stages: Set of enabled stage numbers
         has_both_models: Whether both models are available
         device: Device for computation
     """
-    pbar = tqdm(modules_to_process, desc="Processing modules", total=len(pca_cache))
+    # Convert to list to get accurate length for progress bar
+    modules_list = list(modules_to_process) if not isinstance(modules_to_process, list) else modules_to_process
+    pbar = tqdm(modules_list, desc="Processing modules", total=len(modules_list))
     
     for item in pbar:
         # Extract module information
@@ -1368,6 +1898,58 @@ def _process_modules_for_pca_visualization(modules_to_process, pca_cache, args,
             pbar.set_postfix_str(f"Skipped {module_name} (no stages enabled)")
     
 
+# ============================================================================
+# Model Loading and Initialization
+# ============================================================================
+
+def _setup_device(device_str):
+    """Setup and validate device for computation.
+    
+    Args:
+        device_str: Device string (e.g., 'cuda:0', 'cpu')
+    
+    Returns:
+        Validated device string
+    """
+    if "cuda" in device_str and not torch.cuda.is_available():
+        warnings.warn("CUDA is set to device but unavailable, using CPU instead.")
+        return "cpu"
+    return device_str
+
+
+def _load_model(model_path):
+    """Load YOLO model from checkpoint.
+    
+    Args:
+        model_path: Path to model checkpoint
+    
+    Returns:
+        Model object or None if path is None
+    """
+    if model_path is None:
+        return None
+    print(f"Loading model from: {model_path}")
+    model = YOLO(model_path).model
+    print("Successfully loaded model")
+    return model
+
+
+def _parse_module_filter(module_filter_str):
+    """Parse module filter string into filter specification.
+    
+    Args:
+        module_filter_str: Filter string (can be comma-separated)
+    
+    Returns:
+        Filter specification (string or list of strings)
+    """
+    if module_filter_str is None:
+        return None
+    if ',' in module_filter_str:
+        return [pattern.strip() for pattern in module_filter_str.split(',')]
+    return module_filter_str
+
+
 def main(args):
     """Main function.
     
@@ -1380,6 +1962,7 @@ def main(args):
     print("  Stage 1: Variance and weight update projection histograms")
     print("  Stage 2: Weight projection polar plots")
     print("  Stage 3: Value shift histograms")
+    print("  Stage 4: Input and kernel projection length histograms")
     
     print(f"Saving results to: {args.save_dir}")
     os.makedirs(args.save_dir, exist_ok=True)
@@ -1393,25 +1976,15 @@ def main(args):
         print("Error: PCA cache is empty. No plots will be generated.")
         return
     
-    # Load models
-    device = args.device
-    if "cuda" in device and not torch.cuda.is_available():
-        args.device = "cpu"
-        warnings.warn("CUDA is set to device but unavailable, using CPU instead.")
-    
-    base_model = None
-    if args.base_model:
-        print(f"Loading base model from: {args.base_model}")
-        base_model = YOLO(args.base_model).model
-        print("Successfully loaded base model")
-    
-    incremental_model = None
-    if args.incremental_model:
-        print(f"Loading incremental model from: {args.incremental_model}")
-        incremental_model = YOLO(args.incremental_model).model
-        print("Successfully loaded incremental model")
-    
+    # Setup device and load models
+    device_str = _setup_device(args.device)
+    device = torch.device(device_str)
+    base_model = _load_model(args.base_model)
+    incremental_model = _load_model(args.incremental_model)
     has_both_models = base_model is not None and incremental_model is not None
+    
+    # Parse module filter
+    module_filter = _parse_module_filter(args.module_filter)
     
     # Prepare modules for processing
     need_main_loop = (1 in enabled_stages) or (2 in enabled_stages)
@@ -1435,7 +2008,43 @@ def main(args):
             print("Warning: No models provided. Only PCA variance and mean plots will be generated.")
             modules_to_process = pca_cache.items()
         
+        # Convert modules_to_process to list for filtering
+        if isinstance(modules_to_process, zip):
+            modules_to_process = list(modules_to_process)
+        elif not isinstance(modules_to_process, list):
+            modules_to_process = list(modules_to_process)
+        
+        # Extract module names for filtering
+        all_module_names = []
+        if has_both_models:
+            all_module_names = [name for (name, _), _ in modules_to_process]
+        elif base_model:
+            all_module_names = [name for name, _ in modules_to_process]
+        else:
+            all_module_names = [name for name, _ in modules_to_process]
+        
+        # Apply module filter if provided
+        if module_filter is not None:
+            filtered_module_names = _filter_modules(all_module_names, module_filter)
+            if not filtered_module_names:
+                print(f"Warning: No modules match the filter '{module_filter}' for Stages 1 and 2. Using all modules.")
+                filtered_module_names = all_module_names
+            else:
+                print(f"Filtered to {len(filtered_module_names)}/{len(all_module_names)} modules for Stages 1 and 2 based on filter: {module_filter}")
+            
+            # Filter modules_to_process based on filtered names
+            filtered_modules = []
+            if has_both_models:
+                filtered_modules = [item for item in modules_to_process if item[0][0] in filtered_module_names]
+            elif base_model:
+                filtered_modules = [item for item in modules_to_process if item[0] in filtered_module_names]
+            else:
+                filtered_modules = [item for item in modules_to_process if item[0] in filtered_module_names]
+            
+            modules_to_process = filtered_modules
+        
         print(f"Found {len(pca_cache)} modules in PCA cache: {list(pca_cache.keys())}")
+        print(f"Processing {len(modules_to_process)} modules for Stages 1 and 2")
         
         # Process modules for PCA visualization
         _process_modules_for_pca_visualization(
@@ -1445,6 +2054,7 @@ def main(args):
         print("Stages 1 and 2 are disabled. Skipping main processing loop.")
     
     # Stage 3: Value shift analysis
+    mean_pc_projection_norms = {}
     if 3 in enabled_stages:
         if not has_both_models:
             print("\nStage 3: Skipped (requires both base_model and incremental_model)")
@@ -1456,7 +2066,27 @@ def main(args):
                 base_model.to(device).eval()
             if incremental_model is not None:
                 incremental_model.to(device).eval()
-            _run_value_shift_analysis(base_model, incremental_model, args, device)
+            _, mean_pc_projection_norms = _run_value_shift_analysis(
+                base_model, incremental_model, args, device, pca_cache=pca_cache, module_filter=module_filter
+            )
+    
+    # Stage 4: Input and kernel projection length analysis
+    if 4 in enabled_stages:
+        if not has_both_models:
+            print("\nStage 4: Skipped (requires both base_model and incremental_model)")
+        elif args.sample_dir is None:
+            print("\nStage 4: Skipped (requires --sample_dir)")
+        elif not mean_pc_projection_norms:
+            print("\nStage 4: Skipped (no Stage 4 data available, Stage 3 may not have run)")
+        else:
+            # Ensure models are moved to device
+            if base_model is not None:
+                base_model.to(device).eval()
+            if incremental_model is not None:
+                incremental_model.to(device).eval()
+            
+            # module_filter is already parsed in main function
+            _run_value_shift_proj_analysis(mean_pc_projection_norms, pca_cache, args, device, module_filter=module_filter)
 
 
 if __name__ == "__main__":
@@ -1475,9 +2105,9 @@ if __name__ == "__main__":
                         help="Directory or directories containing label files (optional)")
     parser.add_argument("--sample_num", type=int, default=100,
                         help="Number of samples to use for value shift analysis")
-    parser.add_argument("--stages", type=int, nargs='+', default=[1, 2, 3],
+    parser.add_argument("--stages", type=int, nargs='+', default=[1, 2, 3, 4],
                        help="Stages to enable: 1=histogram plots, 2=polar plots, "
-                           "3=value shift analysis (default: all)")
+                           "3=value shift analysis, 4=input/kernel projection histograms (default: all)")
     parser.add_argument("--xlim_main", type=str, default=None,
                        help="Main x-axis range as 'min,max' (e.g., '0,100')")
     parser.add_argument("--xlim_kernel_update", type=str, default=None,

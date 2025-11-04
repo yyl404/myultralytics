@@ -1,4 +1,5 @@
 import argparse
+import csv
 
 from ultralytics import YOLO
 
@@ -98,12 +99,45 @@ def main():
     parser.add_argument("--data", type=str, help="Data config path(.yaml)")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument("--project", type=str, default="runs/detect", help="Project name(where to save logs)")
+    parser.add_argument("--save_path", type=str, default="results.csv", help="Path to save results")
+    parser.add_argument("--confusion_matrix_path", type=str, default="confusion_matrix.csv", help="Path to save confusion matrix")
     args, unknown = parser.parse_known_args()
     dynamic_kwargs = parse_dynamic_named_args(unknown) # Other dynamic arguments
 
     model = YOLO(args.model)
-    model.val(data=args.data, device=args.device, project=args.project, **dynamic_kwargs)
+    results = model.val(data=args.data, device=args.device, project=args.project, **dynamic_kwargs)
+    summary = results.summary()
+    confusion_matrix = results.confusion_matrix.summary()
+    
+    # Write results to CSV file
+    with open(args.save_path, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['Class', 'Instances', 'Box-P', 'Box-R', 'Box-F1', 'mAP50', 'mAP50-95']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        writer.writeheader()
+        for item in summary:
+            writer.writerow({
+                'Class': item["Class"],
+                'Instances': item["Instances"],
+                'Box-P': item["Box-P"],
+                'Box-R': item["Box-R"],
+                'Box-F1': item["Box-F1"],
+                'mAP50': item["mAP50"],
+                'mAP50-95': item["mAP50-95"]
+            })
+    
+    print(f"Results saved to {args.save_path}")
 
+    # Write confusion matrix to CSV file
+    with open(args.confusion_matrix_path, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = confusion_matrix[0].keys()
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+        writer.writeheader()
+        for item in confusion_matrix:
+            writer.writerow({
+                **{key: item[key] for key in fieldnames},
+            })
 
 if __name__ == "__main__":
     main()

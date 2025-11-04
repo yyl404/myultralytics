@@ -11,7 +11,7 @@ import torch.nn as nn
 __all__ = (
     "Conv",
     "Conv2",
-    "DecomposedConv",
+    "DecomposeConv",
     "LightConv",
     "DWConv",
     "DWConvTranspose2d",
@@ -201,6 +201,9 @@ class DecomposeConv(nn.Module):
             c1, c2, k, s, p, g, d, act, cr = self.conv_args
             self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
             
+            if isinstance(k, tuple):
+                k = k[0]
+
             if self.linear_first:
                 w1 = self.conv_1.weight.data.reshape(g, cr//g, c1//g) # (cr, c1//g, 1, 1) --> (g, cr//g, c1//g)
                 w2 = self.conv_2.weight.data.permute((2,3,0,1)) # (c2, cr//g, k, k) --> (k, k, c2, cr//g)
@@ -223,6 +226,9 @@ class DecomposeConv(nn.Module):
             self.__delattr__("conv_1")
             self.__delattr__("conv_2")
             self.forward = self.forward_fuse_convs
+
+    def forward_fuse(self, x):
+        return self.act(self.conv(x))
 
 
 class LightConv(nn.Module):

@@ -455,6 +455,29 @@ class DetectDecomposed(nn.Module):
         i = torch.arange(batch_size)[..., None]  # batch indices
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
 
+    def fuse_last_2_convs(self, conv_1, conv_2):
+        cr = conv_1.weight.data.shape[0]
+        c1 = conv_1.weight.data.shape[1]
+        c2 = conv_2.weight.data.shape[0]
+        w1 = conv_1.weight.data.reshape(cr, c1) # (cr, c1) --> (cr, c1)
+        w2 = conv_2.weight.data.reshape(c2, cr) # (c2, cr) --> (c2, cr)
+        w = w2 @ w1 # (c2, cr) @ (cr, c1) --> (c2, c1)
+        w = w.reshape(c2, c1, 1, 1)
+        fused_conv = nn.Conv2d(c1, c2, 1)
+        fused_conv.weight.data = w.detach()
+        fused_conv.bias.data = conv_2.bias.data.detach()
+        return fused_conv
+
+    def fuse_convs(self):
+        for i in range(self.nl):
+            for j in range(2):
+                self.cv2[i][j].fuse_convs()
+                self.cv3[i][j].fuse_convs()
+            self.cv2[i][-2] = self.fuse_last_2_convs(self.cv2[i][-2], self.cv2[i][-1])
+            self.cv3[i][-2] = self.fuse_last_2_convs(self.cv3[i][-2], self.cv3[i][-1])
+            self.cv2[i].pop(-1)
+            self.cv3[i].pop(-1)
+
 
 class Segment(Detect):
     """

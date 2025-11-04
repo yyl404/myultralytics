@@ -119,7 +119,7 @@ def compress_conv_module(conv, name, pca_operators, ratio, linear_first=True, ve
     return conv_1, conv_2
             
 # -------- Non-recursive helpers to reduce analyzer complexity --------
-def _compress_conv(module: Conv, name, pca_cache, ratio, linear_first, verbose):
+def _compress_conv(module: Conv, name, pca_cache, ratio, linear_first, verbose, fuse=False):
     conv = module.conv
     conv_name = name + ".conv"
     pca_operators = pca_cache[conv_name]
@@ -136,10 +136,15 @@ def _compress_conv(module: Conv, name, pca_cache, ratio, linear_first, verbose):
         "cr": cr,
         "linear_first": linear_first
     }
+    if fuse:
+        compressed_module.fuse_convs()
+        compressed_module_fused = deepcopy(module)
+        compressed_module_fused.load_state_dict(compressed_module.state_dict())
+        compressed_module = compressed_module_fused
     return compressed_module, decomposition_args
 
 
-def _compress_bottleneck(module: Bottleneck, name, pca_cache, ratio, linear_first, verbose):
+def _compress_bottleneck(module: Bottleneck, name, pca_cache, ratio, linear_first, verbose, fuse=False):
     cv1 = module.cv1
     cv2 = module.cv2
     shortcut = module.add
@@ -147,33 +152,39 @@ def _compress_bottleneck(module: Bottleneck, name, pca_cache, ratio, linear_firs
     k = (module.cv1.conv.kernel_size[0], module.cv2.conv.kernel_size[0])
     e = module.cv1.conv.out_channels / module.cv2.conv.out_channels + 1e-3
 
-    cv1_compressed, decomposition_args_cv1 = _compress_conv(cv1, name + ".cv1", pca_cache, ratio, linear_first, verbose)
-    cv2_compressed, decomposition_args_cv2 = _compress_conv(cv2, name + ".cv2", pca_cache, ratio, linear_first, verbose)
+    cv1_compressed, decomposition_args_cv1 = _compress_conv(cv1, name + ".cv1", pca_cache, ratio, linear_first, verbose, fuse)
+    cv2_compressed, decomposition_args_cv2 = _compress_conv(cv2, name + ".cv2", pca_cache, ratio, linear_first, verbose, fuse)
 
     decomposition_args = {
         "cr1": decomposition_args_cv1["cr"],
         "cr2": decomposition_args_cv2["cr"],
         "linear_first": linear_first
     }
-    compressed_module = BottleneckDecomposed(cv1.conv.in_channels, cv2.conv.out_channels, shortcut=shortcut, g=g, k=k, e=e, decomposition_args=decomposition_args)
-    compressed_module.eval().to(cv1.conv.weight.device)
-    compressed_module.cv1.load_state_dict(cv1_compressed.state_dict())
-    compressed_module.cv2.load_state_dict(cv2_compressed.state_dict())
+    if fuse:
+        compressed_module = deepcopy(module)
+        compressed_module.cv1.load_state_dict(cv1_compressed.state_dict())
+        compressed_module.cv2.load_state_dict(cv2_compressed.state_dict())
+        return compressed_module, decomposition_args
+    else:
+        compressed_module = BottleneckDecomposed(cv1.conv.in_channels, cv2.conv.out_channels, shortcut=shortcut, g=g, k=k, e=e, decomposition_args=decomposition_args)
+        compressed_module.eval().to(cv1.conv.weight.device)
+        compressed_module.cv1.load_state_dict(cv1_compressed.state_dict())
+        compressed_module.cv2.load_state_dict(cv2_compressed.state_dict())
     return compressed_module, decomposition_args
 
 
-def _compress_modulelist(module: nn.ModuleList, name, pca_cache, ratio, linear_first, verbose):
+def _compress_modulelist(module: nn.ModuleList, name, pca_cache, ratio, linear_first, verbose, fuse=False):
     compressed_module = nn.ModuleList()
     decomposition_args = []
     for i, m in enumerate(module):
         # elements are Bottleneck in this architecture
-        compressed_module_item, decomposition_args_item = _compress_bottleneck(m, name + "." + str(i), pca_cache, ratio, linear_first, verbose)
+        compressed_module_item, decomposition_args_item = _compress_bottleneck(m, name + "." + str(i), pca_cache, ratio, linear_first, verbose, fuse)
         compressed_module.append(compressed_module_item)
         decomposition_args.append((decomposition_args_item["cr1"], decomposition_args_item["cr2"]))
     return compressed_module, decomposition_args
 
 
-def _compress_c2f(module: C2f, name, pca_cache, ratio, linear_first, verbose):
+def _compress_c2f(module: C2f, name, pca_cache, ratio, linear_first, verbose, fuse=False):
     cv1 = module.cv1
     cv2 = module.cv2
     m = module.m
@@ -181,9 +192,9 @@ def _compress_c2f(module: C2f, name, pca_cache, ratio, linear_first, verbose):
     g = m[0].cv2.conv.groups
     e = module.c / module.cv2.conv.out_channels + 1e-3
 
-    cv1_compressed, decomposition_args_cv1 = _compress_conv(cv1, name + ".cv1", pca_cache, ratio, linear_first, verbose)
-    cv2_compressed, decomposition_args_cv2 = _compress_conv(cv2, name + ".cv2", pca_cache, ratio, linear_first, verbose)
-    m_compressed, decomposition_args_m = _compress_modulelist(m, name + ".m", pca_cache, ratio, linear_first, verbose)
+    cv1_compressed, decomposition_args_cv1 = _compress_conv(cv1, name + ".cv1", pca_cache, ratio, linear_first, verbose, fuse)
+    cv2_compressed, decomposition_args_cv2 = _compress_conv(cv2, name + ".cv2", pca_cache, ratio, linear_first, verbose, fuse)
+    m_compressed, decomposition_args_m = _compress_modulelist(m, name + ".m", pca_cache, ratio, linear_first, verbose, fuse)
 
     decomposition_args = {
         "cr1": decomposition_args_cv1["cr"],
@@ -191,33 +202,46 @@ def _compress_c2f(module: C2f, name, pca_cache, ratio, linear_first, verbose):
         "cr_bottleneck": decomposition_args_m,
         "linear_first": linear_first
     }
-    compressed_module = C2fDecomposed(cv1.conv.in_channels, cv2.conv.out_channels, n=len(m), shortcut=shortcut, g=g, e=e, decomposition_args=decomposition_args)
-    compressed_module.eval().to(cv1.conv.weight.device)
-    compressed_module.cv1.load_state_dict(cv1_compressed.state_dict())
-    compressed_module.cv2.load_state_dict(cv2_compressed.state_dict())
-    compressed_module.m.load_state_dict(m_compressed.state_dict())
+    if fuse:
+        compressed_module = deepcopy(module)
+        compressed_module.cv1.load_state_dict(cv1_compressed.state_dict())
+        compressed_module.cv2.load_state_dict(cv2_compressed.state_dict())
+        compressed_module.m.load_state_dict(m_compressed.state_dict())
+        return compressed_module, decomposition_args
+    else:
+        compressed_module = C2fDecomposed(cv1.conv.in_channels, cv2.conv.out_channels, n=len(m), shortcut=shortcut, g=g, e=e, decomposition_args=decomposition_args)
+        compressed_module.eval().to(cv1.conv.weight.device)
+        compressed_module.cv1.load_state_dict(cv1_compressed.state_dict())
+        compressed_module.cv2.load_state_dict(cv2_compressed.state_dict())
+        compressed_module.m.load_state_dict(m_compressed.state_dict())
     return compressed_module, decomposition_args
 
 
-def _compress_sppf(module: SPPF, name, pca_cache, ratio, linear_first, verbose):
+def _compress_sppf(module: SPPF, name, pca_cache, ratio, linear_first, verbose, fuse=False):
     cv1 = module.cv1
     cv2 = module.cv2
     k = module.m.kernel_size[0]
-    cv1_compressed, decomposition_args_cv1 = _compress_conv(cv1, name + ".cv1", pca_cache, ratio, linear_first, verbose)
-    cv2_compressed, decomposition_args_cv2 = _compress_conv(cv2, name + ".cv2", pca_cache, ratio, linear_first, verbose)
+    cv1_compressed, decomposition_args_cv1 = _compress_conv(cv1, name + ".cv1", pca_cache, ratio, linear_first, verbose, fuse)
+    cv2_compressed, decomposition_args_cv2 = _compress_conv(cv2, name + ".cv2", pca_cache, ratio, linear_first, verbose, fuse)
     decomposition_args = {
         "cr1": decomposition_args_cv1["cr"],
         "cr2": decomposition_args_cv2["cr"],
         "linear_first": linear_first
     }
-    compressed_module = SPPFDecomposed(cv1.conv.in_channels, cv2.conv.out_channels, k=k, decomposition_args=decomposition_args)
-    compressed_module.eval().to(cv1.conv.weight.device)
-    compressed_module.cv1.load_state_dict(cv1_compressed.state_dict())
-    compressed_module.cv2.load_state_dict(cv2_compressed.state_dict())
+    if fuse:
+        compressed_module = deepcopy(module)
+        compressed_module.cv1.load_state_dict(cv1_compressed.state_dict())
+        compressed_module.cv2.load_state_dict(cv2_compressed.state_dict())
+        return compressed_module, decomposition_args
+    else:
+        compressed_module = SPPFDecomposed(cv1.conv.in_channels, cv2.conv.out_channels, k=k, decomposition_args=decomposition_args)
+        compressed_module.eval().to(cv1.conv.weight.device)
+        compressed_module.cv1.load_state_dict(cv1_compressed.state_dict())
+        compressed_module.cv2.load_state_dict(cv2_compressed.state_dict())
     return compressed_module, decomposition_args
 
 
-def _compress_detect(module: Detect, name, pca_cache, ratio, linear_first, verbose):
+def _compress_detect(module: Detect, name, pca_cache, ratio, linear_first, verbose, fuse=False):
     cv2 = module.cv2
     cv3 = module.cv3
     nc = module.nc
@@ -268,9 +292,15 @@ def _compress_detect(module: Detect, name, pca_cache, ratio, linear_first, verbo
     compressed_module.dfl.load_state_dict(module.dfl.state_dict())
 
     compressed_module.stride = module.stride
+    if fuse:
+        compressed_module.fuse_convs()
+        compressed_module_fused = deepcopy(module)
+        compressed_module_fused.load_state_dict(compressed_module.state_dict())
+        compressed_module = compressed_module_fused
     return compressed_module, decomposition_args
 
-def compress_module(module, name, pca_cache, ratio, linear_first=True, verbose=False):
+
+def compress_module(module, name, pca_cache, ratio, linear_first=True, verbose=False, fuse=False):
     """
     压缩模块，返回近似等效的压缩模块
 
@@ -285,17 +315,17 @@ def compress_module(module, name, pca_cache, ratio, linear_first=True, verbose=F
         tuple: (compressed_module, decomposition_args)
     """
     if isinstance(module, Conv):
-        compressed_module, decomposition_args = _compress_conv(module, name, pca_cache, ratio, linear_first, verbose)
+        compressed_module, decomposition_args = _compress_conv(module, name, pca_cache, ratio, linear_first, verbose, fuse)
     elif isinstance(module, Bottleneck):
-        compressed_module, decomposition_args = _compress_bottleneck(module, name, pca_cache, ratio, linear_first, verbose)
+        compressed_module, decomposition_args = _compress_bottleneck(module, name, pca_cache, ratio, linear_first, verbose, fuse)
     elif isinstance(module, nn.ModuleList):
-        compressed_module, decomposition_args = _compress_modulelist(module, name, pca_cache, ratio, linear_first, verbose)
+        compressed_module, decomposition_args = _compress_modulelist(module, name, pca_cache, ratio, linear_first, verbose, fuse)
     elif isinstance(module, C2f):
-        compressed_module, decomposition_args = _compress_c2f(module, name, pca_cache, ratio, linear_first, verbose)
+        compressed_module, decomposition_args = _compress_c2f(module, name, pca_cache, ratio, linear_first, verbose, fuse)
     elif isinstance(module, SPPF):
-        compressed_module, decomposition_args = _compress_sppf(module, name, pca_cache, ratio, linear_first, verbose)
+        compressed_module, decomposition_args = _compress_sppf(module, name, pca_cache, ratio, linear_first, verbose, fuse)
     elif isinstance(module, Detect):
-        compressed_module, decomposition_args = _compress_detect(module, name, pca_cache, ratio, linear_first, verbose)
+        compressed_module, decomposition_args = _compress_detect(module, name, pca_cache, ratio, linear_first, verbose, fuse)
     else:
         raise ValueError(f"Unsupported module type: {type(module).__name__}")
     
@@ -343,7 +373,7 @@ def compress_module(module, name, pca_cache, ratio, linear_first=True, verbose=F
 
     return compressed_module, decomposition_args
 
-def compress_model(base_model, base_model_cfg, pca_cache, ratio, layers, linear_first=True, verbose=False):
+def compress_model(base_model, base_model_cfg, pca_cache, ratio, layers, linear_first=True, verbose=False, fuse=False):
     """
     压缩模型，返回压缩后的模型和架构配置文件
 
@@ -368,19 +398,20 @@ def compress_model(base_model, base_model_cfg, pca_cache, ratio, layers, linear_
         base_module = base_model.model.get_submodule(name)
         if type(base_module) in [Conv, C2f, SPPF, Detect]:
             # 计算压缩模块的权重
-            compressed_module, decomposition_args = compress_module(base_module, name, pca_cache, ratio, linear_first, verbose)
+            compressed_module, decomposition_args = compress_module(base_module, name, pca_cache, ratio, linear_first, verbose, fuse)
 
             # 替换原始模块为压缩后的模块
             parent_module = compressed_model.model.get_submodule('.'.join(name.split('.')[:-1]) if '.' in name else '')
             parent_module.add_module(name.split('.')[-1], compressed_module)
 
             # 更新架构配置文件
-            if lid < len_backbone:
-                compressed_model_cfg["backbone"][lid][3].append(decomposition_args)
-                compressed_model_cfg["backbone"][lid][2] = type(compressed_module).__name__
-            else:
-                compressed_model_cfg["head"][lid - len_backbone][3].append(decomposition_args)
-                compressed_model_cfg["head"][lid - len_backbone][2] = type(compressed_module).__name__
+            if not fuse:
+                if lid < len_backbone:
+                    compressed_model_cfg["backbone"][lid][3].append(decomposition_args)
+                    compressed_model_cfg["backbone"][lid][2] = type(compressed_module).__name__
+                else:
+                    compressed_model_cfg["head"][lid - len_backbone][3].append(decomposition_args)
+                    compressed_model_cfg["head"][lid - len_backbone][2] = type(compressed_module).__name__
     
     compressed_model.yaml = compressed_model_cfg
     return compressed_model, compressed_model_cfg
@@ -410,7 +441,8 @@ def main(args):
         # 如果未指定层，则压缩所有层
         args.layers = list(range(len(base_model.model.model)))
     LOGGER.info(f"Compressing model with variance cumulative ratio {args.ratio}. Compressed layers: {args.layers}")
-    compressed_model, compressed_model_cfg = compress_model(base_model, base_model_cfg, pca_cache, args.ratio, args.layers, args.linear_first, args.verbose) # 自动创建压缩后的模型和架构配置文件
+    compressed_model, compressed_model_cfg = compress_model(base_model, base_model_cfg, pca_cache, args.ratio,
+                                                           args.layers, args.linear_first, args.verbose, args.fuse)
     # 评估压缩后的模型性能
     pbar = tqdm(os.listdir(args.sample_images)[:args.sample_num])
     total_loss = 0.0
@@ -430,8 +462,8 @@ def main(args):
     YAML.save(data=compressed_model_cfg, file=args.save_path.split('.')[0] + ".yaml")
     compressed_model = YOLO(args.save_path.split('.')[0] + ".yaml")
     compressed_model.model.load_state_dict(state_dict_compressed_model)
+    compressed_model.model.names = base_model.model.names
     compressed_model.save(args.save_path)
-    print(compressed_model.yaml)
     LOGGER.info(f"Compressed model and config saved to {args.save_path} and {args.save_path.split('.')[0] + '.yaml'}")
 
 
@@ -448,5 +480,6 @@ if __name__ == "__main__":
     parser.add_argument("--sample_num", type=int, default=100, help="Sample images number")
     parser.add_argument("--linear_first", action="store_true", help="Whether to compress the model with linear first")
     parser.add_argument("--verbose", action="store_true", help="Whether to print verbose information")
+    parser.add_argument("--fuse", action="store_true", help="Whether to fuse the model")
     args = parser.parse_args()
     main(args)

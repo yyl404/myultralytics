@@ -15,8 +15,6 @@
     --check: （可选）是否检查卷积核展开操作正确性
 """
 
-# from sklearn.decomposition import IncrementalPCA
-from gpu_pca import IncrementalPCAonGPU as IncrementalPCA # faster
 import threading
 import psutil
 import time
@@ -37,6 +35,8 @@ from ultralytics import YOLO
 from ultralytics.utils import (
     LOGGER
 )
+
+from pca_on_gpu import IncrementalPCAonGPU as IncrementalPCA
 
 
 class RealTimeMemoryMonitor:

@@ -29,8 +29,8 @@ def convert_class_id(label_lines, class_id_map):
                 new_cat_id = class_id_map[old_cat_id]
                 parts[0] = str(new_cat_id)
                 converted_lines.append(' '.join(parts) + '\n')
-            else:
-                LOGGER.warning(f"Class ID {old_cat_id} not found in class_id_map")
+            # else:
+                # LOGGER.warning(f"Class ID {old_cat_id} not found in class_id_map")
     return converted_lines
 
 
@@ -126,7 +126,7 @@ def create_classes_expanded_dataset(cfg_source, class_id_map, save_dir, target_d
     return config_path
 
 
-def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save_dir, output_name):
+def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save_dir, output_name, zero_weight_init=False):
     """扩充模型检测头的输出通道数，为新增类别分配新通道，同时将原本检测头的权重迁移到对应通道的权重
     
     Args:
@@ -136,6 +136,7 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
         classes_names: 类别名称列表
         save_dir: 保存目录
         output_name: 输出名称
+        zero_weight_init: 是否将新通道的权重初始化为0
     """
     model = YOLO(ckpt_path)
     assert isinstance(model.model, DetectionModel) and isinstance(model.model.model, Sequential)\
@@ -147,6 +148,10 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
     model_cfg["nc"] = len(classes_names)
     YAML.save(data=model_cfg, file=OSP.join(save_dir, f"{model_name}-nc{len(classes_names)}.yaml"))
     new_model = YOLO(OSP.join(save_dir, f"{model_name}-nc{len(classes_names)}.yaml"))
+    if zero_weight_init:
+        for name, param in new_model.model.named_parameters():
+            if 'cv3' in name and name.endswith('.2.weight'):
+                param.data.zero_()
     new_weight = new_model.model.state_dict()
 
     # 权重迁移：分类层按映射迁移，其他层直接复制
@@ -176,6 +181,53 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
     new_model.save(OSP.join(save_dir, output_name))
 
 
+def calculate_iou(box1, box2):
+    """计算两个边界框的IoU
+    
+    Args:
+        box1: [x_center, y_center, width, height] (归一化坐标，tensor类型)
+        box2: [x_center, y_center, width, height] (归一化坐标，tensor类型)
+    
+    Returns:
+        float: IoU值
+    """
+    # 确保输入是tensor类型
+    if not isinstance(box1, torch.Tensor):
+        box1 = torch.tensor(box1, dtype=torch.float32)
+    if not isinstance(box2, torch.Tensor):
+        box2 = torch.tensor(box2, dtype=torch.float32)
+    
+    # 转换为左上角和右下角坐标
+    x1_1, y1_1 = box1[0] - box1[2]/2, box1[1] - box1[3]/2
+    x2_1, y2_1 = box1[0] + box1[2]/2, box1[1] + box1[3]/2
+    
+    x1_2, y1_2 = box2[0] - box2[2]/2, box2[1] - box2[3]/2
+    x2_2, y2_2 = box2[0] + box2[2]/2, box2[1] + box2[3]/2
+    
+    # 计算交集
+    x1_i = torch.max(x1_1, x1_2)
+    y1_i = torch.max(y1_1, y1_2)
+    x2_i = torch.min(x2_1, x2_2)
+    y2_i = torch.min(y2_1, y2_2)
+    
+    # 检查是否有交集（tensor比较需要转换为标量）
+    if (x2_i <= x1_i).item() or (y2_i <= y1_i).item():
+        return 0.0
+    
+    intersection = (x2_i - x1_i) * (y2_i - y1_i)
+    
+    # 计算并集
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union = area1 + area2 - intersection
+    
+    # 确保返回Python float类型
+    if (union > 0).item():
+        return (intersection / union).item()
+    else:
+        return 0.0
+
+
 def merge_labels(original_labels, pseudo_labels):
     """合并标注文件，用于在基于蒸馏的增量学习方法训练和评估流程中，合并原始标注和伪标注
     
@@ -198,7 +250,38 @@ def merge_labels(original_labels, pseudo_labels):
         
         # 添加伪标注
         if label_file in pseudo_labels:
-            merged_lines.extend(pseudo_labels[label_file])
+            # 解析原始标注，存储为 (class_id, box) 列表
+            original_boxes = []
+            if label_file in original_labels:
+                for line in original_labels[label_file]:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        class_id = int(parts[0])
+                        box = [float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])]
+                        original_boxes.append((class_id, box))
+            
+            # 过滤伪标签：如果与原始标签IoU > 0.5且类别不一致，则不添加
+            for pseudo_line in pseudo_labels[label_file]:
+                # parts = pseudo_line.strip().split()
+                # if len(parts) >= 5:
+                #     pseudo_class_id = int(parts[0])
+                #     pseudo_box = [float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])]
+                    
+                #     # 检查是否应该添加这个伪标签
+                #     should_add = True
+                #     # 将伪标签框转换为tensor
+                #     pseudo_box_tensor = torch.tensor(pseudo_box, dtype=torch.float32)
+                #     for orig_class_id, orig_box in original_boxes:
+                #         # 将原始标签框转换为tensor
+                #         orig_box_tensor = torch.tensor(orig_box, dtype=torch.float32)
+                #         iou = calculate_iou(pseudo_box_tensor, orig_box_tensor)
+                #         if iou > 0.5 and pseudo_class_id != orig_class_id:
+                #             should_add = False
+                #             break
+                    
+                    # if should_add:
+                    if True:
+                        merged_lines.append(pseudo_line)
         
         merged_labels[label_file] = merged_lines
     
@@ -436,13 +519,21 @@ def main(args):
     if args.convert_dataset_class_id:
         model = YOLO(args.model_path)
         model_classes = [model.names[i] for i in sorted(model.names.keys())]
-        
+
         data_cfg = YAML.load(args.data_cfg)
         source_classes = [data_cfg["names"][i] for i in sorted(data_cfg["names"].keys())]
         
         class_id_map = {}
         for i, cls in enumerate(source_classes):
-            class_id_map[i] = model_classes.index(cls)
+            if cls in model_classes:
+                class_id_map[i] = model_classes.index(cls)
+            else:
+                if args.keep_unrecognized_classes:
+                    # 把模型输出类别列表中不包含的类别，映射到超出模型输出通道数的索引空间
+                    class_id_map[i] = len(model_classes)
+                    model_classes.append(cls)
+                else:
+                    LOGGER.warning(f"Class {cls} not found in model classes, skipped")
 
         root_dir, dataset_name = OSP.split(args.save_dir)
         create_classes_expanded_dataset(args.data_cfg, class_id_map, root_dir, dataset_name, model_classes)
@@ -467,7 +558,7 @@ def main(args):
         
         root_dir, model_name = OSP.split(args.save_path)
         expand_detection_head(args.model_path, args.model_cfg, base_class_id_map, all_classes,
-                              root_dir, model_name)
+                              root_dir, model_name, args.zero_weight_init)
         return 0
     
     if args.create_pseudo_labels_dataset:
@@ -504,10 +595,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, help="Save directory")
     # 转换数据集类别ID
     parser.add_argument("--convert_dataset_class_id", action="store_true", help="Convert dataset class id")
+    parser.add_argument("--keep_unrecognized_classes", action="store_true", help="Keep unrecognized classes")
     # 合并增量类别并扩展检测头
     parser.add_argument("--expand_detection_head", action="store_true", help="Expand detection head")
     parser.add_argument("--model_cfg", type=str, help="Model config path")
     parser.add_argument("--save_path", type=str, help="Save path")
+    parser.add_argument("--zero_weight_init", action="store_true", help="Zero weight init")
     # 创建伪标签数据集
     parser.add_argument("--create_pseudo_labels_dataset", action="store_true", help="Create pseudo labels dataset")
     parser.add_argument("--conf_threshold", type=float, default=0.25, help="Confidence threshold")
