@@ -27,9 +27,9 @@ from ultralytics.utils.torch_utils import (
     autocast,
     unset_deterministic,
 )
-from ultralytics.engine.distillation import (
-    KDLoss,
-)
+# from ultralytics.engine.distillation import (
+#     KDLoss,
+# )
 from ultralytics.engine.vspreg import (
     VSPRegLoss,
 )
@@ -58,47 +58,70 @@ class AntiForgetTrainer(BaseTrainer):
             self.base_model = deepcopy(self.model).eval()
             for p in self.base_model.parameters():
                 p.requires_grad_(False)
-            components, variances, biases = {}, {}, {}
+            components, variances = {}, {}
             self.pca_cache = joblib.load(self.args.pca_cache_path)
             for name in self.pca_cache.keys():
                 _components = []
                 _variances = []
-                _biases = []
                 for ig in range(len(self.pca_cache[name])):
                     _components.append(self.pca_cache[name][ig].components_)
                     _variances.append(self.pca_cache[name][ig].explained_variance_)
-                    _biases.append(self.pca_cache[name][ig].mean_)
-                components[name], variances[name], biases[name] = torch.stack(_components), torch.stack(_variances), torch.stack(_biases)
+                components[name], variances[name] = torch.stack(_components), torch.stack(_variances)
             self.vspreg_loss = VSPRegLoss(self.model, self.base_model, module_names=self.pca_cache.keys(),
-                                          components=components, variances=variances, means=biases)
+                                          components=components, variances=variances, keep_ratio=self.args.vspreg_keep_ratio,
+                                          center_ratio=self.args.vspreg_center_ratio, steepness=self.args.vspreg_steepness)
         # ============================== END: set up VSPReg loss =================================================
 
         # ============================== MODIFIED: set up KD loss ================================================
-        if self.args.kd:
-            self.teacher_model = deepcopy(self.model).eval()
-            for p in self.teacher_model.parameters():
-                p.requires_grad_(False)
+        # if self.args.kd:
+        #     self.teacher_model = deepcopy(self.model).eval()
+        #     for p in self.teacher_model.parameters():
+        #         p.requires_grad_(False)
 
-            if self.args.distill_layers is not None:
-                distill_layers = self.args.distill_layers
-            else:
-                if isinstance(self.args.freeze, list):
-                    distill_layers = [x for x in range(len(self.teacher_model.model)) if x not in self.args.freeze]
-                elif isinstance(self.args.freeze, int):
-                    distill_layers = list(range(len(self.teacher_model.model))).remove(self.args.freeze)
-                else:
-                    distill_layers = list(range(len(self.teacher_model.model)))
+        #     if self.args.distill_layers is not None:
+        #         distill_layers = self.args.distill_layers
+        #     else:
+        #         if isinstance(self.args.freeze, list):
+        #             distill_layers = [x for x in range(len(self.teacher_model.model)) if x not in self.args.freeze]
+        #         elif isinstance(self.args.freeze, int):
+        #             distill_layers = list(range(len(self.teacher_model.model))).remove(self.args.freeze)
+        #         else:
+        #             distill_layers = list(range(len(self.teacher_model.model)))
 
-            self.kd_loss = KDLoss(self.model, self.teacher_model, distill_layers=distill_layers,
-                                  distiller=self.args.distiller, device=self.device)
+        #     self.kd_loss = KDLoss(self.model, self.teacher_model, distill_layers=distill_layers,
+        #                           distiller=self.args.distiller, device=self.device)
             
-            # calculate the number of extra parameters introduced by kd loss
-            if self.kd_loss.distill_type.lower() == "feature":
-                kd_params = sum(p.numel() for p in self.kd_loss.D_loss_fn.parameters())
-                LOGGER.info(f"{colorstr('Feature-level KD params:')} {kd_params/1e6:.2f} M")
-            else:
-                LOGGER.info(f"{colorstr('Logit-level KD enabled, no extra sub-module parameters')}")
+        #     # calculate the number of extra parameters introduced by kd loss
+        #     if self.kd_loss.distill_type.lower() == "feature":
+        #         kd_params = sum(p.numel() for p in self.kd_loss.D_loss_fn.parameters())
+        #         LOGGER.info(f"{colorstr('Feature-level KD params:')} {kd_params/1e6:.2f} M")
+        #     else:
+        #         LOGGER.info(f"{colorstr('Logit-level KD enabled, no extra sub-module parameters')}")
         # ============================== END: set up KD loss ======================================================
+
+        # ============================== MODIFIED: set up Prototype Replay loss ===================================
+        if self.args.proto_rp:
+            self.prototypes = torch.load(self.args.prototypes) # List[torch.Tensor]
+            for i, x in enumerate(self.prototypes):
+                # x: [num_prototypes, ch*3*3+4*reg_max+nc]
+                self.prototypes[i] = x.to(self.device)
+                self.prototypes[i].requires_grad_(False)
+            
+            # Check if we should use base_model for distillation instead of prototype supervision
+            # proto_rp_use_base_model: if True, use base_model output as supervision; if False, use prototype's built-in supervision
+            self.proto_rp_use_base_model = self.args.proto_rp_use_base_model
+            
+            # If using base_model for distillation, ensure base_model exists
+            if self.proto_rp_use_base_model:
+                if not hasattr(self, 'base_model'):
+                    # Create base_model from current model if not already created (e.g., by vspreg)
+                    self.base_model = deepcopy(self.model).eval()
+                    for p in self.base_model.parameters():
+                        p.requires_grad_(False)
+                    LOGGER.info("Created base_model for prototype replay distillation")
+                else:
+                    LOGGER.info("Using existing base_model for prototype replay distillation")
+        # ============================== END: set up Prototype Relay loss =========================================
         
         # Freeze layers
         freeze_list = (
@@ -238,8 +261,8 @@ class AntiForgetTrainer(BaseTrainer):
                 with torch.no_grad():
                     _ = self.base_model(torch.randn(1, 3, 640, 640).to(self.device))
 
-            if self.args.kd:
-                self.kd_loss.register_hook() # Register hook for KD loss
+            # if self.args.kd:
+            #     self.kd_loss.register_hook() # Register hook for KD loss
             # ============================== END: register hook ================================================
             
             for i, batch in pbar:
@@ -261,28 +284,75 @@ class AntiForgetTrainer(BaseTrainer):
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
                     loss, self.loss_items = self.model(batch)
+                    # ============================== MODIFIED: make a copy of loss items ===============================
+                    loss_items = deepcopy(self.loss_items)
+                    # ============================== END: make a copy of loss items ====================================
                     self.loss = loss.sum()
 
                     # ============================== MODIFIED: calculate VSPReg loss ===================================
                     if self.args.vspreg:
                         _vspreg_loss = self.vspreg_loss.get_loss()
                         self.loss += (_vspreg_loss * 1000)
-                        loss_items = torch.cat([self.loss_items, torch.tensor([_vspreg_loss], device=self.loss_items.device)])
+                        loss_items = torch.cat([loss_items, torch.tensor([_vspreg_loss], device=loss_items.device)])
                     # ============================== END: calculate VSPReg loss ========================================
 
                     # ============================== MODIFIED: calculate distillation loss =============================
-                    if self.args.kd:
-                        with torch.no_grad():
-                            _ = self.teacher_model(batch["img"])
+                    # if self.args.kd:
+                    #     with torch.no_grad():
+                    #         _ = self.teacher_model(batch["img"])
                         
-                        _raw_kd_loss_weight = self.kd_loss.get_kd_weight(epoch=self.epoch, total_epochs=self.epochs)
-                        _raw_kd_loss = self.kd_loss.get_loss() * _raw_kd_loss_weight
-                        scale = batch["img"].shape[0]  # scale distillation loss by batch size
-                        _kd_loss = _raw_kd_loss * scale
+                    #     _raw_kd_loss_weight = self.kd_loss.get_kd_weight(epoch=self.epoch, total_epochs=self.epochs)
+                    #     _raw_kd_loss = self.kd_loss.get_loss() * _raw_kd_loss_weight
+                    #     scale = batch["img"].shape[0]  # scale distillation loss by batch size
+                    #     _kd_loss = _raw_kd_loss * scale
 
-                        self.loss += _kd_loss
-                        loss_items = torch.cat([loss_items, torch.tensor([_kd_loss], device=loss_items.device)])
+                    #     self.loss += _kd_loss
+                    #     loss_items = torch.cat([loss_items, torch.tensor([_kd_loss], device=loss_items.device)])
                     # ============================== END: calculate distillation loss ====================================
+
+                    # ============================== MODIFIED: replay prototypes =========================================
+                    if self.args.proto_rp:
+                        cls_loss_proto = 0.
+                        box_loss_proto = 0.
+                        reg = self.model.model[-1].cv2
+                        cls = self.model.model[-1].cv3
+
+                        for j in range(len(reg)):
+                            in_channels = cls[j][0].conv.in_channels
+                            reg_out_channels = reg[j][-1].out_channels
+                            cls_out_channels = cls[j][-1].out_channels
+
+                            prototypes = self.prototypes[j][:,:in_channels*3*3].reshape(-1, in_channels, 3, 3)
+                            
+                            # Use reg[j] and cls[j] to access the j-th layer module, not the ModuleList itself
+                            reg_out = reg[j](prototypes)
+                            cls_out = cls[j](prototypes)
+                            
+                            # Reshape outputs to match supervision targets
+                            # Normal case: input is (num_prototypes, in_channels, 3, 3), output is (num_prototypes, out_channels, 3, 3)
+                            # Extract center point (1, 1) to match supervision which corresponds to a single spatial location
+                            reg_out = reg_out[:, :, 1, 1]  # (num_prototypes, out_channels, 3, 3) -> (num_prototypes, out_channels)
+                            cls_out = cls_out[:, :, 1, 1]  # (num_prototypes, out_channels, 3, 3) -> (num_prototypes, out_channels)
+
+                            # Choose supervision signal source: prototype's built-in supervision or base_model distillation
+                            if self.proto_rp_use_base_model:
+                                # Use base_model output as supervision signal (distillation)
+                                with torch.no_grad():
+                                    base_reg = self.base_model.model[-1].cv2
+                                    base_cls = self.base_model.model[-1].cv3
+                                    reg_supervision = base_reg[j](prototypes)[:, :, 1, 1]  # (num_prototypes, reg_out_channels)
+                                    cls_supervision = base_cls[j](prototypes)[:, :, 1, 1]  # (num_prototypes, cls_out_channels)
+                            else:
+                                # Use prototype's built-in supervision labels
+                                reg_supervision = self.prototypes[j][:,in_channels*3*3:in_channels*3*3+reg_out_channels]
+                                cls_supervision = self.prototypes[j][:,in_channels*3*3+reg_out_channels:]
+
+                            cls_loss_proto += torch.nn.functional.mse_loss(cls_out, cls_supervision)
+                            box_loss_proto += torch.nn.functional.mse_loss(reg_out, reg_supervision)
+                    
+                        loss_items = torch.cat([loss_items, torch.tensor([cls_loss_proto, box_loss_proto], device=loss_items.device)])
+                        loss += (cls_loss_proto + box_loss_proto)
+                    # ============================== END: replay prototypes ==============================================
 
                     if RANK != -1:
                         self.loss *= world_size                   
@@ -330,8 +400,8 @@ class AntiForgetTrainer(BaseTrainer):
             # ============================== MODIFIED: remove hook ===========================================
             if self.args.vspreg:
                 self.vspreg_loss.remove_handle_() # Remove hook for VSPRegLoss
-            if self.args.kd:
-                self.kd_loss.remove_handle_() # Remove hook for KD loss
+            # if self.args.kd:
+            #     self.kd_loss.remove_handle_() # Remove hook for KD loss
             # ============================== END: remove hook ================================================
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers

@@ -133,8 +133,12 @@ distiller: "mgd" # (str) distiller type, choices=[mgd, cwdf, at, atm, skd, pkd]
 
 # projection settings ----------------------------------------------------------------------------------------------------
 vspreg: True # (bool) whether to use VSPReg
-projection_layers: None # (list[str], optional)
-sample_images: None # (str, optional)
-sample_labels: None # (str, optional)
-pca_sample_num: 100 # (int)
 pca_cache_path: None # (str, optional)
+vspreg_keep_ratio: 1.0 # (float) keep ratio for VSPReg
+vspreg_center_ratio: 0.9 # (float) center ratio for VSPReg
+vspreg_steepness: 100 # (int) steepness for VSPReg
+
+# prototype replay settings
+proto_rp: True
+prototypes: None
+proto_rp_use_base_model: True

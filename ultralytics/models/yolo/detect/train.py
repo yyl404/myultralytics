@@ -13,7 +13,7 @@ from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.engine.antiforget import AntiForgetTrainer
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import LOGGER, RANK, DEFAULT_CFG
+from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels, plot_results
 from ultralytics.utils.torch_utils import de_parallel, torch_distributed_zero_first
@@ -220,8 +220,6 @@ class DetectionTrainer(BaseTrainer):
 
 
 class AntiForgetDetectionTrainer(AntiForgetTrainer):
-    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
-        super().__init__(cfg, overrides, _callbacks)
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: Optional[int] = None):
         """
@@ -324,6 +322,8 @@ class AntiForgetDetectionTrainer(AntiForgetTrainer):
             self.loss_names.append("vsp_loss")
         if self.args.kd:
             self.loss_names.append("kd_loss")
+        if self.args.proto_rp:
+            self.loss_names.extend(["cls_loss_proto", "cls_loss_proto"])
         self.loss_names = tuple(self.loss_names)
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks

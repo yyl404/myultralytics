@@ -15,7 +15,6 @@ from ultralytics.nn.modules import (
     AIFI,
     C1,
     C2,
-    C2fDecomposed,
     C2PSA,
     C3,
     C3TR,
@@ -25,7 +24,6 @@ from ultralytics.nn.modules import (
     SPP,
     SPPELAN,
     SPPF,
-    SPPFDecomposed,
     A2C2f,
     AConv,
     ADown,
@@ -44,10 +42,8 @@ from ultralytics.nn.modules import (
     Concat,
     Conv,
     Conv2,
-    DecomposeConv,
     ConvTranspose,
     Detect,
-    DetectDecomposed,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -235,8 +231,8 @@ class BaseModel(torch.nn.Module):
         """
         if not self.is_fused():
             for m in self.model.modules():
-                if isinstance(m, (Conv, Conv2, DWConv, DecomposeConv)) and hasattr(m, "bn"):
-                    if isinstance(m, (Conv2, DecomposeConv)):
+                if isinstance(m, (Conv, Conv2, DWConv)) and hasattr(m, "bn"):
+                    if isinstance(m, Conv2):
                         m.fuse_convs()
                     m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                     delattr(m, "bn")  # remove batchnorm
@@ -293,7 +289,9 @@ class BaseModel(torch.nn.Module):
         """
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, DetectDecomposed)): # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect, YOLOEDetect, YOLOESegment
+        if isinstance(
+            m, Detect
+        ):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect, YOLOEDetect, YOLOESegment
             m.stride = fn(m.stride)
             m.anchors = fn(m.anchors)
             m.strides = fn(m.strides)
@@ -404,7 +402,7 @@ class DetectionModel(BaseModel):
 
         # Build strides
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, DetectDecomposed)): # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
+        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
             s = 256  # 2x min stride
             m.inplace = self.inplace
 
@@ -1612,14 +1610,12 @@ def parse_model(d, ch, verbose=True):
         {
             Classify,
             Conv,
-            DecomposeConv,
             ConvTranspose,
             GhostConv,
             Bottleneck,
             GhostBottleneck,
             SPP,
             SPPF,
-            SPPFDecomposed,
             C2fPSA,
             C2PSA,
             DWConv,
@@ -1628,7 +1624,6 @@ def parse_model(d, ch, verbose=True):
             C1,
             C2,
             C2f,
-            C2fDecomposed,
             C3k2,
             RepNCSPELAN4,
             ELAN1,
@@ -1655,7 +1650,6 @@ def parse_model(d, ch, verbose=True):
             C1,
             C2,
             C2f,
-            C2fDecomposed,
             C3k2,
             C2fAttn,
             C3,
@@ -1667,14 +1661,6 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
-        }
-    )
-    decomposed_modules = frozenset(
-        {
-            C2fDecomposed,
-            SPPFDecomposed,
-            DetectDecomposed,
-            DecomposeConv,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1690,9 +1676,6 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in decomposed_modules:
-            decomposition_args = args[-1]
-            args = args[:-1]
         if m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
@@ -1730,12 +1713,12 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, DetectDecomposed, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, DetectDecomposed, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1752,15 +1735,7 @@ def parse_model(d, ch, verbose=True):
         else:
             c2 = ch[f]
 
-        if m in decomposed_modules:
-            if m is DecomposeConv:
-                m_ = torch.nn.Sequential(*(m(*args, **decomposition_args) for _ in range(n))) \
-                    if n > 1 else m(*args, **decomposition_args)  # module
-            else:
-                m_ = torch.nn.Sequential(*(m(*args, decomposition_args=decomposition_args) for _ in range(n))) \
-                    if n > 1 else m(*args, decomposition_args=decomposition_args)  # module
-        else:
-            m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type
         m_.np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
@@ -1863,7 +1838,7 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, DetectDecomposed, WorldDetect, YOLOEDetect, v10Detect)):
+            elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"
 
     # Guess from model filename

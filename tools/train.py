@@ -1,3 +1,63 @@
+"""Train a YOLO model on a given dataset and save the trained model.
+
+This script trains a YOLO model on a specified dataset and saves the trained model checkpoint.
+It supports both standard detection training and anti-forgetting training for incremental learning.
+
+Usage:
+    $ python tools/train.py \
+        --model <path/to/model.pt> \
+        --data <path/to/dataset.yaml> \
+        --save_path <path/to/save/model.pt> \
+        [--epochs <num_epochs>] \
+        [--batch_size <batch_size>] \
+        [--workers <num_workers>] \
+        [--device <device>] \
+        [--project <project_dir>] \
+        [--trainer <trainer_type>] \
+        [--<additional_args> ...]
+
+Arguments:
+    --model: Path to the model checkpoint file (.pt) for fine-tuning or model configuration
+        file (.yaml) for training from scratch. Required argument.
+    --data: Path to the dataset configuration file (.yaml). Required argument.
+    --save_path: Path where the trained model will be saved. Required argument.
+    --epochs: Number of training epochs. Default: 100.
+    --batch_size: Batch size for training. Default: 16.
+    --workers: Number of worker threads for data loading. Default: 8.
+    --device: Device to use for training (e.g., 'cuda', 'cpu', '0', '1').
+        Default: 'cuda'.
+    --project: Project directory where training logs and outputs will be saved.
+        Default: 'runs/detect'.
+    --trainer: Type of trainer to use. Options:
+        - None or not specified: Use default DetectionTrainer
+        - 'antiforget': Use AntiForgetDetectionTrainer for incremental learning
+        Default: None.
+    --<additional_args>: Additional dynamic arguments can be passed to the model.train()
+        method. These will be automatically parsed and passed through. Examples include
+        --imgsz, --lr0, --lrf, --momentum, --weight_decay, etc.
+
+Examples:
+    $ python tools/train.py \
+        --model yolov8l.yaml \
+        --data data/VOC_inc_10_10/task_1_cls_10/dataset.yaml \
+        --save_path runs/task1/best.pt \
+        --epochs 100 \
+        --batch_size 16 \
+        --device 0
+    
+    $ python tools/train.py \
+        --model runs/task1/best.pt \
+        --data data/VOC_inc_10_10/task_2_cls_10/dataset.yaml \
+        --save_path runs/task2/best.pt \
+        --epochs 100 \
+        --batch_size 16 \
+        --workers 8 \
+        --device cuda \
+        --trainer antiforget \
+        --imgsz 640 \
+        --lr0 0.01
+"""
+
 import argparse
 
 from ultralytics import YOLO
@@ -96,6 +156,7 @@ def parse_dynamic_named_args(tokens):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, help="Model to train(.pt/.yaml)")
+    parser.add_argument("--weight", type=str, default=None, help="Pretrained weight to load(.pt)")
     parser.add_argument("--data", type=str, help="Data config path(.yaml)")
     parser.add_argument("--save_path", type=str, help="Where to save the trained model")
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
@@ -108,6 +169,9 @@ def main():
     dynamic_kwargs = parse_dynamic_named_args(unknown) # Other dynamic arguments
 
     model = YOLO(args.model)
+    if args.weight is not None:
+        # This is for loading weights of heterogeneous models while preserving the architecture of the originally initialized model
+        model.load(args.weight) 
     
     if args.trainer == "antiforget":
         trainer = AntiForgetDetectionTrainer

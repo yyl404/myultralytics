@@ -7,6 +7,8 @@ from torch import nn
 
 from ultralytics import YOLO
 
+from tools.pca import PCAHooker, PCAHookerWithBboxes
+
 
 MILESTONES = [0.75, 0.90, 0.95, 0.99]
 MILESTONE_COLORS = ['red', 'orange', 'green', 'purple']
@@ -22,12 +24,9 @@ def main(args):
     base_model.to(args.device).eval()
     incremental_model.to(args.device).eval()
 
-    pca_cache = joblib.load(args.pca_cache)
-
     if args.layers is None:
         args.layers = list(range(len(base_model.model.model)))
     
-    base_kernels = {}
     kernel_updates = {}
 
     if args.label_dir is not None:
@@ -37,18 +36,26 @@ def main(args):
     
     pca_hookers.load_pca_cache(args.pca_cache)
     
-    # Stage 1: plot PCA variances, kernel update cosine similarity and milestones
     for name, module in base_model.model.named_modules():
         for layer in args.layers:
             if f"model.{layer}" in name and isinstance(nn.Conv2d):
-                base_kernels[name] = module.weight.data.flatten(1,3) # [c_out, c_in*k*k]
+                k, g, c_in, c_out = module.kernel_size, module.groups, module.in_channels, module.out_channels
+
+                base_kernel = module.weight.data.reshape(g, c_out//g, c_in//g * k[0] * k[1])  # [g, c_out//g, c_in//g * k[0] * k[1]]
                 
                 incremental_module = incremental_model.model.get_submodule(name)
-                incremental_kernel = incremental_module.weight.data.flatten(1,3) # [c_out, c_in*k*k]
+                incremental_kernel = incremental_module.weight.data.reshape(g, c_out//g, c_in//g * k[0] * k[1])  # [g, c_out//g, c_in//g * k[0] * k[1]]
 
-                kernel_updates[name] = incremental_kernel - base_kernels[name]
+                kernel_updates[name] = incremental_kernel - base_kernel
 
                 break
+
+    for name in kernel_updates.keys():
+        if name in pca_hookers.names:
+            for ig in range(kernel_updates[name].shape[0]):
+                components, variances = pca_hookers.get_pca_results(name, ig)
+                projections = torch.mean(kernel_updates @ components.T, dim=0)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

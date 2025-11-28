@@ -1,31 +1,54 @@
+"""Perform PCA analysis on intermediate layer input feature activations of YOLO models.
+
+Usage:
+    $ python tools/pca.py \
+        --model <path/to/model.pt> \
+        --sample_dir <path/to/sample_dir> \
+        --save_path <path/to/save_path> \
+        [--sample_num <sample_num> \
+         --label_dir <label_dir> \
+         --layers <layer1> <layer2> ... \
+         --modules <module1> <module2> ... \
+         --mode <mode> \
+         --check]
+
+Arguments:
+    --model: Path to the model checkpoint (.pt file)
+    --sample_dir: Path to the sample images directory for PCA computation
+    --save_path: Path to save the PCA results file
+    --sample_num: Maximum number of samples to use (default: 100)
+    --label_dir: (optional) Path to the label directory for bounding box-based feature sampling
+    --layers: (optional) Layers to calculate PCA for, space-separated. If not specified, all intermediate layers are analyzed
+    --modules: (optional) Specific module names to calculate PCA for, space-separated. Provides more detailed control than --layers
+    --mode: (optional) Mode to calculate PCA, choices: unfold (default), fold
+    --check: (optional) Check the correctness of convolution kernel unfolding operations
+    --device: Device to use (default: "cuda")
+
+Examples:
+    $ python tools/pca.py \
+        --model yolov8n.pt \
+        --sample_dir data/images/train \
+        --save_path pca_results.pkl \
+        --sample_num 200 \
+        --layers 10 11 12
+    
+    $ python tools/pca.py \
+        --model yolov8n.pt \
+        --sample_dir data/images/train \
+        --save_path pca_results.pkl \
+        --modules model.10.conv model.11.conv \
+        --label_dir data/labels/train \
+        --mode unfold \
+        --check
 """
-对yolo模型的中间层输入特征激活值分布进行PCA分析
 
-用法:
-    python pca.py --model <model_path> --sample_dir <sample_dir> --save_path <save_path> \
-    [--sample_num <sample_num> --label_dir <label_dir> --load_path <load_path> --layers "<layer1,layer2,...>" --check]
-
-参数:
-    --model: 模型权重路径（格式为YOLO模型）
-    --sample_dir: 用于计算PCA的样本路径
-    --sample_num: 采样的最大数量
-    --save_path: 保存PCA结果的文件路径
-    --label_dir: （可选）标签路径
-    --layers: （可选）要计算PCA的层，用逗号分隔，如果不指定则默认计算所有中间层
-    --check: （可选）是否检查卷积核展开操作正确性
-"""
-
-import threading
-import psutil
-import time
 import joblib
-import os
+import os.path as OSP
 import random
 import cv2
 from tqdm import tqdm
 import glob
 import argparse
-import traceback
 
 import torch
 import torch.nn as nn
@@ -33,61 +56,15 @@ import torch.nn.functional as F
 
 from ultralytics import YOLO
 from ultralytics.utils import (
-    LOGGER
+    LOGGER, YAML
 )
 
 from pca_on_gpu import IncrementalPCAonGPU as IncrementalPCA
-
-
-class RealTimeMemoryMonitor:
-    """Real-time memory monitor"""
-    def __init__(self, update_interval=0.5):
-        self.update_interval = update_interval
-        self.monitoring = False
-        self.monitor_thread = None
-        self.gpu_mem = 0
-        self.mem = 0
-        self.pbar = None  # store progress bar reference
-        
-    def get_gpu_mem_mb(self):
-        if torch.cuda.is_available():
-            return torch.cuda.memory_allocated() // (1024 * 1024)
-        return 0
-
-    def get_mem_mb(self):
-        return psutil.Process().memory_info().rss // (1024 * 1024)
-    
-    def set_progress_bar(self, pbar):
-        self.pbar = pbar
-    
-    def _monitor_loop(self):
-        while self.monitoring:
-            self.gpu_mem = self.get_gpu_mem_mb()
-            self.mem = self.get_mem_mb()
-            
-            # Real-time update progress bar description
-            if self.pbar is not None:
-                self.pbar.set_description(f"PCA computing - GPU Mem: {self.gpu_mem:.2f} MB, Mem: {self.mem:.2f} MB")
-            
-            time.sleep(self.update_interval)
-    
-    def start_monitoring(self):
-        if not self.monitoring:
-            self.monitoring = True
-            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-            self.monitor_thread.start()
-    
-    def stop_monitoring(self):
-        self.monitoring = False
-        if self.monitor_thread:
-            self.monitor_thread.join()
-    
-    def get_status(self):
-        return f"GPU Mem: {self.gpu_mem:.2f} MB, Mem: {self.mem:.2f} MB"
+from utils import RealTimeMemoryMonitor
 
 
 class PCAHooker:
-    def __init__(self, model, layers, modules=None, device="cuda", check=False, unfold=False):
+    def __init__(self, model, layers, modules=None, device="cuda", check=False, unfold=True):
         self.model = model
         self.modules = {}
         self.pca_operators = {}
@@ -137,7 +114,7 @@ class PCAHooker:
             raise ValueError("Either modules or layers must be provided")
 
     def _get_sample_feature_indices(self, bs, h_out, w_out):
-        # randomly sample feature indices
+        # Randomly sample feature indices
         sample_feature_indices = torch.randperm(bs*h_out*w_out, device=self.device)[:100]
         return sample_feature_indices
 
@@ -150,7 +127,7 @@ class PCAHooker:
         for n, mod in self.modules.items():
             self._handles.append(mod.register_forward_hook(self._hook(n, self.unfold)))
 
-    def _hook(self, module_name, unfold=False):
+    def _hook(self, module_name, unfold=True):
         """
         If unfold is True, the input feature will be unfolded into a sequence of vectors with shape [c_in*k[0]*k[1], bs*h_out*w_out],
         otherwise, the input feature will be reshaped into a matrix with shape [c_in, bs*h_out*w_out].
@@ -160,7 +137,7 @@ class PCAHooker:
                 k, s, p, g, d, c_in, c_out = module.kernel_size, module.stride, module.padding, \
                     module.groups, module.dilation, module.in_channels, module.out_channels
 
-                feat_in = feat_in[0] # module may accept multiple input feats, and we only extract the first
+                feat_in = feat_in[0]  # Module may accept multiple input features, and we only extract the first
                 if p[0] > 0 or p[1] > 0:
                     feat_in_padded = torch.nn.functional.pad(feat_in, (p[1], p[1], p[0], p[0]), mode='constant', value=0)
                 else:
@@ -168,85 +145,59 @@ class PCAHooker:
                 bs, _, h_in, w_in = feat_in_padded.shape
                 h_out, w_out = feat_out.shape[2], feat_out.shape[3]
 
-                # group the input features
+                # Group the input features
                 feat_in_padded_grouped = feat_in_padded.reshape(bs, g, c_in//g, h_in, w_in)
                 c_in_grouped = c_in//g
 
-                if unfold:
-                    # Use the sliding window with the same settings as convolution kernels
-                    # to unfold input features into a sequence of vectors, considering dilation
-                    # For dilated convolution, we need to adjust the unfold parameters
-                    if d[0] > 1 or d[1] > 1:
-                        # For dilation > 1, we need to unfold with larger window size
-                        # Effective kernel size becomes: k[0] + (k[0]-1)*(d[0]-1), k[1] + (k[1]-1)*(d[1]-1)
-                        effective_k_h = k[0] + (k[0] - 1) * (d[0] - 1)
-                        effective_k_w = k[1] + (k[1] - 1) * (d[1] - 1)
-                        
-                        # [bs, g, c_in//g, h, w] --> [bs, g, c_in//g, h_out, w, effective_k_h]
-                        feat_unfold_h = feat_in_padded_grouped.unfold(3, effective_k_h, s[0])
-                        # [bs, g, c_in//g, h_out, w, effective_k_h] --> [bs, g, c_in//g, h_out, w_out, effective_k_h, effective_k_w]
-                        feat_unfold = feat_unfold_h.unfold(4, effective_k_w, s[1])
-                        
-                        # Now subsample to get the actual dilated kernel positions
-                        # feat_unfold shape: [bs, g, c_in//g, h_out, w_out, effective_k_h, effective_k_w]
-                        # We keep only every d[0]-th and d[1]-th element in kernel dimensions
-                        feat_unfold = feat_unfold[:, :, :, :, :, ::d[0], ::d[1]]
-                    else:
-                        # Standard convolution (dilation = 1)
-                        # [bs, g, c_in//g, h, w] --> [bs, g, c_in//g, h_out, w, k[0]]
-                        feat_unfold_h = feat_in_padded_grouped.unfold(3, k[0], s[0])
-                        # [bs, g, c_in//g, h_out, w, k[0]] --> [bs, g, c_in//g, h_out, w_out, k[0], k[1]]
-                        feat_unfold = feat_unfold_h.unfold(4, k[1], s[1])
-                    # Get actual kernel dimensions after dilation processing
-                    actual_k_h, actual_k_w = feat_unfold.shape[5], feat_unfold.shape[6]
+                # Use the sliding window with the same settings as convolution kernels
+                # to unfold input features into a sequence of vectors, considering dilation
+                # For dilated convolution, we need to adjust the unfold parameters
+                if d[0] > 1 or d[1] > 1:
+                    # For dilation > 1, we need to unfold with larger window size
+                    # Effective kernel size becomes: k[0] + (k[0]-1)*(d[0]-1), k[1] + (k[1]-1)*(d[1]-1)
+                    effective_k_h = k[0] + (k[0] - 1) * (d[0] - 1)
+                    effective_k_w = k[1] + (k[1] - 1) * (d[1] - 1)
                     
-                    # Permute the dims: [bs, g, c_in//g, h_out, w_out, actual_k_h, actual_k_w] -> [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out]
-                    feat_unfold = feat_unfold.permute(1, 2, 5, 6, 0, 3, 4).contiguous()
-                    # Squeeze: [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out] --> [g, c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out]
-                    feat_reshaped = feat_unfold.view(g, c_in_grouped*actual_k_h*actual_k_w, bs*h_out*w_out)
-
-                    # The following code is used to check whether the unfolding representation of convolution operation
-                    # is equivalent with the original convolution operation
-                    if self.check:
-                        weight = module.weight.data.reshape(g, c_out//g, -1) # [g, c_out//g, c_in//g*actual_k_h*actual_k_w]
-                        feat_out_reshaped = weight @ feat_reshaped # [g, c_out//g, c_in//g*actual_k_h*actual_k_w] @ [c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out] --> [g, c_out//g, bs*h_out*w_out]
-                        feat_out_reshaped = feat_out_reshaped.reshape(c_out, -1) # [c_out, bs*h_out*w_out]
-
-                        # [c_out, bs*h_out*w_out] --> [c_out, bs, h_out, w_out] --> [bs, c_out, h_out, w_out]
-                        feat_out_reshaped_reversed = feat_out_reshaped.view(-1, bs, h_out, w_out).permute(1, 0, 2, 3).contiguous()
-                        if module.bias is not None:
-                            feat_out_reshaped_reversed = feat_out_reshaped_reversed + module.bias.data.reshape(1, c_out, 1, 1)
-                        
-                        LOGGER.info(f"Module {module_name}'s unfolding error: {F.mse_loss(feat_out, feat_out_reshaped_reversed)}")
+                    # [bs, g, c_in//g, h, w] --> [bs, g, c_in//g, h_out, w, effective_k_h]
+                    feat_unfold_h = feat_in_padded_grouped.unfold(3, effective_k_h, s[0])
+                    # [bs, g, c_in//g, h_out, w, effective_k_h] --> [bs, g, c_in//g, h_out, w_out, effective_k_h, effective_k_w]
+                    feat_unfold = feat_unfold_h.unfold(4, effective_k_w, s[1])
+                    
+                    # Now subsample to get the actual dilated kernel positions
+                    # feat_unfold shape: [bs, g, c_in//g, h_out, w_out, effective_k_h, effective_k_w]
+                    # We keep only every d[0]-th and d[1]-th element in kernel dimensions
+                    feat_unfold = feat_unfold[:, :, :, :, :, ::d[0], ::d[1]]
                 else:
-                    feat_reshaped = feat_in_padded_grouped.permute(1, 2, 0, 3, 4).view(g, c_in_grouped, -1) # [bs, g, c_in//g, h_out, w_out] --> [g, c_in//g, bs*h_in*w_in]
+                    # Standard convolution (dilation = 1)
+                    # [bs, g, c_in//g, h, w] --> [bs, g, c_in//g, h_out, w, k[0]]
+                    feat_unfold_h = feat_in_padded_grouped.unfold(3, k[0], s[0])
+                    # [bs, g, c_in//g, h_out, w, k[0]] --> [bs, g, c_in//g, h_out, w_out, k[0], k[1]]
+                    feat_unfold = feat_unfold_h.unfold(4, k[1], s[1])
+                # Get actual kernel dimensions after dilation processing
+                actual_k_h, actual_k_w = feat_unfold.shape[5], feat_unfold.shape[6]
+                
+                # Permute the dims: [bs, g, c_in//g, h_out, w_out, actual_k_h, actual_k_w] -> [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out]
+                feat_unfold = feat_unfold.permute(1, 2, 5, 6, 0, 3, 4).contiguous()
+                # Squeeze: [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out] --> [g, c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out]
+                feat_reshaped = feat_unfold.view(g, c_in_grouped*actual_k_h*actual_k_w, bs*h_out*w_out)
+                if module.bias is not None:
+                    feat_reshaped = torch.concat((feat_reshaped, torch.ones(g, 1, bs*h_out*w_out).to(feat_reshaped.device)), dim=1)
 
-                    if self.check:
-                        weight = module.weight.data.reshape(g, c_out//g, c_in//g, k[0], k[1]) # [g, c_out//g, c_in//g, k[0], k[1]]
-                        feat_out_reshaped = []
-                        for i in range(k[0]):
-                            for j in range(k[1]):
-                                # Group-wise convolution: weight[kernel_i,kernel_j] @ input_features[kernel_i,kernel_j] 
-                                # Shape: [g, c_out//g, c_in//g] @ [bs, h_out, w_out, g, c_in//g, 1] --> [bs, h_out, w_out, g, c_out//g, 1]
-                                # Permute the dims: [bs, h_out, w_out, g, c_out//g, 1] -> [bs, g, c_out//g, h_out, w_out, 1]
-                                # Flatten the dims: [bs, g, c_out//g, h_out, w_out, 1] -> [bs, c_out, h_out, w_out, 1]
-                                # Squeeze the last dim: [bs, c_out, h_out, w_out, 1] -> [bs, c_out, h_out, w_out]
-                                feat_out_reshaped_tmp = feat_in_padded_grouped[:, :, :, i*d[0]::s[0], j*d[1]::s[1], None].permute(0, 3, 4, 1, 2, 5)
-                                feat_out_reshaped_tmp = weight[:, :, :, i, j] @ feat_out_reshaped_tmp
-                                feat_out_reshaped_tmp = feat_out_reshaped_tmp.permute(0, 3, 4, 1, 2, 5).flatten(1, 2).squeeze(-1)
-                                feat_out_reshaped.append(feat_out_reshaped_tmp[:, :, :h_out, :w_out])
-                        feat_out_reshaped = sum(feat_out_reshaped) # [bs, c_out, h_out, w_out]
+                # The following code is used to check whether the unfolding representation of convolution operation
+                # is equivalent with the original convolution operation
+                if self.check:
+                    weight = module.weight.data.reshape(g, c_out//g, -1)  # [g, c_out//g, c_in//g*actual_k_h*actual_k_w]
+                    if module.bias is not None:
+                        weight = torch.concat((weight, module.bias.data.reshape(g, c_out//g, 1)), dim=2)
+                    feat_out_reshaped = weight @ feat_reshaped  # [g, c_out//g, c_in//g*actual_k_h*actual_k_w] @ [c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out] --> [g, c_out//g, bs*h_out*w_out]
+                    feat_out_reshaped = feat_out_reshaped.reshape(c_out, -1)  # [c_out, bs*h_out*w_out]
 
-                        feat_out_reshaped_reversed = feat_out_reshaped
-                        if module.bias is not None:
-                            feat_out_reshaped_reversed = feat_out_reshaped_reversed + module.bias.data.reshape(1, c_out, 1, 1)
-                        
-                        LOGGER.info(f"Module {module_name}'s unfolding error: {F.mse_loss(feat_out, feat_out_reshaped_reversed)}")
+                    # [c_out, bs*h_out*w_out] --> [c_out, bs, h_out, w_out] --> [bs, c_out, h_out, w_out]
+                    feat_out_reshaped_reversed = feat_out_reshaped.view(-1, bs, h_out, w_out).permute(1, 0, 2, 3).contiguous()
+                    
+                    LOGGER.info(f"Module {module_name}'s unfolding error: {F.mse_loss(feat_out, feat_out_reshaped_reversed)}")
 
-                if self.unfold:
-                    sample_feature_indices = self._get_sample_feature_indices(bs, h_out, w_out)
-                else:
-                    sample_feature_indices = self._get_sample_feature_indices(bs, h_in, w_in)
+                sample_feature_indices = self._get_sample_feature_indices(bs, h_out, w_out)
                 if sample_feature_indices.max() >= feat_reshaped.shape[2]:
                     raise RuntimeError(f"Sample feature indices out of range: {sample_feature_indices.max()} >= {feat_reshaped.shape[2]}")
                 if sample_feature_indices.min() < 0:
@@ -261,7 +212,8 @@ class PCAHooker:
                 feature_cache.append(feat_sampled)
 
                 pca_operators = self.pca_operators[module_name]
-                if sum([x.shape[2] for x in feature_cache]) >= pca_operators[0].n_components: # Incremental PCA requires the first batch's size is larger than n_components
+                # Incremental PCA requires the first batch's size is larger than n_components
+                if sum([x.shape[2] for x in feature_cache]) >= pca_operators[0].n_components:
                     feat_sampled = torch.cat(feature_cache, dim=2)
                     feature_cache.clear()
                     for ig in range(g):
@@ -280,31 +232,27 @@ class PCAHooker:
         for n, cache in self.feature_caches.items():
             if len(cache) > 0:
                 for ig in range(len(self.pca_operators[n])):
-                    # before clearing the cache, we need to fit the PCA operator with the final batch of features
-                    if not hasattr(self.pca_operators[n][ig], 'components_'):
-                        # If components_ is not calculated, it means the PCA operator has not been called yet, and that
-                        # means the number of features in this cache has never reached n_components, so we need to
-                        # reduce n_components to the number of features in this cache.
-                        LOGGER.warning(f"Too few samples to fit PCA in module {n}. Could result in instability.")
-                        self.pca_operators[n][ig].n_components = torch.cat(cache, dim=2)[ig].shape[1]   
-                    # self.pca_operators[n].partial_fit(torch.cat(cache, dim=1).cpu().T.numpy())
-                    self.pca_operators[n][ig].partial_fit(torch.cat(cache, dim=2)[ig].T)
+                    # Before clearing the cache, we need to fit the PCA operator with the final batch of features
+                    if hasattr(self.pca_operators[n][ig], 'components_'):
+                        self.pca_operators[n][ig].partial_fit(torch.cat(cache, dim=2)[ig].T)
+                    else:
+                        # No components_ means PCA hasn't been fitted yet (samples < n_components), 
+                        # use normal PCA instead of Incremental PCA
+                        LOGGER.info(f"Too few samples to fit PCA in module {n}. Use normal PCA instead.")
+                        self.pca_operators[n][ig].fit(torch.cat(cache, dim=2)[ig].T)
             cache.clear()
     
     def get_pca_results(self, name, ig=None):
         if ig is not None:
             return (self.pca_operators[name][ig].components_, 
-                    self.pca_operators[name][ig].explained_variance_, 
-                    self.pca_operators[name][ig].mean_)
+                    self.pca_operators[name][ig].explained_variance_)
         else:
             componets_ = []
             variances_ = []
-            means_ = []
             for ig in range(len(self.pca_operators[name])):
                 componets_.append(self.pca_operators[name][ig].components_)
                 variances_.append(self.pca_operators[name][ig].explained_variance_)
-                means_.append(self.pca_operators[name][ig].mean_)
-            return (torch.stack(componets_), torch.stack(variances_), torch.stack(means_))
+            return (torch.stack(componets_), torch.stack(variances_))
 
     def get_pca_operators(self, name):
         return self.pca_operators[name]
@@ -322,16 +270,31 @@ class PCAHooker:
             joblib.dump(pca_cache, f)
     
     def load_pca_cache(self, load_path):
+        """Load PCA cache and use it as initial state.
+        
+        Args:
+            load_path: Path to PCA cache file
+        """
         with open(load_path, "rb") as f:
             pca_cache = joblib.load(f)
+        
         for n in self.names:
-            for ig in range(len(pca_cache[n])):
-                self.set_pca_operator(n, ig, pca_cache[n][ig])
+            if n in pca_cache:
+                if len(pca_cache[n]) != len(self.pca_operators[n]):
+                    LOGGER.warning(
+                        f"Module {n}: PCA cache has {len(pca_cache[n])} groups, "
+                        f"but expected {len(self.pca_operators[n])} groups. "
+                        f"This may indicate errors."
+                    )
+                    continue
+                for ig in range(min(len(self.pca_operators[n]), len(pca_cache[n]))):
+                    self.set_pca_operator(n, ig, pca_cache[n][ig])
+        
         LOGGER.info(f"Loaded PCA cache from {load_path}")
 
 
 class PCAHookerWithBboxes(PCAHooker):
-    def __init__(self, model, layers, modules=None, bboxes=None, device="cuda", check=False, unfold=False):
+    def __init__(self, model, layers, modules=None, bboxes=None, device="cuda", check=False, unfold=True):
         super().__init__(model, layers, modules, device, check, unfold)
         self.bboxes = bboxes
         
@@ -349,7 +312,7 @@ class PCAHookerWithBboxes(PCAHooker):
                 all_bboxes.append(_bbox)
                 batch_ids.append(_batch_id)
         
-        # If boxes in this paticular batch is empty, return an empty tensor
+        # If boxes in this particular batch is empty, return an empty tensor
         if len(all_bboxes) == 0:
             return torch.tensor([], device=self.device)
 
@@ -370,7 +333,7 @@ class PCAHookerWithBboxes(PCAHooker):
             x_ranges = torch.arange(feat_x_min[i].item(), feat_x_max[i].item()+1, device=self.device)
 
             # Generate grid indices
-            grid = torch.meshgrid(y_ranges, x_ranges)
+            grid = torch.meshgrid(y_ranges, x_ranges, indexing='ij')
             grid = grid[0].flatten().tolist(), grid[1].flatten().tolist()
 
             # Calculate feature indices
@@ -387,16 +350,22 @@ class PCAHookerWithBboxes(PCAHooker):
         return sample_feature_indices
 
 
-def do_pca(model, layers, modules, sample_dir=None, label_dir=None,
-           device="cuda", check=False, pca_cache_save_path=None, sample_num=100,
-           unfold=False):
+def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda",
+           check=False, pca_cache_save_path=None, sample_num=100, unfold=True, load_hist=None):
     # Create PCA Hooker
     if label_dir is not None:
         pca_hooker = PCAHookerWithBboxes(model, layers, modules, None, device, check, unfold)
     else:
         pca_hooker = PCAHooker(model, layers, modules, device, check, unfold)
+    
+    # Load historical PCA cache if specified
+    if load_hist is not None:
+        if OSP.exists(load_hist):
+            pca_hooker.load_pca_cache(load_hist)
+        else:
+            LOGGER.warning(f"Historical PCA cache file not found: {load_hist}. Starting from scratch.")
 
-    memory_monitor = RealTimeMemoryMonitor(update_interval=0.2) # Monitor memory and CUDA memory usage
+    memory_monitor = RealTimeMemoryMonitor(update_interval=0.2)  # Monitor memory and CUDA memory usage
     pbar = tqdm(range(sample_num), desc="PCA computing", total=sample_num)
     memory_monitor.set_progress_bar(pbar)
     memory_monitor.start_monitoring()
@@ -407,32 +376,32 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None,
         if isinstance(sample_dir, list) or isinstance(sample_dir, tuple):
             for _dir in sample_dir:
                 for ext in image_extensions:
-                    sample_files.extend(glob.glob(os.path.join(_dir, f'*.{ext.lower()}')))
-                    sample_files.extend(glob.glob(os.path.join(_dir, f'*.{ext.upper()}')))
+                    sample_files.extend(glob.glob(OSP.join(_dir, f'*.{ext.lower()}')))
+                    sample_files.extend(glob.glob(OSP.join(_dir, f'*.{ext.upper()}')))
         else:
             for ext in image_extensions:
-                sample_files.extend(glob.glob(os.path.join(sample_dir, f'*.{ext.lower()}')))
-                sample_files.extend(glob.glob(os.path.join(sample_dir, f'*.{ext.upper()}')))
+                sample_files.extend(glob.glob(OSP.join(sample_dir, f'*.{ext.lower()}')))
+                sample_files.extend(glob.glob(OSP.join(sample_dir, f'*.{ext.upper()}')))
         random.shuffle(sample_files)
         sample_files = sample_files[:sample_num]
         
         if label_dir is not None:
             label_files = []
             for _sample_file in sample_files:
-                _label_name = os.path.basename(_sample_file).split('.')[0] + '.txt'
+                _label_name = OSP.basename(_sample_file).split('.')[0] + '.txt'
                 if isinstance(label_dir, list) or isinstance(label_dir, tuple):
                     exist_label_file = False
                     for _dir_label in label_dir:
-                        if os.path.exists(os.path.join(_dir_label, _label_name)):
-                            label_files.append(os.path.join(_dir_label, _label_name))
+                        if OSP.exists(OSP.join(_dir_label, _label_name)):
+                            label_files.append(OSP.join(_dir_label, _label_name))
                             exist_label_file = True
                             break
                     if not exist_label_file:
                         label_files.append(None)
                         LOGGER.warning(f"Label file {_label_name} not found in {label_dir}")
                 else:
-                    if os.path.exists(os.path.join(label_dir, _label_name)):
-                        label_files.append(os.path.join(label_dir, _label_name))
+                    if OSP.exists(OSP.join(label_dir, _label_name)):
+                        label_files.append(OSP.join(label_dir, _label_name))
                     else:
                         label_files.append(None)
                         LOGGER.warning(f"Label file {_label_name} not found in {label_dir}")
@@ -478,7 +447,7 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None,
 
 
 def main(args):
-    # test cuda available
+    # Test CUDA availability
     if "cuda" in args.device and not torch.cuda.is_available():
         LOGGER.warning(f"{args.device} is not available, using cpu instead")
         args.device = "cpu"
@@ -498,25 +467,58 @@ def main(args):
     else:
         modules = None
 
-    # Do PCA
+    # If specifying samples and labels by --dataset, get the sample dir and label dir
+    if args.dataset is not None:
+        sample_dirs = []
+        label_dirs = []
+        for dataset_path in args.dataset:
+            dataset_config = YAML.load(dataset_path)
+            if 'path' not in dataset_config.keys():
+                sample_dir = OSP.join(OSP.dirname(dataset_path), dataset_config['train'])
+            else:
+                sample_dir = OSP.join(dataset_config['path'], dataset_config['train'])
+            label_dir = sample_dir.replace("images", "labels")
+            sample_dirs.append(sample_dir)
+            label_dirs.append(label_dir)
+        # Convert to lists (do_pca supports both list and string, but list is more consistent)
+        args.sample_dir = sample_dirs
+        args.label_dir = label_dirs
+    if args.dataset is None and args.sample_dir is None:
+        raise ValueError("Either --dataset or --sample_dir must be provided")
+
+    # Mode
+    if args.mode == "unfold":
+        unfold = True
+    elif args.mode == "fold":
+        unfold = False
+    else:
+        raise ValueError(f"Invalid mode: {args.mode}")
+
+    # Perform PCA
     do_pca(model, layers, modules, args.sample_dir, args.label_dir,
            args.device, args.check, args.save_path, args.sample_num,
-           args.unfold)
+           unfold, args.load_hist)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--sample_dir", type=str, required=True)
+    parser.add_argument("--sample_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--label_dir", type=str, default=None)
+    parser.add_argument("--dataset", nargs="+", type=str, default=None,
+        help="Dataset YAML configuration file(s). Can specify multiple datasets.")
     parser.add_argument("--sample_num", type=int, default=100)
     parser.add_argument("--layers", nargs="+", type=int, default=None,
         help="Layers to calculate PCA for, use comma to separate, conv modules within layers are analyzed.")
     parser.add_argument("--modules", nargs="+", type=str, default=None,
-        help="Modules to calculate PCA for, use comma to separate, providing more detailed control over the modules to calculate PCA.")
-    parser.add_argument("--unfold", action="store_true",
-        help="Unfold the input feature before calculating PCA.")
+        help="Modules to calculate PCA for, use comma to separate, providing more detailed control over the "+
+        "modules to calculate PCA.")
+    parser.add_argument("--mode", type=str, choices=["unfold", "fold"], default="unfold",
+        help="Mode to calculate PCA, choices: unfold (default), fold.")
+    parser.add_argument("--load_hist", type=str, default=None,
+        help="Optional path to historical PCA cache file to load as initial state. "
+             "Only modules that exist in both current and historical cache will be loaded.")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 

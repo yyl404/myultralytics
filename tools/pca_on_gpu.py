@@ -46,14 +46,25 @@ class IncrementalPCAonGPU():
         copy (bool): If False, input data will be overwritten. Defaults to True.
         batch_size (int, optional): The number of samples to use for each batch. If `None`, it's inferred from 
                                     the data and set to `5 * n_features`. Defaults to None.
+        device (str): The device to use for the model. Defaults to "cuda".
+        centralize (bool): If True, the data will be centralized. Defaults to True.
     """
 
-    def __init__(self, n_components=None, *, whiten=False, copy=True, batch_size=None, device="cuda"):
+    def __init__(self, n_components=None, *, whiten=False, copy=True, batch_size=None, device="cuda", centralize=True):
         self.n_components = n_components
         self.whiten = whiten
         self.copy = copy
         self.batch_size = batch_size
-        self.device = device
+
+        # Determine if there's a GPU available
+        if "cuda" in device and not torch.cuda.is_available():
+            print("WARNING ⚠️ IncrementalPCAonGPU: No GPU available, using CPU instead")
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(device)
+
+        # TODO: Implement code branch for uncentralized PCA
+        self.centralize = centralize
         
         # Set n_components_ based on n_components if provided
         if n_components:
