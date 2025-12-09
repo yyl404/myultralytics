@@ -2,16 +2,12 @@
 
 # Configuration
 MODEL_CFG="yolov8l.yaml"
-OUTPUT_DIR="runs/yolov8l_voc_inc_10_10_fromscratch_vspreg+pseudo_label+proto_rp"
+OUTPUT_DIR="runs/yolov8l_voc_inc_10_10_fromscratch_vspreg"
 EPOCHS=100
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
 DEVICE=0
-
-# PRoRP configuration
-# Set to True to use base_model distillation, False to use prototype's built-in supervision
-PROTO_RP_USE_BASE_MODEL=${PROTO_RP_USE_BASE_MODEL:-True}
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -30,16 +26,14 @@ if [ $START_TASK -lt 1 ] || [ $START_TASK -gt ${#TASK_DATASETS[@]} ]; then
     exit 1
 fi
 
-# Initialize PREV_PCA_CACHE and PREV_PROTOTYPES for first task
+# Initialize PREV_PCA_CACHE for first task
 PREV_PCA_CACHE=""
-PREV_PROTOTYPES=""
 
 # If starting from a task other than 1, set PREV_MODEL to the previous task's model
 if [ $START_TASK -gt 1 ]; then
     PREV_TASK=$((START_TASK - 1))
     PREV_MODEL="$OUTPUT_DIR/task-$PREV_TASK/best.pt"
     PREV_PCA_CACHE="$OUTPUT_DIR/task-$PREV_TASK/pca_cache.pkl"
-    PREV_PROTOTYPES="$OUTPUT_DIR/task-$PREV_TASK/prototypes.pt"
     
     if [ ! -f "$PREV_MODEL" ]; then
         echo "Error: Previous task model not found: $PREV_MODEL"
@@ -52,19 +46,11 @@ if [ $START_TASK -gt 1 ]; then
         echo "Training will proceed without PCA cache."
     fi
     
-    if [ ! -f "$PREV_PROTOTYPES" ]; then
-        echo "Warning: Previous task prototypes not found: $PREV_PROTOTYPES"
-        echo "Training will proceed without prototype replay."
-    fi
-    
     echo "=========================================="
     echo "Resuming from Task $START_TASK"
     echo "Using previous model: $PREV_MODEL"
     if [ -f "$PREV_PCA_CACHE" ]; then
         echo "Using previous PCA cache: $PREV_PCA_CACHE"
-    fi
-    if [ -f "$PREV_PROTOTYPES" ]; then
-        echo "Using previous prototypes: $PREV_PROTOTYPES"
     fi
     echo "=========================================="
     echo ""
@@ -107,20 +93,8 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --dataset $DATASET_PATH \
             --save_path $PCA_CACHE_PATH
         
-        # Generate prototypes for task 1
-        echo "Generating prototypes for task $task_num..."
-        PROTOTYPES_PATH="$TASK_DIR/prototypes.pt"
-        PROTOTYPES_VIS_DIR="$TASK_DIR/prototypes-visualizations"
-        python tools/generate_prototypes.py \
-            --model $TASK_DIR/best.pt \
-            --data $DATASET_PATH \
-            --output $PROTOTYPES_PATH \
-            --vis_dir $PROTOTYPES_VIS_DIR \
-            --device $DEVICE
-        
         PREV_MODEL="$TASK_DIR/best.pt"
         PREV_PCA_CACHE="$PCA_CACHE_PATH"
-        PREV_PROTOTYPES="$PROTOTYPES_PATH"
     else
         # Subsequent tasks: extract dataset name from path for output directory naming
         DATASET_NAME=$(basename $(dirname $DATASET_PATH))
@@ -134,43 +108,12 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --dataset $DATASET_PATH \
             --save_path $EXPANDED_MODEL
 
-        # Convert prototype classes if prototypes exist from previous task
-        CONVERTED_PROTOTYPES=""
-        if [ -n "$PREV_PROTOTYPES" ] && [ -f "$PREV_PROTOTYPES" ]; then
-            echo "Converting prototype classes for task $task_num..."
-            CONVERTED_PROTOTYPES="$TASK_DIR/task-$((task_num-1))-prototypes-converted.pt"
-            python tools/convert_prototype_classes.py \
-                --prototypes $PREV_PROTOTYPES \
-                --original_model $PREV_MODEL \
-                --expanded_model $EXPANDED_MODEL \
-                --output $CONVERTED_PROTOTYPES
-        else
-            echo "Warning: No prototypes from previous task, skipping prototype conversion."
-        fi
-
-        # Generate pseudo labels for task $task_num
-        echo "Generating pseudo labels for task $task_num..."
-        PSEUDO_LABELS_DIR="$TASK_DIR/${DATASET_NAME}_train_pseudo_labels"
-        python tools/generate_pseudo_label.py \
-            --model $PREV_MODEL \
-            --dataset $DATASET_PATH \
-            --output_dir $PSEUDO_LABELS_DIR \
-            --conf_threshold 0.25 \
-            --splits train
-
-        # Merge datasets
-        echo "Merging dataset for task $task_num..."
-        MERGED_DATASET_DIR="$TASK_DIR/${DATASET_NAME}_merged"
-        python tools/merge_datasets.py \
-            --datasets "$PSEUDO_LABELS_DIR/dataset.yaml" "$DATASET_PATH" \
-            --output_dir $MERGED_DATASET_DIR
-
         # Convert dataset class IDs
         echo "Converting dataset class IDs for task $task_num..."
         CONVERTED_DATASET="$TASK_DIR/${DATASET_NAME}_converted"
         python tools/convert_dataset_class_ids.py \
             --model $EXPANDED_MODEL \
-            --dataset $MERGED_DATASET_DIR/dataset.yaml \
+            --dataset $DATASET_PATH \
             --output_dir $CONVERTED_DATASET
         
         echo "Training task $task_num..."
@@ -194,21 +137,6 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             echo "Warning: No PCA cache available from previous task, training without PCA cache."
         fi
         
-        # Add prototypes if available
-        if [ -n "$CONVERTED_PROTOTYPES" ] && [ -f "$CONVERTED_PROTOTYPES" ]; then
-            echo "Using converted prototypes: $CONVERTED_PROTOTYPES"
-            TRAIN_CMD="$TRAIN_CMD --prototypes $CONVERTED_PROTOTYPES"
-            # Add proto_rp_use_base_model option if specified
-            if [ "$PROTO_RP_USE_BASE_MODEL" = "True" ] || [ "$PROTO_RP_USE_BASE_MODEL" = "true" ]; then
-                TRAIN_CMD="$TRAIN_CMD --proto_rp_use_base_model True"
-                echo "Using base_model for prototype replay distillation"
-            else
-                echo "Using prototype's built-in supervision for replay"
-            fi
-        else
-            echo "Warning: No converted prototypes available, training without prototype replay."
-        fi
-        
         # Execute training command
         eval $TRAIN_CMD
 
@@ -221,21 +149,8 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --load_hist $PREV_PCA_CACHE \
             --save_path $PCA_CACHE_PATH
         
-        # Generate prototypes for current task
-        echo "Generating prototypes for task $task_num..."
-        PROTOTYPES_PATH="$TASK_DIR/prototypes.pt"
-        PROTOTYPES_VIS_DIR="$TASK_DIR/prototypes-visualizations"
-        python tools/generate_prototypes.py \
-            --model $TASK_DIR/best.pt \
-            --data $DATASET_PATH \
-            --output $PROTOTYPES_PATH \
-            --vis_dir $PROTOTYPES_VIS_DIR \
-            --load_hits $CONVERTED_PROTOTYPES \
-            --device $DEVICE
-        
         PREV_MODEL="$TASK_DIR/best.pt"
         PREV_PCA_CACHE="$PCA_CACHE_PATH"
-        PREV_PROTOTYPES="$PROTOTYPES_PATH"
     fi
     
     echo "Task $task_num completed!"

@@ -132,13 +132,15 @@ distill_layers: None # (list[str], optional)
 distiller: "mgd" # (str) distiller type, choices=[mgd, cwdf, at, atm, skd, pkd]
 
 # projection settings ----------------------------------------------------------------------------------------------------
-vspreg: True # (bool) whether to use VSPReg
+vspreg: False # (bool) whether to use VSPReg
+vspreg_loss_weight: 1.0 # (float) the contribution weight of vspreg loss in total loss
 pca_cache_path: None # (str, optional)
 vspreg_keep_ratio: 1.0 # (float) keep ratio for VSPReg
 vspreg_center_ratio: 0.9 # (float) center ratio for VSPReg
 vspreg_steepness: 100 # (int) steepness for VSPReg
 
 # prototype replay settings
-proto_rp: True
+proto_rp: False
 prototypes: None
 proto_rp_use_base_model: True
+proto_rp_loss_weight: 1.0 # (float) the contribution weight of prototype replay loss in total loss

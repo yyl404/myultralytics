@@ -6,6 +6,9 @@ import os.path as OSP
 import threading
 import time
 
+from torch import nn
+import torch.nn.functional as F
+
 import psutil
 import torch
 
@@ -221,3 +224,55 @@ class RealTimeMemoryMonitor:
             str: Formatted string with current GPU and system memory usage.
         """
         return f"GPU Mem: {self.gpu_mem:.2f} MB, Mem: {self.mem:.2f} MB"
+
+
+class RegDistributionLoss(nn.Module):
+    """Criterion class for computing loss between two distributions (for prototype replay)."""
+
+    def __init__(self, reg_max: int = 16, reduction: str = "mean") -> None:
+        """
+        Initialize the DistributionLoss module.
+        
+        Args:
+            reg_max: Maximum value for regression (number of bins in distribution)
+            reduction: Reduction method ('mean', 'sum', or 'none')
+        """
+        super().__init__()
+        self.reg_max = reg_max
+        self.reduction = reduction
+
+    def __call__(self, pred_dist: torch.Tensor, target_dist: torch.Tensor) -> torch.Tensor:
+        """
+        Compute loss between two distributions.
+        
+        Args:
+            pred_dist: Predicted distribution, shape (N, 4*reg_max) or (N, 4, reg_max)
+            target_dist: Target distribution, shape (N, 4*reg_max) or (N, 4, reg_max)
+        
+        Returns:
+            Loss value (scalar for 'mean' or 'sum', tensor for 'none')
+        """
+        # Ensure both tensors have the same shape
+        assert pred_dist.shape == target_dist.shape, f"Shape mismatch: pred_dist {pred_dist.shape} vs target_dist {target_dist.shape}"
+        
+        # Reshape if needed: (N, 4*reg_max) -> (N, 4, reg_max)
+        if pred_dist.dim() == 2 and pred_dist.shape[1] == 4 * self.reg_max:
+            pred_dist = pred_dist.view(-1, 4, self.reg_max)
+            target_dist = target_dist.view(-1, 4, self.reg_max)
+        elif pred_dist.dim() == 2:
+            # If not the expected shape, assume it's already in correct format or reshape accordingly
+            raise ValueError(f"Unexpected pred_dist shape: {pred_dist.shape}, expected (N, {4 * self.reg_max}) or (N, 4, {self.reg_max})")
+        
+        target_prob = F.softmax(target_dist, dim=-1)  # (N, 4, reg_max)
+        log_pred_prob = F.log_softmax(pred_dist, dim=-1)  # (N, 4, reg_max)
+        
+        # Compute cross-entropy: -sum(target * log(pred))
+        # This is equivalent to KL divergence up to a constant (entropy of target)
+        loss = -(target_prob * log_pred_prob).sum(dim=-1)  # (N, 4)
+        
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:  # 'none'
+            return loss

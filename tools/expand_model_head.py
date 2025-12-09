@@ -17,6 +17,9 @@ Usage:
             e.g., "['class1', 'class2', ...]" (alternative to --dataset)
         --save_path: Path where the expanded model will be saved
         --zero_weight_init: Whether to initialize the weights of the new classes to 0
+        --class_embedding_init: Whether to initialize the weights of new classes using their text embeddings.
+            Requires --yoloe_model to provide a YOLOE model for generating embeddings.
+        --yoloe_model: Path to YOLOE model weights (required if --class_embedding_init is used)
         
 Examples:
     # Expand by specifying incremental dataset yaml file
@@ -30,23 +33,33 @@ Examples:
     $ python tools/expand_model_head.py \
         --model runs/yolov8l_voc_10_10_fromscratch_vspreg/task-1/best.pt \
         --model_cfg yolov8l.yaml \
-        --new_classes "['diningtable', 'dog', 'horse', 'motorbike', 'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor']" \\
+        --new_classes "['diningtable', 'dog', 'horse', 'motorbike', 'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor']" \
         --save_path runs/yolov8l_voc_inc_10_10_fromscratch_vspreg/task-2/task-1-best-expanded.pt
+
+    # Expand with embedding initialization for new classes
+    $ python tools/expand_model_head.py \
+        --model runs/yolov8l_voc_inc_10_10_fromscratch_vspreg/task-1/best.pt \
+        --model_cfg yolov8l.yaml \
+        --new_classes "['diningtable', 'dog', 'horse', 'motorbike', 'person']" \
+        --save_path runs/yolov8l_voc_inc_10_10_fromscratch_vspreg/task-2/task-1-best-expanded.pt \
+        --class_embedding_init \
+        --yoloe_model yoloe-v8l-seg.pt
 """
 
-from os import path as OSP
 import argparse
+from os import path as OSP
 
 from torch.nn import Sequential
 
-from ultralytics import YOLO
+from ultralytics import YOLO, YOLOE
+from ultralytics.nn.tasks import DetectionModel, Detect, yaml_model_load
 from ultralytics.utils import YAML
-from ultralytics.nn.tasks import yaml_model_load, DetectionModel, Detect
 
 from utils import parse_list_string
 
 
-def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save_dir, output_name, zero_weight_init=False):
+def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save_dir, output_name, 
+                          zero_weight_init=False, class_embedding_init=False, yoloe_model_path=None):
     """Expand the detection head output channels and migrate weights from old to new channels.
     
     This function expands the model's detection head to support more classes by allocating
@@ -63,11 +76,15 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
         output_name (str): Output filename for the expanded model.
         zero_weight_init (bool, optional): Whether to initialize weights of new channels to zero.
             Defaults to False.
+        class_embedding_init (bool, optional): Whether to initialize weights of new classes using text embeddings.
+            Defaults to False.
+        yoloe_model_path (str, optional): Path to YOLOE model for generating embeddings.
+            Required if class_embedding_init is True.
     
     Returns:
         None: The function saves the expanded model to disk but does not return anything.
     """
-    model = YOLO(ckpt_path)
+    model = YOLO(ckpt_path).eval()
     assert isinstance(model.model, DetectionModel) and isinstance(model.model.model, Sequential)\
         and isinstance(model.model.model[-1], Detect), "Only support DetectionModel with Detect in the last layer"
     weight = model.model.state_dict()
@@ -81,6 +98,14 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
         for name, param in new_model.model.named_parameters():
             if 'cv3' in name and name.endswith('.2.weight'):
                 param.data.zero_()
+            if 'cv3' in name and name.endswith('.2.bias'):
+                param.data.zero_()
+    if class_embedding_init:
+        # Load fused yoloe weights
+        yoloe_model = YOLOE(yoloe_model_path).eval()
+        tpe = yoloe_model.get_text_pe(classes_names)
+        yoloe_model.model.model[-1].fuse(tpe)
+        new_model.model.load_state_dict(yoloe_model.model.state_dict(), strict=False)
     new_weight = new_model.model.state_dict()
 
     # Migrate weights from old to new channels
@@ -118,6 +143,8 @@ if __name__ == "__main__":
     parser.add_argument("--new_classes", type=str, required=False, default=None, help="List of new class names as a Python list string, e.g., \"['class1', 'class2', ...]\" (alternative to --dataset)")
     parser.add_argument("--save_path", type=str, required=True, help="Path where the expanded model will be saved")
     parser.add_argument("--zero_weight_init", action="store_true", help="Whether to initialize the weights of the new classes to 0")
+    parser.add_argument("--class_embedding_init", action="store_true", help="Whether to initialize the weights of new classes using their text embeddings")
+    parser.add_argument("--yoloe_model", type=str, default=None, help="Path to YOLOE model weights (required if --class_embedding_init is used)")
     args = parser.parse_args()
 
     base_model = YOLO(args.model)
@@ -142,4 +169,5 @@ if __name__ == "__main__":
     
     root_dir, model_name = OSP.split(args.save_path)
     expand_detection_head(args.model, args.model_cfg, base_class_id_map, all_classes,
-                          root_dir, model_name, args.zero_weight_init)
+                          root_dir, model_name, args.zero_weight_init, 
+                          args.class_embedding_init, args.yoloe_model)
