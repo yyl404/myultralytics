@@ -9,7 +9,7 @@ This script generates prototypes by:
    that have IOU > 0.5 and correct classification (max class matches GT class)
 4. Extracting 5x5 feature patches and corresponding regression/classification outputs
 5. Organizing prototypes by layer and ground truth class
-6. Using K-means clustering to select representative prototypes (k_center=10 per class)
+6. Using K-means clustering to select representative prototypes (k_center=num_protos per class, default: 10)
 7. Saving prototypes as a list of tensors (one per layer), where each tensor contains:
    [num_prototypes, in_channels*5*5 + reg_out_channels + cls_out_channels]
 
@@ -24,6 +24,7 @@ Usage:
         --output <path_to_output.pt> \
         [--device 0] \
         [--imgsz 640] \
+        [--num_protos 10] \
         [--vis_dir <path_to_vis_dir>]
 
 Arguments:
@@ -32,6 +33,7 @@ Arguments:
     --output: Path to save generated prototypes (.pt file) [required]
     --device: Device to use (e.g., '0' for GPU 0, 'cpu' for CPU) [default: '0']
     --imgsz: Image size for inference [default: 640]
+    --num_protos: Number of prototypes per class to select via K-means clustering [default: 10]
     --vis_dir: Optional directory to save visualization of prototypes [optional]
 
 Example:
@@ -48,7 +50,6 @@ import os
 from pathlib import Path
 import cv2
 
-from numpy.core.defchararray import isdigit
 import torch
 import torch.nn.functional as F
 
@@ -59,30 +60,45 @@ from ultralytics.utils.metrics import bbox_iou
 
 
 def run_kmeans(features, k, max_iters=100):
-    """Select k representative prototypes using K-Means clustering."""
+    """
+    Select k representative prototypes using K-Means clustering (Using consine distance).
+    
+    Args:
+        features (torch.Tensor): Feature matrix [n, dim].
+        k (int): Number of prototypes to select.
+        max_iters (int): Maximum iterations. Default: 100.
+    
+    Returns:
+        torch.Tensor: Indices of k prototypes closest to cluster centroids [k].
+    """
+    # Normalize for cosine distance-based clustering
+    features = F.normalize(features, dim=1)
+
     n, dim = features.shape
     if n <= k:
         return torch.arange(n, device=features.device)
 
-    # Initialize
+    # Random initialization
     centers = features[torch.randperm(n, device=features.device)[:k]]
     
+    # K-Means iteration
     for _ in range(max_iters):
-        # E-step: Assign points to nearest center
+        # E-step: assign to nearest center
         dists = torch.cdist(features, centers)
         labels = dists.argmin(dim=1)
         
-        # M-step: Update centers
+        # M-step: update centers
         new_centers = torch.stack([
             features[labels == i].mean(0) if (labels == i).any() else centers[i]
             for i in range(k)
         ])
         
+        # Check convergence
         if torch.norm(new_centers - centers) < 1e-4:
             break
         centers = new_centers
 
-    # Find actual data points closest to centroids
+    # Return actual data points closest to centroids
     dists_to_centers = torch.cdist(features, centers)
     return dists_to_centers.argmin(dim=0)
 
@@ -244,7 +260,7 @@ def generate_prototypes(args):
     names = model.model.names
     class_names_model = [names[i] for i in sorted(names.keys())]
     
-    # Hooks
+    # 2. Hooks
     captured_inputs = []
     captured_outputs = []
     def input_hook(m, x): captured_inputs[:] = [t.detach() for t in x[0]]
@@ -252,7 +268,7 @@ def generate_prototypes(args):
     detect.register_forward_pre_hook(input_hook)
     detect.register_forward_hook(output_hook)
 
-    # 2. Setup Data
+    # 3. Setup Data
     data_cfg = YAML.load(args.data)
     class_names_dataset = data_cfg['names']
     class_id_map = {}
@@ -265,6 +281,7 @@ def generate_prototypes(args):
                 break
         if not exist_flag:
             LOGGER.warning(f"Class {name} doesn't exist in model's class list, skipped")
+    dataset_name = Path(data_cfg['path'] if 'path' in data_cfg else os.path.dirname(args.data)).stem
     img_dir = data_cfg['train'] if os.path.exists(data_cfg['train']) else \
         os.path.join(data_cfg['path'], data_cfg['train'])  if 'path' in data_cfg else \
             os.path.join(os.path.dirname(args.data), data_cfg["train"])
@@ -272,12 +289,9 @@ def generate_prototypes(args):
     img_extensions = [".jpg", ".png", ".jpeg", ".bmp"]
     img_extensions.extend([ext.upper() for ext in img_extensions])
     img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(tuple(img_extensions))])
-    
-    # Storage: layers -> classes -> list of prototypes
-    # Use simple list for collection, process later
-    collector = [[[] for _ in range(detect.nc)] for _ in range(detect.nl)]
 
-    # 3. Processing each image
+    # 4. Iter through dataset to collect raw features
+    collector = [[[] for _ in range(detect.nc)] for _ in range(detect.nl)]
     pbar = TQDM(img_files, desc="Generating prototypes")
     for img_file in pbar:
         # Load Image
@@ -355,13 +369,14 @@ def generate_prototypes(args):
                 if iou > args.iou_threshold:
                     meta = {
                         "img_path": img_path, "yx": (y, x), "HWs": HWs,
-                        "bbox_gt_norm": gt_bbox_norm[idx].cpu()
+                        "bbox_gt_norm": gt_bbox_norm[idx].cpu(),
+                        "dataset": dataset_name
                     }
                     collector[layer_idx][gt_cls_batch[idx].item()].append(
                         (patch, reg, cls, pad_mask, meta)
                     )
 
-    # 4. Check prototypes for each class
+    # 5. Check prototypes for each class
     for cls_idx in range(detect.nc):
         num_cls_protos = 0
         for layer_idx in range(detect.nl):
@@ -369,7 +384,7 @@ def generate_prototypes(args):
         if num_cls_protos == 0 and cls_idx in class_id_map.values():
             LOGGER.warning(f"No prototypes of {class_names_model[cls_idx]} collected.")
 
-    # 5. Clustering & Saving
+    # 6. Clustering & Saving
     final_protos = [None] * detect.nl
     final_metas = [[] for _ in range(detect.nl)]
     
@@ -387,7 +402,7 @@ def generate_prototypes(args):
             patch_tensor = torch.stack(patches)
             
             # K-Means
-            indices = run_kmeans(patch_tensor, k=10)
+            indices = run_kmeans(patch_tensor, k=args.num_protos)
             
             # Select
             sel_patches = patch_tensor[indices]
@@ -406,7 +421,7 @@ def generate_prototypes(args):
         else:
             LOGGER.warning(f"No prototypes collected from layer {layer_idx}")
 
-    # 6. Merge History
+    # 7. Merge History
     if args.load_hist:
         hist = torch.load(args.load_hist, map_location='cpu')
         for i in range(detect.nl):
@@ -438,6 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="0")
     parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--num_protos", type=int, default=10)
     parser.add_argument("--iou_threshold", type=float, default=0.5)
     parser.add_argument("--vis_dir", default=None)
     parser.add_argument("--load_hist", default=None)

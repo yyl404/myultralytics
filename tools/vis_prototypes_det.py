@@ -191,10 +191,14 @@ def run_evaluation(model, prototypes, meta_info, device, max_protos=torch.inf):
                 if both_correct:
                     losses['correct_both'] += 1
                 
+                # Extract dataset name
+                dataset_name = meta['dataset']
+                
                 # Store
                 results.append({
                     'meta': meta,
                     'layer': l_idx,
+                    'dataset': dataset_name,
                     'pred': {'cls': class_names[pred_cls.argmax().item()],
                              'cls_id': pred_cls.argmax().item(),
                              'conf': pred_cls.softmax(0).max().item(),
@@ -218,6 +222,25 @@ def run_evaluation(model, prototypes, meta_info, device, max_protos=torch.inf):
     
     acc = losses['correct_both'] / losses['count'] if losses['count'] else 0.0
     losses['acc'] = acc
+    
+    # Calculate per-dataset accuracy
+    dataset_stats = {}
+    for result in results:
+        dataset_name = result['dataset']
+        if dataset_name not in dataset_stats:
+            dataset_stats[dataset_name] = {'count': 0, 'correct_both': 0}
+        dataset_stats[dataset_name]['count'] += 1
+        if result['metrics']['both_ok']:
+            dataset_stats[dataset_name]['correct_both'] += 1
+    
+    # Calculate accuracy for each dataset
+    dataset_accuracies = {}
+    for dataset_name, stats in dataset_stats.items():
+        dataset_accuracies[dataset_name] = stats['correct_both'] / stats['count'] if stats['count'] > 0 else 0.0
+    
+    losses['dataset_acc'] = dataset_accuracies
+    losses['dataset_stats'] = dataset_stats
+    
     return losses, results
 
 
@@ -247,7 +270,14 @@ def main():
     
     with open(out_dir / 'report.txt', 'w') as f:
         f.write(f"Cls Loss: {losses['cls']:.4f}\nReg Loss: {losses['reg']:.4f}\n")
-        f.write(f"Acc (IoU>0.5 & cls correct): {losses['acc']:.4f}\n")
+        f.write(f"Overall Acc (IoU>0.5 & cls correct): {losses['acc']:.4f}\n")
+        f.write(f"\nPer-Dataset Accuracy:\n")
+        f.write(f"{'Dataset':<30} {'Count':<10} {'Correct':<10} {'Accuracy':<10}\n")
+        f.write(f"{'-'*60}\n")
+        for dataset_name in sorted(losses['dataset_acc'].keys()):
+            stats = losses['dataset_stats'][dataset_name]
+            acc = losses['dataset_acc'][dataset_name]
+            f.write(f"{dataset_name:<30} {stats['count']:<10} {stats['correct_both']:<10} {acc:.4f}\n")
     
     # Visualize
     vis_dir = out_dir / "vis"

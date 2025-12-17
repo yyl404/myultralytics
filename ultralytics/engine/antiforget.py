@@ -526,13 +526,11 @@ class AntiForgetTrainer(BaseTrainer):
                 reg_supervision = self.prototypes[lid][:, in_channels * 5 * 5 : in_channels * 5 * 5 + reg_out_channels]
                 cls_supervision = self.prototypes[lid][:, in_channels * 5 * 5 + reg_out_channels : in_channels * 5 * 5 + reg_out_channels + cls_out_channels]
 
-            cls_out_log_softmax = F.log_softmax(cls_out, dim=1)
-            cls_supervision_softmax = F.softmax(cls_supervision, dim=1)
-            cls_loss_proto += F.kl_div(cls_out_log_softmax, cls_supervision_softmax, reduction="batchmean")
+            cls_loss_proto += (F.binary_cross_entropy_with_logits(cls_out, cls_supervision.sigmoid())\
+                -F.binary_cross_entropy_with_logits(cls_supervision, cls_supervision.sigmoid())) # min value of cls_loss_proto
 
-            reg_out = F.log_softmax(reg_out.reshape(-1, reg_max), dim=1)  # [num_prototypes*4, reg_max]
             reg_supervision = F.softmax(reg_supervision.reshape(-1, reg_max), dim=1)  # [num_prototypes*4, reg_max]
-            reg_loss_proto += F.kl_div(reg_out, reg_supervision, reduction='batchmean')
+            reg_loss_proto += F.cross_entropy(reg_out.reshape(-1, reg_max), reg_supervision)
 
         cls_loss_proto /= sum([self.prototypes[lid].shape[0] for lid in range(detect.nl)])
         reg_loss_proto /= sum([self.prototypes[lid].shape[0] for lid in range(detect.nl)])

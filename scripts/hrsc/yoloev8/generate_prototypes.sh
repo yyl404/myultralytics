@@ -1,20 +1,19 @@
 #!/bin/bash
 
 # Configuration
-OUTPUT_DIR="runs/yolov8l_4-domain_pretrained-yoloe_proto_rp"
+OUTPUT_DIR="runs/yolov8l_hrsc_pretrained-yoloe_proto_rp"
 DEVICE=0
 IOU_THRESHOLD=0.5
-NUM_PROTOS = 10
+NUM_PROTOS=50
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 START_TASK=${START_TASK:-1}
 
 # Specify dataset path for each task
 TASK_DATASETS=(
-    "data/4-domain/voc/dataset.yaml"
-    "data/4-domain/clipart/dataset.yaml"
-    "data/4-domain/watercolor/dataset.yaml"
-    "data/4-domain/comic/dataset.yaml"
+    "/root/myultralytics/data/HRSC2016-YOLO-Coarse_1x4/task_1_cls_1/dataset.yaml"
+    "/root/myultralytics/data/HRSC2016-YOLO-Coarse_1x4/task_2_cls_1/dataset.yaml"
+    "/root/myultralytics/data/HRSC2016-YOLO-Coarse_1x4/task_3_cls_1/dataset.yaml"
 )
 
 # Generate prototypes for each task iteratively

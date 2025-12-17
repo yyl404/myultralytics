@@ -48,10 +48,10 @@ from tqdm import tqdm
 
 from ultralytics.utils import YAML, LOGGER
 
-from tools.utils import parse_list_string
+from utils import parse_list_string
 
 
-SUPPORTED_IMAGE_EXTENSIONS = ['.jpg', '.png', '.jpeg']
+SUPPORTED_IMAGE_EXTENSIONS = ['.jpg', '.png', '.jpeg', 'bmp']
 SUPPORTED_LABEL_EXTENSIONS = ['.txt']
 
 if __name__ == "__main__":
