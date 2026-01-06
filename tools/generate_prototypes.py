@@ -103,10 +103,11 @@ def run_kmeans(features, k, max_iters=100):
     return dists_to_centers.argmin(dim=0)
 
 
-def extract_patches_from_layer(feat, bbox_map_px, cls_map, reg_map, gt_bbox_px, gt_cls):
+def extract_pos_patches_from_layer(feat, bbox_map_px, cls_map, reg_map, gt_bbox_px, gt_cls, conf_thresh=0.25, iou_threshold=0.5):
     """
     Extracts 5x5 feature patches from a single layer that match the GT.
-    Returns list of: (y, x, patch, reg, cls, pred_bbox, iou)
+    Returns list of: (y, x, patch, reg, cls, pad_mask, iou, gt_idx)
+    where gt_idx indicates which GT bbox each result corresponds to.
     """
     B, C, H, W = feat.shape
     # Pad and unfold to get 5x5 patches: (1, C, H, W, 25) -> (H*W, C*25)
@@ -133,9 +134,9 @@ def extract_patches_from_layer(feat, bbox_map_px, cls_map, reg_map, gt_bbox_px, 
     ious = torch.nan_to_num(ious).clamp(0, 1).squeeze(-1) # [num_gt, H*W]
     
     # Filter 3: Correct Classification
-    cls_preds = cls_flat.argmax(dim=1) # [H*W]
+    conf, cls_preds = cls_flat.sigmoid().max(dim=1)  # [H*W], [H*W]
     # gt_cls: [num_gt]
-    correct_cls_mask = (cls_preds.unsqueeze(0) == gt_cls.unsqueeze(1)) & valid_mask.unsqueeze(0)
+    correct_cls_mask = (cls_preds.unsqueeze(0) == gt_cls.unsqueeze(1)) & (conf.unsqueeze(0) > conf_thresh) & valid_mask.unsqueeze(0)
 
     # Select best candidate
     masked_ious = ious.clone()
@@ -146,15 +147,213 @@ def extract_patches_from_layer(feat, bbox_map_px, cls_map, reg_map, gt_bbox_px, 
     row_indices = torch.arange(num_gt, device=best_idx.device)
     max_iou = masked_ious[row_indices, best_idx] # [num_gt]
     
+    # Filter by iou_threshold: only keep matches with IOU >= threshold
+    valid_iou_mask = max_iou >= iou_threshold
+    
+    # If no valid matches, return empty tensors
+    if not valid_iou_mask.any():
+        return (
+            torch.tensor([], dtype=torch.long, device=feat.device),  # y
+            torch.tensor([], dtype=torch.long, device=feat.device),  # x
+            torch.empty((0, patches_flat.shape[1]), device=feat.device),  # patches
+            torch.empty((0, reg_flat.shape[1]), device=feat.device),  # reg
+            torch.empty((0, cls_flat.shape[1]), device=feat.device),  # cls
+            torch.empty((0, unpadded_mask.shape[1]), device=feat.device),  # pad_mask
+            torch.tensor([], dtype=torch.float32, device=feat.device),  # iou
+            torch.tensor([], dtype=torch.long, device=feat.device)  # gt_idx
+        )
+    
+    # Filter all outputs by valid_iou_mask
     y, x = best_idx // W, best_idx % W
+    gt_indices = torch.arange(num_gt, device=feat.device)[valid_iou_mask]  # Original GT indices
     return (
-        y, x,
-        patches_flat[best_idx], # [num_gt, C*25]
-        reg_flat[best_idx], # [num_gt, 4*reg_max]
-        cls_flat[best_idx], # [num_gt, num_cls]
-        unpadded_mask[best_idx], # [num_gt, 25]
-        max_iou # [num_gt]
+        y[valid_iou_mask],  # [num_valid]
+        x[valid_iou_mask],  # [num_valid]
+        patches_flat[best_idx[valid_iou_mask]], # [num_valid, C*25]
+        reg_flat[best_idx[valid_iou_mask]], # [num_valid, 4*reg_max]
+        cls_flat[best_idx[valid_iou_mask]], # [num_valid, num_cls]
+        unpadded_mask[best_idx[valid_iou_mask]], # [num_valid, 25]
+        max_iou[valid_iou_mask], # [num_valid]
+        gt_indices  # [num_valid] - indices to original GT
     )
+
+
+def extract_neg_patches_from_layer(feat, cls_map, max_num, neg_conf_threshold=0.25):
+    """
+    Extracts 5x5 feature patches from a single layer where all class confidences are below threshold.
+    Randomly selects patches that satisfy the condition.
+    
+    Args:
+        feat: Feature map [B, C, H, W]
+        cls_map: Classification logits [B, num_cls, H, W]
+        max_num: Maximum number of patches to return
+        neg_conf_threshold: Threshold for negative samples - all class confidences must be below this
+    
+    Returns:
+        Tuple of (y, x, patch, pad_mask):
+        - y: y coordinates [num_selected]
+        - x: x coordinates [num_selected]
+        - patch: Feature patches [num_selected, C*25]
+        - pad_mask: Unpadded region mask [num_selected, 25]
+    """
+    B, C, H, W = feat.shape
+    # Pad and unfold to get 5x5 patches: (1, C, H, W, 25) -> (H*W, C*25)
+    feat_padded = F.pad(feat, (2, 2, 2, 2))
+    patches = feat_padded.unfold(2, 5, 1).unfold(3, 5, 1)
+    patches_flat = patches.permute(0, 2, 3, 1, 4, 5).reshape(H * W, -1) # [H*W, C*25]
+
+    # Create unpadded region mask
+    unpadded_mask = F.pad(torch.ones([feat.shape[0], 1, *feat.shape[2:4]], dtype=torch.float32, device=feat_padded.device), (2, 2, 2, 2))
+    unpadded_mask = unpadded_mask.unfold(2, 5, 1).unfold(3, 5, 1)
+    unpadded_mask = unpadded_mask.permute(0, 2, 3, 1, 4, 5).reshape(H * W, -1) # [H*W, 25]
+
+    # Flatten classification map
+    cls_flat = cls_map.permute(0, 2, 3, 1).reshape(H * W, -1) # [H*W, num_cls]
+    
+    # Filter: All class confidences must be below threshold
+    cls_conf = cls_flat.sigmoid()  # [H*W, num_cls]
+    # Check that all class confidences are below threshold
+    valid_neg_mask = (cls_conf < neg_conf_threshold).all(dim=1)  # [H*W]
+    
+    # If no valid negative patches, return empty tensors
+    if not valid_neg_mask.any():
+        return (
+            torch.tensor([], dtype=torch.long, device=feat.device),  # y
+            torch.tensor([], dtype=torch.long, device=feat.device),  # x
+            torch.empty((0, patches_flat.shape[1]), device=feat.device),  # patches
+            torch.empty((0, unpadded_mask.shape[1]), device=feat.device)  # pad_mask
+        )
+    
+    # Get indices of valid negative patches
+    valid_indices = torch.where(valid_neg_mask)[0]  # [num_valid]
+    
+    # Randomly select patches (up to max_num if specified)
+    num_valid = valid_indices.shape[0]
+    if max_num is not None and num_valid > max_num:
+        # Randomly sample max_num indices
+        perm = torch.randperm(num_valid, device=feat.device)
+        selected_indices = valid_indices[perm[:max_num]]
+    else:
+        selected_indices = valid_indices
+    
+    # Convert flat indices to (y, x) coordinates
+    y = selected_indices // W
+    x = selected_indices % W
+    
+    return (
+        y,  # [num_selected]
+        x,  # [num_selected]
+        patches_flat[selected_indices],  # [num_selected, C*25]
+        unpadded_mask[selected_indices]  # [num_selected, 25]
+    )
+
+
+def filter_old_neg_protos(p_old, meta_old, detect, layer_idx, neg_conf_threshold=0.25):
+    """
+    Filter old negative prototypes by checking if they are still negative samples
+    under the new model parameters (with expanded class channels).
+    
+    Args:
+        p_old: Old negative prototypes tensor [num_protos, C*25 + nc_old + 25]
+               Format: [feat(C*25) | cls_valid_mask(nc_old) | pad_mask(25)]
+        meta_old: List of meta information for old prototypes
+        detect: Detection head module
+        layer_idx: Layer index
+        neg_conf_threshold: Confidence threshold for negative samples
+    
+    Returns:
+        Tuple of (filtered_protos, filtered_meta):
+        - filtered_protos: Filtered prototypes tensor [num_valid, C*25 + nc_new + 25]
+        - filtered_meta: Filtered meta information list
+    """
+    if p_old is None or p_old.numel() == 0:
+        return p_old, meta_old if meta_old else []
+    
+    device = detect.cv2[layer_idx][0].conv.weight.device
+    p_old = p_old.to(device)
+    
+    num_protos = p_old.shape[0]
+    in_channels = detect.cv2[layer_idx][0].conv.in_channels
+    feat_dim = in_channels * 25
+    nc_new = detect.nc
+    
+    # Parse old prototypes: [feat(C*25) | cls_valid_mask(nc_old) | pad_mask(25)]
+    # We need to extract feat and pad_mask, ignore the old cls_valid_mask
+    # The old format might have different nc, so we need to handle it
+    # Assume the last 25 elements are pad_mask, and before that is cls_valid_mask
+    pad_mask_flat = p_old[:, -25:]  # [num_protos, 25]
+    # The feat is the first feat_dim elements
+    feat_flat = p_old[:, :feat_dim]  # [num_protos, C*25]
+    
+    # Reshape features to [num_protos, C, 5, 5]
+    feat_5x5 = feat_flat.reshape(num_protos, in_channels, 5, 5)
+    
+    # Reshape pad_mask to [num_protos, 5, 5]
+    pad_mask_5x5 = pad_mask_flat.reshape(num_protos, 5, 5)
+    
+    # Restore prototypes from padded format to 5x5 feature maps
+    restored_prototypes = torch.zeros([num_protos, in_channels, 5, 5], device=device)
+    
+    for k in range(num_protos):
+        mask = pad_mask_5x5[k]  # [5, 5], 1=original, 0=padded
+        proto = feat_5x5[k]  # [in_channels, 5, 5]
+        
+        # Find the valid region (original region) bounds in pad_mask
+        valid_rows = torch.where(mask.sum(dim=1) > 0)[0]
+        valid_cols = torch.where(mask.sum(dim=0) > 0)[0]
+        
+        if len(valid_rows) > 0 and len(valid_cols) > 0:
+            # Get valid region bounds in pad_mask coordinates
+            mask_h_start, mask_h_end = valid_rows[0].item(), valid_rows[-1].item() + 1
+            mask_w_start, mask_w_end = valid_cols[0].item(), valid_cols[-1].item() + 1
+            
+            # Extract valid region from prototype (this is the original feature map region)
+            valid_proto = proto[:, mask_h_start:mask_h_end, mask_w_start:mask_w_end]  # [in_channels, H', W']
+            
+            # Calculate restore offsets
+            offset_y = (0 - mask_h_start) + (5 - mask_h_end)
+            offset_x = (0 - mask_w_start) + (5 - mask_w_end)
+            
+            # Place valid region at the offset position in restored feature map
+            restored_h_start = mask_h_start + offset_y
+            restored_w_start = mask_w_start + offset_x
+            restored_h_end = mask_h_end + offset_y
+            restored_w_end = mask_w_end + offset_x
+            
+            # Place the valid region at the corresponding position
+            restored_prototypes[k, :, restored_h_start:restored_h_end, restored_w_start:restored_w_end] = valid_proto
+    
+    # Forward through classification head to get class predictions
+    cls_output = detect.cv3[layer_idx](restored_prototypes)  # [num_protos, num_cls, 5, 5]
+    
+    # Average over spatial dimensions to get per-prototype class confidences
+    cls_conf = cls_output.sigmoid().mean(dim=(2, 3))  # [num_protos, num_cls]
+    
+    # Check if all class confidences are below threshold
+    all_below_threshold = (cls_conf < neg_conf_threshold).all(dim=1)  # [num_protos]
+    
+    # Filter prototypes that are still negative
+    valid_indices = torch.where(all_below_threshold)[0]
+    
+    if len(valid_indices) == 0:
+        # No valid negative prototypes, return empty tensor and empty meta
+        return torch.empty((0, feat_dim + nc_new + 25), device=device).cpu(), []
+    
+    # Get filtered prototypes
+    filtered_feat = feat_flat[valid_indices]  # [num_valid, C*25]
+    filtered_pad_mask = pad_mask_flat[valid_indices]  # [num_valid, 25]
+    
+    # Create new cls_valid_mask (all ones for negative samples)
+    cls_valid_mask = torch.ones([len(valid_indices), nc_new], device=device)
+    
+    # Combine: [feat(C*25) | cls_valid_mask(nc_new) | pad_mask(25)]
+    filtered_protos = torch.cat([filtered_feat, cls_valid_mask, filtered_pad_mask], dim=1)
+    
+    # Filter meta information
+    valid_indices_list = valid_indices.cpu().tolist()
+    filtered_meta = [meta_old[i] for i in valid_indices_list] if meta_old else []
+    
+    return filtered_protos.cpu(), filtered_meta
 
 
 def visualize_results(prototypes, meta_info, detect, vis_dir, class_names, imgsz=640):
@@ -180,7 +379,7 @@ def visualize_results(prototypes, meta_info, detect, vis_dir, class_names, imgsz
         feat_dim = detect.cv2[layer_idx][0].conv.in_channels * 25
         cls_preds = proto_tensor[:, feat_dim+reg_dim:feat_dim+reg_dim+nc]
         reg_cls_preds = proto_tensor[:, feat_dim:feat_dim+reg_dim+nc]
-        top_conf, top_cls = cls_preds.softmax(dim=1).max(dim=1)
+        top_conf, top_cls = cls_preds.sigmoid().max(dim=1)
         
         for reg_cls, conf, cls, meta in zip(reg_cls_preds, top_conf, top_cls, metas):
             img_path = meta['img_path']
@@ -291,7 +490,8 @@ def generate_prototypes(args):
     img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(tuple(img_extensions))])
 
     # 4. Iter through dataset to collect raw features
-    collector = [[[] for _ in range(detect.nc)] for _ in range(detect.nl)]
+    collector_pos = [[[] for _ in range(detect.nc)] for _ in range(detect.nl)]
+    collector_neg = [[] for _ in range(detect.nl)]
     pbar = TQDM(img_files, desc="Generating prototypes")
     for img_file in pbar:
         # Load Image
@@ -321,7 +521,7 @@ def generate_prototypes(args):
         bbox_maps_px = []
         start = 0
         HWs = []
-        for i, raw in enumerate(raw_preds):
+        for lid, raw in enumerate(raw_preds):
             B, _, H, W = raw.shape
             # decoded_preds contains xywh
             bbox_layer = decoded_preds[:, :4, start:start + H*W].view(B, 4, H, W)
@@ -360,40 +560,59 @@ def generate_prototypes(args):
             reg_map = raw_pred[:, :detect.reg_max * 4]
             cls_map = raw_pred[:, detect.reg_max * 4:]
             
-            result = extract_patches_from_layer(
+            pos_result = extract_pos_patches_from_layer(
                 feat, bbox_map_px, cls_map, reg_map, 
-                gt_bbox_px, gt_cls_batch
+                gt_bbox_px, gt_cls_batch,
+                args.pos_conf_threshold, args.iou_threshold
             )
 
-            for idx, (y, x, patch, reg, cls, pad_mask, iou) in enumerate(zip(*result)):
-                if iou > args.iou_threshold:
-                    meta = {
-                        "img_path": img_path, "yx": (y, x), "HWs": HWs,
-                        "bbox_gt_norm": gt_bbox_norm[idx].cpu(),
-                        "dataset": dataset_name
-                    }
-                    collector[layer_idx][gt_cls_batch[idx].item()].append(
-                        (patch, reg, cls, pad_mask, meta)
-                    )
+            neg_result = extract_neg_patches_from_layer(
+                feat, cls_map,
+                max(args.num_protos//len(img_files), 1), args.neg_conf_threshold
+            )
+
+            for y, x, patch, reg, cls, pad_mask, iou, gt_idx in zip(*pos_result):
+                meta = {
+                    "img_path": img_path, "yx": (y, x), "HWs": HWs,
+                    "bbox_gt_norm": gt_bbox_norm[gt_idx].cpu(),
+                    "dataset": dataset_name
+                }
+                collector_pos[layer_idx][gt_cls_batch[gt_idx].item()].append(
+                    (patch, reg, cls, pad_mask, meta)
+                )
+            
+            for y, x, patch, pad_mask in zip(*neg_result):
+                meta = {
+                    "img_path": img_path, "yx": (y, x), "HWs": HWs,
+                    "dataset": dataset_name
+                }
+                cls_valid_mask = torch.ones(detect.nc).to(device)
+                collector_neg[layer_idx].append(
+                    (patch, cls_valid_mask, pad_mask, meta)
+                )
+
 
     # 5. Check prototypes for each class
     for cls_idx in range(detect.nc):
         num_cls_protos = 0
         for layer_idx in range(detect.nl):
-            num_cls_protos += len(collector[layer_idx][cls_idx])
+            num_cls_protos += len(collector_pos[layer_idx][cls_idx])
         if num_cls_protos == 0 and cls_idx in class_id_map.values():
             LOGGER.warning(f"No prototypes of {class_names_model[cls_idx]} collected.")
 
     # 6. Clustering & Saving
-    final_protos = [None] * detect.nl
-    final_metas = [[] for _ in range(detect.nl)]
+    final_protos_pos = [None] * detect.nl
+    final_metas_pos = [[] for _ in range(detect.nl)]
+    final_protos_neg = [None] * detect.nl
+    final_metas_neg = [[] for _ in range(detect.nl)]
     
     LOGGER.info("Clustering prototypes...")
     for layer_idx in range(detect.nl):
+        # Collect and clustering positive protos
         layer_tensors = []
         
         for cls_idx in range(detect.nc):
-            items = collector[layer_idx][cls_idx]
+            items = collector_pos[layer_idx][cls_idx]
             if not items:
                 continue
             
@@ -414,31 +633,54 @@ def generate_prototypes(args):
             # Combine: [Feat(25C) | Reg | Cls | Mask(25)]
             combined = torch.cat([sel_patches, sel_regs, sel_clss, sel_masks], dim=1)
             layer_tensors.append(combined)
-            final_metas[layer_idx].extend(sel_metas)
+            final_metas_pos[layer_idx].extend(sel_metas)
 
         if layer_tensors:
-            final_protos[layer_idx] = torch.cat(layer_tensors, dim=0).cpu()
+            final_protos_pos[layer_idx] = torch.cat(layer_tensors, dim=0).cpu()
         else:
             LOGGER.warning(f"No prototypes collected from layer {layer_idx}")
+
+        # Collect and randomly sample negative protos
+        num_neg_items = len(collector_neg[layer_idx])
+        if num_neg_items > 0:
+            # Randomly sample num_protos negative prototypes
+            if num_neg_items > args.num_protos:
+                # Randomly select indices
+                selected_indices = torch.randperm(num_neg_items, device=torch.device('cpu'))[:args.num_protos].tolist()
+            else:
+                # Use all available negative prototypes
+                selected_indices = list(range(num_neg_items))
+            
+            selected_items = [collector_neg[layer_idx][idx] for idx in selected_indices]
+            final_protos_neg[layer_idx] = torch.stack([torch.cat(item[:3], dim=0) for item in selected_items]).cpu()
+            final_metas_neg[layer_idx] = [item[-1] for item in selected_items]
 
     # 7. Merge History
     if args.load_hist:
         hist = torch.load(args.load_hist, map_location='cpu')
-        for i in range(detect.nl):
-            if hist['prototypes'][i] is not None:
-                p_new = final_protos[i]
-                p_old = hist['prototypes'][i]
-                final_protos[i] = torch.cat([p_old, p_new]) if p_new is not None else p_old
-                final_metas[i] = hist['meta_info'][i] + final_metas[i]
+        for lid in range(detect.nl):
+            if hist['prototypes'][lid] is not None:
+                p_new = final_protos_pos[lid]
+                p_old = hist['prototypes'][lid]
+                final_protos_pos[lid] = torch.cat([p_old, p_new]) if p_new is not None else p_old
+                final_metas_pos[lid] = hist['meta_info'][lid] + final_metas_pos[lid]
+            if hist['prototypes_neg'][lid] is not None:
+                p_new = final_protos_neg[lid]
+                p_old = hist['prototypes_neg'][lid]
+                meta_old = hist['meta_info_neg'][lid]
+                p_old, meta_old = filter_old_neg_protos(p_old, meta_old, detect, lid, args.neg_conf_threshold)
+                final_protos_neg[lid] = torch.cat([p_old, p_new]) if p_new is not None else p_old
+                final_metas_neg[lid] = meta_old + final_metas_neg[lid]
 
-    torch.save({"prototypes": final_protos, "meta_info": final_metas}, args.output)
+    torch.save({"prototypes": final_protos_pos, "meta_info": final_metas_pos, "prototypes_neg": final_protos_neg, "meta_info_neg": final_metas_neg},
+        args.output)
     LOGGER.info(f"Saved to {args.output}")
 
     # 7. Visualize prototypes
     if args.vis_dir:
         visualize_results(
-            final_protos, 
-            final_metas,
+            final_protos_pos, 
+            final_metas_pos,
             detect,
             args.vis_dir,
             class_names_model,
@@ -454,6 +696,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="0")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--num_protos", type=int, default=10)
+    parser.add_argument("--pos_conf_threshold", type=float, default=0.1)
+    parser.add_argument("--neg_conf_threshold", type=float, default=0.25)
     parser.add_argument("--iou_threshold", type=float, default=0.5)
     parser.add_argument("--vis_dir", default=None)
     parser.add_argument("--load_hist", default=None)

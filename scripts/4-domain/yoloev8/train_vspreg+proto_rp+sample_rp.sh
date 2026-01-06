@@ -5,19 +5,19 @@ MODEL_CFG="yolov8l.yaml"
 YOLOE_MODEL_WEIGHT="yoloe-v8l-seg.pt"
 FREEZE_BASE="[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]"
 FREEZE_INC="[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]"
-OUTPUT_DIR="runs/yolov8l_4-domain_pretrained-yoloe_proto_rp"
-EPOCHS=300
+OUTPUT_DIR="runs/yolov8l_4-domain_pretrained-yoloe_vspreg+pseudo_label+proto_rp+sample_rp"
+EPOCHS=100
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
 DEVICE=0
 PATIENCE=15
-NUM_PROTOS=10
+NUM_PROTOS=100
 PROTO_RP_LOSS_WEIGHT=10000
 
 # PRoRP configuration
 # Set to True to use base_model distillation, False to use prototype's built-in supervision
-PROTO_RP_USE_BASE_MODEL=${PROTO_RP_USE_BASE_MODEL:-False}
+PROTO_RP_USE_BASE_MODEL=${PROTO_RP_USE_BASE_MODEL:-True}
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -32,18 +32,26 @@ TASK_DATASETS=(
     "data/4-domain/comic/dataset.yaml"
 )
 
-# Initialize PREV_PROTOTYPES for first task
+# Initialize PREV_PCA_CACHE and PREV_PROTOTYPES for first task
+PREV_PCA_CACHE=""
 PREV_PROTOTYPES=""
 
 # If starting from a task other than 1, set PREV_MODEL to the previous task's model
 if [ $START_TASK -gt 1 ]; then
     PREV_TASK=$((START_TASK - 1))
     PREV_MODEL="$OUTPUT_DIR/task-$PREV_TASK/best.pt"
+    PREV_PCA_CACHE="$OUTPUT_DIR/task-$PREV_TASK/pca_cache.pkl"
     PREV_PROTOTYPES="$OUTPUT_DIR/task-$PREV_TASK/prototypes.pt"
     
     if [ ! -f "$PREV_MODEL" ]; then
         echo "Error: Previous task model not found: $PREV_MODEL"
         echo "Cannot resume from task $START_TASK without task $PREV_TASK model."
+        exit 1
+    fi
+    
+    if [ ! -f "$PREV_PCA_CACHE" ]; then
+        echo "Error: Previous task PCA cache not found: $PREV_PCA_CACHE"
+        echo "You can regenerate previouse task PCA cache using tools/pca.py."
         exit 1
     fi
     
@@ -55,6 +63,7 @@ if [ $START_TASK -gt 1 ]; then
     echo "=========================================="
     echo "Resuming from Task $START_TASK"
     echo "Using previous model: $PREV_MODEL"
+    echo "Using previous PCA cache: $PREV_PCA_CACHE"
     echo "Using previous prototypes: $PREV_PROTOTYPES"
     echo "=========================================="
     echo ""
@@ -96,8 +105,16 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --workers $WORKERS \
             --device $DEVICE \
             --project $TASK_DIR \
-            --freeze $FREEZE_BASE \
-            --patience $PATIENCE
+            --patience $PATIENCE \
+            --freeze $FREEZE_BASE
+        
+        # Perform PCA on model's input
+        echo "Performing PCA analysis on task $task_num..."
+        PCA_CACHE_PATH="$TASK_DIR/pca_cache.pkl"
+        python tools/pca.py \
+            --model $TASK_DIR/best.pt \
+            --dataset $DATASET_PATH \
+            --save_path $PCA_CACHE_PATH
         
         # Generate prototypes
         echo "Generating prototypes for task $task_num..."
@@ -112,6 +129,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --num_protos $NUM_PROTOS
         
         PREV_MODEL="$TASK_DIR/best.pt"
+        PREV_PCA_CACHE="$PCA_CACHE_PATH"
         PREV_PROTOTYPES="$PROTOTYPES_PATH"
     else
         # Subsequent tasks: extract dataset name from path for output directory naming
@@ -137,16 +155,42 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --expanded_model $EXPANDED_MODEL \
             --output $CONVERTED_PROTOTYPES
 
-        # Convert dataset class IDs
-        echo "Converting dataset class IDs for task $task_num..."
-        CONVERTED_DATASET="$TASK_DIR/${DATASET_NAME}_converted"
+        # Generate a replay dataset by selecting images and annotations from prototype meta_info
+        echo "Extracting replay samples from prototypes (Task $task_num)..."
+        REPLAY_DATASET="$TASK_DIR/task-$((task_num-1))-replay-samples"
+        python tools/generate_replay_dataset.py \
+            --prototypes $CONVERTED_PROTOTYPES \
+            --output $REPLAY_DATASET \
+            --copy_images \
+            --use_all_annotations
+
+        # Use previous task's model to generate pseudo labels for replay samples
+        echo "Generating pseudo labels for replay samples (Task $task_num)..."
+        PSEUDO_LABELS_DIR="$TASK_DIR/task-$((task_num-1))-replay-samples-pseudo-labels"
+        python tools/generate_pseudo_label.py \
+            --model $PREV_MODEL \
+            --dataset $REPLAY_DATASET/dataset.yaml \
+            --output_dir $PSEUDO_LABELS_DIR \
+            --conf_threshold 0.25 \
+            --splits train
+
+        # Combine replay samples (with pseudo labels) and current task dataset
+        echo "Merging replay dataset with current task dataset (Task $task_num)..."
+        MERGED_DATASET_DIR="$TASK_DIR/task-$((task_num-1))-dataset_merged"
+        python tools/merge_datasets.py \
+            --datasets "$PSEUDO_LABELS_DIR/dataset.yaml" "$DATASET_PATH" \
+            --output_dir $MERGED_DATASET_DIR
+        
+        # Map class IDs from merged dataset to expanded model's class order
+        echo "Converting dataset class IDs to match expanded model (Task $task_num)..."
+        CONVERTED_DATASET="$TASK_DIR/task-$((task_num-1))-dataset_converted"
         python tools/convert_dataset_class_ids.py \
             --model $EXPANDED_MODEL \
-            --dataset $DATASET_PATH \
+            --dataset $MERGED_DATASET_DIR/dataset.yaml \
             --output_dir $CONVERTED_DATASET
         
         echo "Training task $task_num..."
-        # Build training command with optional prototypes
+        # Build training command with optional PCA cache and prototypes
         TRAIN_CMD="python tools/train.py \
             --model $EXPANDED_MODEL \
             --data \"$CONVERTED_DATASET/dataset.yaml\" \
@@ -161,15 +205,27 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --patience $PATIENCE \
             --freeze $FREEZE_INC"
         
+        # Add PCA cache
+        echo "Using PCA cache from previous task: $PREV_PCA_CACHE"
+        TRAIN_CMD="$TRAIN_CMD --vspreg True --pca_cache_path $PREV_PCA_CACHE"
+        
         # Add prototypes
         echo "Using converted prototypes: $CONVERTED_PROTOTYPES"
         TRAIN_CMD="$TRAIN_CMD --proto_rp True"
         TRAIN_CMD="$TRAIN_CMD --prototypes $CONVERTED_PROTOTYPES"
         TRAIN_CMD="$TRAIN_CMD --proto_rp_use_base_model $PROTO_RP_USE_BASE_MODEL"
-        TRAIN_CMD="$TRAIN_CMD --proto_rp_loss_weight $PROTO_RP_LOSS_WEIGHT"
         
         # Execute training command
         eval $TRAIN_CMD
+
+        # Perform PCA on model's input using original dataset (all layers)
+        echo "Performing PCA analysis..."
+        PCA_CACHE_PATH="$TASK_DIR/pca_cache.pkl"
+        python tools/pca.py \
+            --model $TASK_DIR/best.pt \
+            --dataset $DATASET_PATH \
+            --load_hist $PREV_PCA_CACHE \
+            --save_path $PCA_CACHE_PATH
         
         # Generate prototypes for current task
         echo "Generating prototypes for task $task_num..."
@@ -185,6 +241,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --num_protos $NUM_PROTOS
         
         PREV_MODEL="$TASK_DIR/best.pt"
+        PREV_PCA_CACHE="$PCA_CACHE_PATH"
         PREV_PROTOTYPES="$PROTOTYPES_PATH"
     fi
     

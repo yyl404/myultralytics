@@ -2,13 +2,12 @@
 
 # Configuration
 MODEL_CFG="yolov8l.yaml"
-OUTPUT_DIR="runs/yolov8l_4-domain_fromscratch_naive"
+OUTPUT_DIR="runs/yolov8l_voc_inc_10_10_fromscratch_vspreg"
 EPOCHS=100
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
 DEVICE=0
-PATIENCE=10
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -17,10 +16,8 @@ START_TASK=${START_TASK:-1}
 # Specify dataset path for each task
 # Add or remove entries as needed
 TASK_DATASETS=(
-    "data/4-domain/voc/dataset.yaml"
-    "data/4-domain/clipart/dataset.yaml"
-    "data/4-domain/watercolor/dataset.yaml"
-    "data/4-domain/comic/dataset.yaml"
+    "data/VOC_inc_10_10/task_1_cls_10/dataset.yaml"
+    "data/VOC_inc_10_10/task_2_cls_10/dataset.yaml"
 )
 
 # Validate START_TASK
@@ -29,10 +26,14 @@ if [ $START_TASK -lt 1 ] || [ $START_TASK -gt ${#TASK_DATASETS[@]} ]; then
     exit 1
 fi
 
+# Initialize PREV_PCA_CACHE for first task
+PREV_PCA_CACHE=""
+
 # If starting from a task other than 1, set PREV_MODEL to the previous task's model
 if [ $START_TASK -gt 1 ]; then
     PREV_TASK=$((START_TASK - 1))
     PREV_MODEL="$OUTPUT_DIR/task-$PREV_TASK/best.pt"
+    PREV_PCA_CACHE="$OUTPUT_DIR/task-$PREV_TASK/pca_cache.pkl"
     
     if [ ! -f "$PREV_MODEL" ]; then
         echo "Error: Previous task model not found: $PREV_MODEL"
@@ -40,9 +41,17 @@ if [ $START_TASK -gt 1 ]; then
         exit 1
     fi
     
+    if [ ! -f "$PREV_PCA_CACHE" ]; then
+        echo "Warning: Previous task PCA cache not found: $PREV_PCA_CACHE"
+        echo "Training will proceed without PCA cache."
+    fi
+    
     echo "=========================================="
     echo "Resuming from Task $START_TASK"
     echo "Using previous model: $PREV_MODEL"
+    if [ -f "$PREV_PCA_CACHE" ]; then
+        echo "Using previous PCA cache: $PREV_PCA_CACHE"
+    fi
     echo "=========================================="
     echo ""
 fi
@@ -74,12 +83,23 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --imgsz $IMGSZ \
             --workers $WORKERS \
             --device $DEVICE \
-            --project $TASK_DIR \
-            --patience $PATIENCE
+            --project $TASK_DIR
+        
+        # Perform PCA on model's input using original dataset (all layers)
+        echo "Performing PCA analysis on all layers using original dataset..."
+        PCA_CACHE_PATH="$TASK_DIR/pca_cache.pkl"
+        python tools/pca.py \
+            --model $TASK_DIR/best.pt \
+            --dataset $DATASET_PATH \
+            --save_path $PCA_CACHE_PATH
         
         PREV_MODEL="$TASK_DIR/best.pt"
+        PREV_PCA_CACHE="$PCA_CACHE_PATH"
     else
-        # Subsequent tasks: expand model head and train
+        # Subsequent tasks: extract dataset name from path for output directory naming
+        DATASET_NAME=$(basename $(dirname $DATASET_PATH))
+
+        # Expand model head
         echo "Expanding model head for task $task_num..."
         EXPANDED_MODEL="$TASK_DIR/task-$((task_num-1))-best-expanded.pt"
         python tools/expand_model_head.py \
@@ -87,10 +107,9 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --model_cfg $MODEL_CFG \
             --dataset $DATASET_PATH \
             --save_path $EXPANDED_MODEL
-        
+
+        # Convert dataset class IDs
         echo "Converting dataset class IDs for task $task_num..."
-        # Extract dataset name from path for output directory naming
-        DATASET_NAME=$(basename $(dirname $DATASET_PATH))
         CONVERTED_DATASET="$TASK_DIR/${DATASET_NAME}_converted"
         python tools/convert_dataset_class_ids.py \
             --model $EXPANDED_MODEL \
@@ -98,8 +117,9 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --output_dir $CONVERTED_DATASET
         
         echo "Training task $task_num..."
-        python tools/train.py --model $PREV_MODEL \
-            --data $CONVERTED_DATASET/dataset.yaml \
+        # Build training command with optional PCA cache and prototypes
+        TRAIN_CMD="python tools/train.py --model $EXPANDED_MODEL \
+            --data \"$CONVERTED_DATASET/dataset.yaml\" \
             --save_path $TASK_DIR/best.pt \
             --epochs $EPOCHS \
             --batch_size $BATCH_SIZE \
@@ -107,9 +127,30 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --workers $WORKERS \
             --device $DEVICE \
             --project $TASK_DIR \
-            --patience $PATIENCE
+            --trainer antiforget"
+        
+        # Add PCA cache if available
+        if [ -n "$PREV_PCA_CACHE" ] && [ -f "$PREV_PCA_CACHE" ]; then
+            echo "Using PCA cache from previous task: $PREV_PCA_CACHE"
+            TRAIN_CMD="$TRAIN_CMD --vspreg True --pca_cache_path $PREV_PCA_CACHE"
+        else
+            echo "Warning: No PCA cache available from previous task, training without PCA cache."
+        fi
+        
+        # Execute training command
+        eval $TRAIN_CMD
+
+        # Perform PCA on model's input using original dataset (all layers)
+        echo "Performing PCA analysis on all layers using original dataset..."
+        PCA_CACHE_PATH="$TASK_DIR/pca_cache.pkl"
+        python tools/pca.py \
+            --model $TASK_DIR/best.pt \
+            --dataset $DATASET_PATH \
+            --load_hist $PREV_PCA_CACHE \
+            --save_path $PCA_CACHE_PATH
         
         PREV_MODEL="$TASK_DIR/best.pt"
+        PREV_PCA_CACHE="$PCA_CACHE_PATH"
     fi
     
     echo "Task $task_num completed!"
@@ -121,3 +162,4 @@ done
 echo "=========================================="
 echo "All tasks completed!"
 echo "=========================================="
+

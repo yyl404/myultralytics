@@ -2,13 +2,12 @@
 
 # Configuration
 MODEL_CFG="yolov8l.yaml"
-OUTPUT_DIR="runs/yolov8l_4-domain_fromscratch_naive"
+OUTPUT_DIR="runs/yolov8l_voc_inc_10_10_fromscratch_pseudo_label"
 EPOCHS=100
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
 DEVICE=0
-PATIENCE=10
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -17,10 +16,8 @@ START_TASK=${START_TASK:-1}
 # Specify dataset path for each task
 # Add or remove entries as needed
 TASK_DATASETS=(
-    "data/4-domain/voc/dataset.yaml"
-    "data/4-domain/clipart/dataset.yaml"
-    "data/4-domain/watercolor/dataset.yaml"
-    "data/4-domain/comic/dataset.yaml"
+    "data/VOC_inc_15_5/task_1_cls_15/dataset.yaml"
+    "data/VOC_inc_15_5/task_2_cls_5/dataset.yaml"
 )
 
 # Validate START_TASK
@@ -74,12 +71,14 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --imgsz $IMGSZ \
             --workers $WORKERS \
             --device $DEVICE \
-            --project $TASK_DIR \
-            --patience $PATIENCE
+            --project $TASK_DIR
         
         PREV_MODEL="$TASK_DIR/best.pt"
     else
-        # Subsequent tasks: expand model head and train
+        # Subsequent tasks: extract dataset name from path for output directory naming
+        DATASET_NAME=$(basename $(dirname $DATASET_PATH))
+
+        # Expand model head
         echo "Expanding model head for task $task_num..."
         EXPANDED_MODEL="$TASK_DIR/task-$((task_num-1))-best-expanded.pt"
         python tools/expand_model_head.py \
@@ -87,27 +86,42 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --model_cfg $MODEL_CFG \
             --dataset $DATASET_PATH \
             --save_path $EXPANDED_MODEL
-        
+
+        # Generate pseudo labels for task $task_num
+        echo "Generating pseudo labels for task $task_num..."
+        PSEUDO_LABELS_DIR="$TASK_DIR/${DATASET_NAME}_train_pseudo_labels"
+        python tools/generate_pseudo_label.py \
+            --model $PREV_MODEL \
+            --dataset $DATASET_PATH \
+            --output_dir $PSEUDO_LABELS_DIR \
+            --conf_threshold 0.25 \
+            --splits train
+
+        # Merge datasets
+        echo "Merging dataset for task $task_num..."
+        MERGED_DATASET_DIR="$TASK_DIR/${DATASET_NAME}_merged"
+        python tools/merge_datasets.py \
+            --datasets "$PSEUDO_LABELS_DIR/dataset.yaml" "$DATASET_PATH" \
+            --output_dir $MERGED_DATASET_DIR
+
+        # Convert dataset class IDs
         echo "Converting dataset class IDs for task $task_num..."
-        # Extract dataset name from path for output directory naming
-        DATASET_NAME=$(basename $(dirname $DATASET_PATH))
         CONVERTED_DATASET="$TASK_DIR/${DATASET_NAME}_converted"
         python tools/convert_dataset_class_ids.py \
             --model $EXPANDED_MODEL \
-            --dataset $DATASET_PATH \
+            --dataset $MERGED_DATASET_DIR/dataset.yaml \
             --output_dir $CONVERTED_DATASET
         
         echo "Training task $task_num..."
         python tools/train.py --model $PREV_MODEL \
-            --data $CONVERTED_DATASET/dataset.yaml \
+            --data "$CONVERTED_DATASET/dataset.yaml" \
             --save_path $TASK_DIR/best.pt \
             --epochs $EPOCHS \
             --batch_size $BATCH_SIZE \
             --imgsz $IMGSZ \
             --workers $WORKERS \
             --device $DEVICE \
-            --project $TASK_DIR \
-            --patience $PATIENCE
+            --project $TASK_DIR
         
         PREV_MODEL="$TASK_DIR/best.pt"
     fi

@@ -11,6 +11,7 @@ BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
 DEVICE=0
+PATIENCE=15
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -79,7 +80,8 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --workers $WORKERS \
             --device $DEVICE \
             --project $TASK_DIR \
-            --freeze $FREEZE_BASE
+            --freeze $FREEZE_BASE \
+            --patience $PATIENCE
 
         PREV_MODEL="$TASK_DIR/best.pt"
     else
@@ -120,6 +122,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --trainer antiforget \
             --vspreg False \
             --proto_rp False \
+            --patience $PATIENCE \
             --freeze $FREEZE_INC"
         
         # Execute training command

@@ -5,8 +5,8 @@ MODEL_CFG="yolov8l.yaml"
 YOLOE_MODEL_WEIGHT="yoloe-v8l-seg.pt"
 FREEZE_BASE="[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]"
 FREEZE_INC="[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]"
-OUTPUT_DIR="runs/yolov8l_4-domain_pretrained-yoloe_proto_rp"
-EPOCHS=300
+OUTPUT_DIR="runs/yolov8l_voc_1x5_pretrained-yoloe_proto_rp"
+EPOCHS=100
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
@@ -17,7 +17,7 @@ PROTO_RP_LOSS_WEIGHT=10000
 
 # PRoRP configuration
 # Set to True to use base_model distillation, False to use prototype's built-in supervision
-PROTO_RP_USE_BASE_MODEL=${PROTO_RP_USE_BASE_MODEL:-False}
+PROTO_RP_USE_BASE_MODEL=${PROTO_RP_USE_BASE_MODEL:-True}
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -26,10 +26,11 @@ START_TASK=${START_TASK:-1}
 # Specify dataset path for each task
 # Add or remove entries as needed
 TASK_DATASETS=(
-    "data/4-domain/voc/dataset.yaml"
-    "data/4-domain/clipart/dataset.yaml"
-    "data/4-domain/watercolor/dataset.yaml"
-    "data/4-domain/comic/dataset.yaml"
+    "data/VOC_inc_15_1x5/task_2_cls_1/dataset.yaml"
+    "data/VOC_inc_15_1x5/task_3_cls_1/dataset.yaml"
+    "data/VOC_inc_15_1x5/task_4_cls_1/dataset.yaml"
+    "data/VOC_inc_15_1x5/task_5_cls_1/dataset.yaml"
+    "data/VOC_inc_15_1x5/task_6_cls_1/dataset.yaml" 
 )
 
 # Initialize PREV_PROTOTYPES for first task

@@ -91,7 +91,7 @@ def run_evaluation(model, prototypes, meta_info, device, max_protos=torch.inf):
                    for m in detect.cv3]
     
     results = []
-    losses = {'cls': 0.0, 'reg': 0.0, 'count': 0, 'correct_both': 0}
+    losses = {'cls': 0.0, 'reg': 0.0, 'count': 0, 'correct_both': 0, 'correct_loc': 0, 'correct_cls': 0}
     
     with torch.no_grad():
         for l_idx, (proto_tensor, metas) in enumerate(zip(prototypes, meta_info)):
@@ -143,15 +143,10 @@ def run_evaluation(model, prototypes, meta_info, device, max_protos=torch.inf):
                 pred_bbox_xywh = decoded[0, :4, idx_linear] 
                 
                 # 4. Losses & Metrics
-                cls_out_log_softmax = F.log_softmax(pred_cls, dim=0)
-                cls_supervision_softmax = F.softmax(clss_sup[i].to(device), dim=0)
-                loss_cls = F.kl_div(cls_out_log_softmax, cls_supervision_softmax, reduction="batchmean")
-                # loss_cls = F.binary_cross_entropy_with_logits(pred_cls, torch.sigmoid(clss_sup[i].to(device))).item()
+                loss_cls = F.binary_cross_entropy_with_logits(pred_cls, torch.sigmoid(clss_sup[i].to(device))).item()
 
-                reg_out_log_softmax = F.log_softmax(pred_reg.reshape(-1, detect.reg_max), dim=1)  # [num_prototypes*4, reg_max]
-                reg_supervision_softmax = F.softmax(regs_sup[i].to(device).reshape(-1, detect.reg_max), dim=1)  # [num_prototypes*4, reg_max]
-                loss_reg = F.kl_div(reg_out_log_softmax, reg_supervision_softmax, reduction='batchmean')
-                # loss_reg = F.mse_loss(pred_reg, regs_sup[i].to(device)).item()
+                reg_supervision_softmax = F.softmax(regs_sup[i].to(device).reshape(-1, detect.reg_max), dim=1)  # [4, reg_max]
+                loss_reg = F.cross_entropy(pred_reg.reshape(-1, detect.reg_max), reg_supervision_softmax).item()
                 
                 losses['cls'] += loss_cls
                 losses['reg'] += loss_reg
@@ -188,6 +183,10 @@ def run_evaluation(model, prototypes, meta_info, device, max_protos=torch.inf):
 
                 # Both IoU and classification correct
                 both_correct = bool(iou_ok and cls_correct)
+                if iou_ok:
+                    losses['correct_loc'] += 1
+                if cls_correct:
+                    losses['correct_cls'] += 1
                 if both_correct:
                     losses['correct_both'] += 1
                 
@@ -220,24 +219,35 @@ def run_evaluation(model, prototypes, meta_info, device, max_protos=torch.inf):
         losses['cls'] /= losses['count']
         losses['reg'] /= losses['count']
     
-    acc = losses['correct_both'] / losses['count'] if losses['count'] else 0.0
-    losses['acc'] = acc
+    losses['acc_loc'] = losses['correct_loc'] / losses['count'] if losses['count'] else 0.0
+    losses['acc_cls'] = losses['correct_cls'] / losses['count'] if losses['count'] else 0.0
+    losses['acc'] = losses['correct_both'] / losses['count'] if losses['count'] else 0.0
     
     # Calculate per-dataset accuracy
     dataset_stats = {}
     for result in results:
         dataset_name = result['dataset']
         if dataset_name not in dataset_stats:
-            dataset_stats[dataset_name] = {'count': 0, 'correct_both': 0}
+            dataset_stats[dataset_name] = {'count': 0, 'correct_both': 0, 'correct_loc': 0, 'correct_cls': 0}
         dataset_stats[dataset_name]['count'] += 1
+        if result['metrics']['iou_ok']:
+            dataset_stats[dataset_name]['correct_loc'] += 1
+        if result['metrics']['cls_correct']:
+            dataset_stats[dataset_name]['correct_cls'] += 1
         if result['metrics']['both_ok']:
             dataset_stats[dataset_name]['correct_both'] += 1
     
     # Calculate accuracy for each dataset
     dataset_accuracies = {}
+    dataset_accuracies_loc = {}
+    dataset_accuracies_cls = {}
     for dataset_name, stats in dataset_stats.items():
+        dataset_accuracies_loc[dataset_name] = stats['correct_loc'] / stats['count'] if stats['count'] > 0 else 0.0
+        dataset_accuracies_cls[dataset_name] = stats['correct_cls'] / stats['count'] if stats['count'] > 0 else 0.0
         dataset_accuracies[dataset_name] = stats['correct_both'] / stats['count'] if stats['count'] > 0 else 0.0
     
+    losses['dataset_acc_loc'] = dataset_accuracies_loc
+    losses['dataset_acc_cls'] = dataset_accuracies_cls
     losses['dataset_acc'] = dataset_accuracies
     losses['dataset_stats'] = dataset_stats
     
@@ -270,14 +280,28 @@ def main():
     
     with open(out_dir / 'report.txt', 'w') as f:
         f.write(f"Cls Loss: {losses['cls']:.4f}\nReg Loss: {losses['reg']:.4f}\n")
-        f.write(f"Overall Acc (IoU>0.5 & cls correct): {losses['acc']:.4f}\n")
+        f.write(f"Overall Loc Acc (IoU>0.5): {losses['acc_loc']:.4f}\n")
+        f.write(f"Overall Cls Acc (cls correct): {losses['acc_cls']:.4f}\n")
+        f.write(f"Overall Both Acc (IoU>0.5 & cls correct): {losses['acc']:.4f}\n")
         f.write(f"\nPer-Dataset Accuracy:\n")
-        f.write(f"{'Dataset':<30} {'Count':<10} {'Correct':<10} {'Accuracy':<10}\n")
-        f.write(f"{'-'*60}\n")
-        for dataset_name in sorted(losses['dataset_acc'].keys()):
+        f.write(
+            f"{'Dataset':<30} {'Count':<10} "
+            f"{'LocCorrect':<10} {'LocAcc':<10} "
+            f"{'ClsCorrect':<10} {'ClsAcc':<10} "
+            f"{'BothCorrect':<11} {'BothAcc':<10}\n"
+        )
+        f.write(f"{'-'*120}\n")
+        for dataset_name in sorted(losses['dataset_stats'].keys()):
             stats = losses['dataset_stats'][dataset_name]
-            acc = losses['dataset_acc'][dataset_name]
-            f.write(f"{dataset_name:<30} {stats['count']:<10} {stats['correct_both']:<10} {acc:.4f}\n")
+            acc_loc = losses['dataset_acc_loc'][dataset_name]
+            acc_cls = losses['dataset_acc_cls'][dataset_name]
+            acc_both = losses['dataset_acc'][dataset_name]
+            f.write(
+                f"{dataset_name:<30} {stats['count']:<10} "
+                f"{stats['correct_loc']:<10} {acc_loc:<10.4f} "
+                f"{stats['correct_cls']:<10} {acc_cls:<10.4f} "
+                f"{stats['correct_both']:<11} {acc_both:<10.4f}\n"
+            )
     
     # Visualize
     vis_dir = out_dir / "vis"

@@ -2,19 +2,19 @@
 
 # Configuration
 MODEL_CFG="yolov8l.yaml"
-YOLOE_MODEL_WEIGHT="yoloe-v8l-seg.pt"
-FREEZE_BASE="[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]"
-FREEZE_INC="[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]"
-OUTPUT_DIR="runs/yolov8l_4-domain_pretrained-yoloe_vspreg+pseudo_label+proto_rp"
+OUTPUT_DIR="runs/yolov8l_4-domain_fromscratch_vspreg+proto_rp"
 EPOCHS=100
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
 DEVICE=0
+PATIENCE=15
+NUM_PROTOS=10
+PROTO_RP_LOSS_WEIGHT=10000
 
 # PRoRP configuration
 # Set to True to use base_model distillation, False to use prototype's built-in supervision
-PROTO_RP_USE_BASE_MODEL=${PROTO_RP_USE_BASE_MODEL:-False}
+PROTO_RP_USE_BASE_MODEL=${PROTO_RP_USE_BASE_MODEL:-True}
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -83,17 +83,9 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
     TASK_DIR="$OUTPUT_DIR/task-$task_num"
     
     if [ $task_num -eq 1 ]; then
-        # First task: fuse YOLOE to YOLO and train
-        echo "Fusing YOLOE model to YOLO for task $task_num..."
-        FUSED_MODEL="$TASK_DIR/yoloe-v8l-fused.pt"
-        python tools/fuse_zero-shot_yoloe.py \
-            --input "$YOLOE_MODEL_WEIGHT" \
-            --output "$FUSED_MODEL" \
-            --model_cfg "$MODEL_CFG" \
-            --data $DATASET_PATH
-        
-        echo "Training task $task_num..."
-        python tools/train.py --model "$FUSED_MODEL" \
+        # First task: train from scratch
+        echo "Training task $task_num from scratch..."
+        python tools/train.py --model $MODEL_CFG \
             --data $DATASET_PATH \
             --save_path $TASK_DIR/best.pt \
             --epochs $EPOCHS \
@@ -102,7 +94,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --workers $WORKERS \
             --device $DEVICE \
             --project $TASK_DIR \
-            --freeze $FREEZE_BASE
+            --patience $PATIENCE
         
         # Perform PCA on model's input
         echo "Performing PCA analysis on task $task_num..."
@@ -121,7 +113,8 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --data $DATASET_PATH \
             --output $PROTOTYPES_PATH \
             --vis_dir $PROTOTYPES_VIS_DIR \
-            --device $DEVICE
+            --device $DEVICE \
+            --num_protos $NUM_PROTOS
         
         PREV_MODEL="$TASK_DIR/best.pt"
         PREV_PCA_CACHE="$PCA_CACHE_PATH"
@@ -138,11 +131,9 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --model_cfg $MODEL_CFG \
             --dataset $DATASET_PATH \
             --save_path $EXPANDED_MODEL \
-            --class_embedding_init \
             --yoloe_model $YOLOE_MODEL_WEIGHT
 
         # Convert prototype classes if prototypes exist from previous task
-        CONVERTED_PROTOTYPES=""
         echo "Converting prototype classes for task $task_num..."
         CONVERTED_PROTOTYPES="$TASK_DIR/task-$((task_num-1))-prototypes-converted.pt"
         python tools/convert_prototype_classes.py \
@@ -151,33 +142,16 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --expanded_model $EXPANDED_MODEL \
             --output $CONVERTED_PROTOTYPES
 
-        # Generate pseudo labels for task $task_num
-        echo "Generating pseudo labels for task $task_num..."
-        PSEUDO_LABELS_DIR="$TASK_DIR/${DATASET_NAME}_train_pseudo_labels"
-        python tools/generate_pseudo_label.py \
-            --model $PREV_MODEL \
-            --dataset $DATASET_PATH \
-            --output_dir $PSEUDO_LABELS_DIR \
-            --conf_threshold 0.25 \
-            --splits train
-
-        # Merge datasets
-        echo "Merging dataset for task $task_num..."
-        MERGED_DATASET_DIR="$TASK_DIR/${DATASET_NAME}_merged"
-        python tools/merge_datasets.py \
-            --datasets "$PSEUDO_LABELS_DIR/dataset.yaml" "$DATASET_PATH" \
-            --output_dir $MERGED_DATASET_DIR
-
         # Convert dataset class IDs
         echo "Converting dataset class IDs for task $task_num..."
         CONVERTED_DATASET="$TASK_DIR/${DATASET_NAME}_converted"
         python tools/convert_dataset_class_ids.py \
             --model $EXPANDED_MODEL \
-            --dataset $MERGED_DATASET_DIR/dataset.yaml \
+            --dataset $DATASET_PATH \
             --output_dir $CONVERTED_DATASET
         
         echo "Training task $task_num..."
-        # Build training command with optional PCA cache and prototypes
+        # Build training command with optional prototypes
         TRAIN_CMD="python tools/train.py \
             --model $EXPANDED_MODEL \
             --data \"$CONVERTED_DATASET/dataset.yaml\" \
@@ -189,6 +163,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --device $DEVICE \
             --project $TASK_DIR \
             --trainer antiforget \
+            --patience $PATIENCE \
             --freeze $FREEZE_INC"
         
         # Add PCA cache
@@ -200,6 +175,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
         TRAIN_CMD="$TRAIN_CMD --proto_rp True"
         TRAIN_CMD="$TRAIN_CMD --prototypes $CONVERTED_PROTOTYPES"
         TRAIN_CMD="$TRAIN_CMD --proto_rp_use_base_model $PROTO_RP_USE_BASE_MODEL"
+        TRAIN_CMD="$TRAIN_CMD --proto_rp_loss_weight $PROTO_RP_LOSS_WEIGHT"
         
         # Execute training command
         eval $TRAIN_CMD
@@ -223,7 +199,8 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --output $PROTOTYPES_PATH \
             --vis_dir $PROTOTYPES_VIS_DIR \
             --load_hist $CONVERTED_PROTOTYPES \
-            --device $DEVICE
+            --device $DEVICE \
+            --num_protos $NUM_PROTOS
         
         PREV_MODEL="$TASK_DIR/best.pt"
         PREV_PCA_CACHE="$PCA_CACHE_PATH"

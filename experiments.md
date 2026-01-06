@@ -493,3 +493,11 @@ $$
 model-1的False Positive分析：
 |在task-2验证集上将new class识别为old class|在task-2验证集上将background识别为old class|在task-1验证集上将background识别为old class|
 |---|---|---|
+
+
+# 2025/12/18
+
+重新总结目前存在的问题。
+
+在我们的增量学习场景下，有可能导致综合检测结果不高的情形包括：
+

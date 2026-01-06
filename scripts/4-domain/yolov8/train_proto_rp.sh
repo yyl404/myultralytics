@@ -2,11 +2,8 @@
 
 # Configuration
 MODEL_CFG="yolov8l.yaml"
-YOLOE_MODEL_WEIGHT="yoloe-v8l-seg.pt"
-FREEZE_BASE="[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]"
-FREEZE_INC="[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]"
-OUTPUT_DIR="runs/yolov8l_4-domain_pretrained-yoloe_proto_rp"
-EPOCHS=300
+OUTPUT_DIR="runs/yolov8l_4-domain_from_scratch_proto_rp"
+EPOCHS=100
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
@@ -17,7 +14,7 @@ PROTO_RP_LOSS_WEIGHT=10000
 
 # PRoRP configuration
 # Set to True to use base_model distillation, False to use prototype's built-in supervision
-PROTO_RP_USE_BASE_MODEL=${PROTO_RP_USE_BASE_MODEL:-False}
+PROTO_RP_USE_BASE_MODEL=${PROTO_RP_USE_BASE_MODEL:-True}
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -77,17 +74,9 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
     TASK_DIR="$OUTPUT_DIR/task-$task_num"
     
     if [ $task_num -eq 1 ]; then
-        # First task: fuse YOLOE to YOLO and train
-        echo "Fusing YOLOE model to YOLO for task $task_num..."
-        FUSED_MODEL="$TASK_DIR/yoloe-v8l-fused.pt"
-        python tools/fuse_zero-shot_yoloe.py \
-            --input "$YOLOE_MODEL_WEIGHT" \
-            --output "$FUSED_MODEL" \
-            --model_cfg "$MODEL_CFG" \
-            --data $DATASET_PATH
-        
-        echo "Training task $task_num..."
-        python tools/train.py --model "$FUSED_MODEL" \
+        # First task: train from scratch
+        echo "Training task $task_num from scratch..."
+        python tools/train.py --model $MODEL_CFG \
             --data $DATASET_PATH \
             --save_path $TASK_DIR/best.pt \
             --epochs $EPOCHS \
@@ -96,7 +85,6 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --workers $WORKERS \
             --device $DEVICE \
             --project $TASK_DIR \
-            --freeze $FREEZE_BASE \
             --patience $PATIENCE
         
         # Generate prototypes
@@ -111,6 +99,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --device $DEVICE \
             --num_protos $NUM_PROTOS
         
+        PREV_MODEL="$TASK_DIR/best.pt"
         PREV_MODEL="$TASK_DIR/best.pt"
         PREV_PROTOTYPES="$PROTOTYPES_PATH"
     else

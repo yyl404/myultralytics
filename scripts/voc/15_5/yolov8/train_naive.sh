@@ -2,13 +2,12 @@
 
 # Configuration
 MODEL_CFG="yolov8l.yaml"
-OUTPUT_DIR="runs/yolov8l_4-domain_fromscratch_naive"
+OUTPUT_DIR="runs/yolov8l_voc_inc_10_10_fromscratch_naive"
 EPOCHS=100
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
 DEVICE=0
-PATIENCE=10
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -17,10 +16,8 @@ START_TASK=${START_TASK:-1}
 # Specify dataset path for each task
 # Add or remove entries as needed
 TASK_DATASETS=(
-    "data/4-domain/voc/dataset.yaml"
-    "data/4-domain/clipart/dataset.yaml"
-    "data/4-domain/watercolor/dataset.yaml"
-    "data/4-domain/comic/dataset.yaml"
+    "data/VOC_inc_10_10/task_1_cls_10/dataset.yaml"
+    "data/VOC_inc_10_10/task_2_cls_10/dataset.yaml"
 )
 
 # Validate START_TASK
@@ -74,8 +71,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --imgsz $IMGSZ \
             --workers $WORKERS \
             --device $DEVICE \
-            --project $TASK_DIR \
-            --patience $PATIENCE
+            --project $TASK_DIR
         
         PREV_MODEL="$TASK_DIR/best.pt"
     else
@@ -106,8 +102,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --imgsz $IMGSZ \
             --workers $WORKERS \
             --device $DEVICE \
-            --project $TASK_DIR \
-            --patience $PATIENCE
+            --project $TASK_DIR
         
         PREV_MODEL="$TASK_DIR/best.pt"
     fi

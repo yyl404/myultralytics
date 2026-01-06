@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-OUTPUT_DIR="${1:-runs/yolov8l_4-domain_pretrained-yoloe_proto_rp}"  # Default value if not specified
+OUTPUT_DIR="${1:-runs/yolov8l_4-domain_fromscratch_proto_rp}"  # Default value if not specified
 DEVICE=0
 IOU_THRESHOLD=0.5
 NUM_PROTOS=10

@@ -147,4 +147,6 @@ proto_rp: False
 prototypes: None
 proto_rp_use_base_model: True
 proto_rp_loss_weight: 1.0 # (float) the contribution weight of prototype replay loss in total loss
+proto_use_neg: True
+
 tracker: botsort.yaml # (str) tracker config file: botsort.yaml or bytetrack.yaml
