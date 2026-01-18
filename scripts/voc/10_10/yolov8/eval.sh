@@ -11,8 +11,13 @@ DEVICE=0
 
 # Specify dataset path for each task - should match training script
 TASK_DATASETS=(
-    "data/VOC_inc_10_10/task_1_cls_10/dataset.yaml"
-    "data/VOC_inc_10_10/task_2_cls_10/dataset.yaml"
+    "data/VOC_10_10/task_1_cls_10/dataset.yaml"
+    "data/VOC_10_10/task_2_cls_10/dataset.yaml"
+)
+
+CUMULATIVE_DATASETS=(
+    "data/VOC_10_10/task_1_cls_10/dataset.yaml"
+    "data/VOC_10_10/task_1-2_cls_20/dataset.yaml"
 )
 
 NUM_TASKS=${#TASK_DATASETS[@]}
@@ -87,14 +92,7 @@ for model_task in $(seq 1 $NUM_TASKS); do
     done
     
     # Evaluate on cumulative dataset
-    if [ $model_task -eq 1 ]; then
-        # For task 1, cumulative dataset is the same as task 1 dataset
-        CUMULATIVE_DATASET_PATH="${TASK_DATASETS[0]}"
-    else
-        # For task 2+, use the pre-merged cumulative dataset
-        # Format: task_1-{N}_cls_{N*10}
-        CUMULATIVE_DATASET_PATH="data/VOC_inc_10_10/task_1-${model_task}_cls_$((model_task * 10))/dataset.yaml"
-    fi
+    CUMULATIVE_DATASET_PATH="${CUMULATIVE_DATASETS[$((model_task - 1))]}"
     
     if [ ! -f "$CUMULATIVE_DATASET_PATH" ]; then
         echo "Warning: Cumulative dataset not found: $CUMULATIVE_DATASET_PATH"

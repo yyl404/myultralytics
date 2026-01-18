@@ -6,6 +6,7 @@ Usage:
         --dataset <path/to/dataset.yaml> \
         --output_dir <path/to/output_dir> \
         --conf_threshold <confidence_threshold> \
+        --filter_iou_threshold <iou_threshold> (optional) \
         --splits <split1> <split2> ... (optional)
 
 Arguments:
@@ -13,6 +14,9 @@ Arguments:
     --dataset: Path to the dataset YAML file
     --output_dir: Path to the output directory
     --conf_threshold: Confidence threshold for generating pseudo labels
+    --filter_iou_threshold: IoU threshold for filtering duplicate annotations when merging
+        ground truth labels and pseudo labels. When a pseudo label has IoU > threshold
+        with any ground truth label, the pseudo label is discarded (default: 0.5)
     --splits: Dataset splits to generate pseudo labels for (default: "train val test")
 
 Examples:
@@ -38,8 +42,22 @@ from utils import convert_class_ids_from_dir, merge_labels_from_dir
 
 
 def create_pseudo_labels_dataset(model, base_class_id_map, new_class_id_map, cfg_source,
-                                 output_dir, all_classes, splits, conf_threshold=0.25):
-    """生成带有伪标签的数据集
+                                 output_dir, all_classes, splits, conf_threshold=0.25,
+                                 filter_iou_threshold=0.5):
+    """Create a pseudo labels dataset by merging ground truth labels and pseudo labels.
+    
+    Args:
+        model: YOLO model for generating pseudo labels
+        base_class_id_map: Class ID mapping for base classes
+        new_class_id_map: Class ID mapping for new classes
+        cfg_source: Path to source dataset config file
+        output_dir: Output directory path
+        all_classes: List of all class names
+        splits: Dataset splits to process
+        conf_threshold: Confidence threshold for pseudo label generation
+        filter_iou_threshold: IoU threshold for filtering duplicate annotations.
+            When merging ground truth and pseudo labels, if a pseudo label has IoU > threshold
+            with any ground truth label, the pseudo label is discarded (default: 0.5)
     """
     dir_source = OSP.dirname(cfg_source) # source dataset directory
     cfg_source = YAML.load(cfg_source) # source dataset config file
@@ -76,7 +94,8 @@ def create_pseudo_labels_dataset(model, base_class_id_map, new_class_id_map, cfg
             # 4. Merge the ground truth labels and the pseudo labels
             os.makedirs(OSP.join(output_dir, f"labels/{split}"), exist_ok=True)
             merge_labels_from_dir([gt_labels_dir, pseudo_labels_dir],
-                                  output_dir=OSP.join(output_dir, f"labels/{split}"))
+                                  output_dir=OSP.join(output_dir, f"labels/{split}"),
+                                  filter_iou_threshold=filter_iou_threshold)
 
             # 5. Copy the images to the output directory
             images_output_dir = OSP.join(output_dir, f"images/{split}")
@@ -110,6 +129,10 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=True, help="Path to the output directory")
     parser.add_argument("--conf_threshold", type=float, required=False, default=0.25,
         help="Confidence threshold for generating pseudo labels (default: 0.25)")
+    parser.add_argument("--filter_iou_threshold", type=float, required=False, default=0.5,
+        help="IoU threshold for filtering duplicate annotations when merging ground truth "
+             "labels and pseudo labels. When a pseudo label has IoU > threshold with any "
+             "ground truth label, the pseudo label is discarded (default: 0.5)")
     parser.add_argument("--splits", type=str, required=False, default=["train", "val", "test"], nargs="+",
         help="Dataset splits to generate pseudo labels for (default: ['train', 'val', 'test'])")
     args = parser.parse_args()
@@ -135,4 +158,5 @@ if __name__ == "__main__":
     
     create_pseudo_labels_dataset(model, base_class_id_map, new_class_id_map,
                                  args.dataset,
-                                 args.output_dir, all_classes, args.splits, args.conf_threshold)
+                                 args.output_dir, all_classes, args.splits, args.conf_threshold,
+                                 args.filter_iou_threshold)

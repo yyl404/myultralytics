@@ -55,19 +55,78 @@ def parse_list_string(list_str):
 
 
 # ====== Dataset Utils ======
+def calculate_iou_xywh(box1, box2):
+    """Calculate IoU between two xywh format boxes.
+    
+    Args:
+        box1 (list): [x_center, y_center, width, height]
+        box2 (list): [x_center, y_center, width, height]
+    
+    Returns:
+        float: IoU value between 0 and 1
+    """
+    x1_center, y1_center, w1, h1 = box1
+    x2_center, y2_center, w2, h2 = box2
+    
+    # Convert to corner coordinates
+    x1_min = x1_center - w1 / 2
+    x1_max = x1_center + w1 / 2
+    y1_min = y1_center - h1 / 2
+    y1_max = y1_center + h1 / 2
+    
+    x2_min = x2_center - w2 / 2
+    x2_max = x2_center + w2 / 2
+    y2_min = y2_center - h2 / 2
+    y2_max = y2_center + h2 / 2
+    
+    # Calculate intersection
+    inter_x_min = max(x1_min, x2_min)
+    inter_x_max = min(x1_max, x2_max)
+    inter_y_min = max(y1_min, y2_min)
+    inter_y_max = min(y1_max, y2_max)
+    
+    if inter_x_max <= inter_x_min or inter_y_max <= inter_y_min:
+        return 0.0
+    
+    inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+    
+    # Calculate union
+    box1_area = w1 * h1
+    box2_area = w2 * h2
+    union_area = box1_area + box2_area - inter_area
+    
+    return inter_area / (union_area+1e-6)
+
+
+def parse_label_line(line):
+    """Parse a YOLO format label line.
+    
+    Args:
+        line (str): Label line in YOLO format: "class_id x_center y_center width height"
+    
+    Returns:
+        tuple: (class_id, x_center, y_center, width, height) or None if invalid
+    """
+    parts = line.strip().split()
+    class_id = int(parts[0])
+    x_center = float(parts[1])
+    y_center = float(parts[2])
+    width = float(parts[3])
+    height = float(parts[4])
+    return (class_id, x_center, y_center, width, height)
+
+
 def convert_class_ids(label_lines, class_id_map):
     """Convert the class IDs in the label lines by the class_id_map"""
     converted_lines = []
     for line in label_lines:
-        parts = line.strip().split()
-        if len(parts) >= 5:
-            old_cat_id = int(parts[0])
-            if old_cat_id in class_id_map:
-                new_cat_id = class_id_map[old_cat_id]
-                parts[0] = str(new_cat_id)
-                converted_lines.append(' '.join(parts) + '\n')
-            # else:
-                # LOGGER.warning(f"Class ID {old_cat_id} not found in class_id_map")
+        parsed = parse_label_line(line.strip())
+        if parsed is None:
+            continue
+        old_cat_id, x, y, w, h = parsed
+        if old_cat_id in class_id_map:
+            new_cat_id = class_id_map[old_cat_id]
+            converted_lines.append(f'{new_cat_id} {x} {y} {w} {h}\n')
     return converted_lines
 
 
@@ -85,21 +144,29 @@ def convert_class_ids_from_dir(labels_dir, class_id_map, output_dir):
                 f.writelines(converted_lines)
 
 
-def merge_labels_from_dir(label_dirs, output_dir, class_id_maps=None):
+def merge_labels_from_dir(label_dirs, output_dir, class_id_maps=None, filter_iou_threshold=None):
     """Merge labels from multiple directories.
     
     This function reads label files from multiple directories and merges them.
     For each label file (same filename across directories), all label lines are
     combined into a single file in the output directory.
     
+    When filter_iou_threshold is in [0, 1], labels are processed in order of label_dirs.
+    For each new label, if it has IoU > threshold with any previously merged label,
+    the new label is adopted (considered as duplicate annotation of the same object).
+    
     Args:
         label_dirs (list): List of label directory paths to merge from.
         output_dir (str): Output directory path where merged labels will be saved.
         class_id_maps (list | None): List of class ID maps to apply to the labels.
+        filter_iou_threshold (float | None): IoU threshold for filtering duplicate annotations.
+            If in [0, 1], enables IoU-based filtering. Default: None.
 
     Example:
         >>> merge_labels_from_dir(['dir1/labels', 'dir2/labels'], 'output/labels')
         # Merges all .txt files from dir1/labels and dir2/labels into output/labels
+        >>> merge_labels_from_dir(['dir1/labels', 'dir2/labels'], 'output/labels', filter_iou_threshold=0.5)
+        # Merges with IoU filtering: new labels with IoU > 0.5 is discarded
     """
     os.makedirs(output_dir, exist_ok=True)
     
@@ -110,32 +177,59 @@ def merge_labels_from_dir(label_dirs, output_dir, class_id_maps=None):
             if label_file.endswith('.txt'):
                 all_label_files.add(label_file)
     
+    # Check if IoU filtering is enabled
+    use_iou_filter = filter_iou_threshold is not None and 0 <= filter_iou_threshold <= 1
+    
     # Merge labels for each file
     for label_file in all_label_files:
-        merged_lines = set()
+        merged_labels = []
         
-        # Read labels from each directory
-        if class_id_maps is None:
-            for label_dir in label_dirs:
-                label_path = OSP.join(label_dir, label_file)
-                if OSP.exists(label_path):
-                    with open(label_path, 'r') as f:
-                        lines = f.readlines()
-                        merged_lines.update(lines)
-        else:
-            for label_dir, class_id_map in zip(label_dirs, class_id_maps):
-                label_path = OSP.join(label_dir, label_file)
-                if OSP.exists(label_path):
-                    with open(label_path, 'r') as f:
-                        lines = f.readlines()
-                        converted_lines = convert_class_ids(lines, class_id_map)
-                        merged_lines.update(converted_lines)
+        # Process labels from each directory in order
+        label_iter = zip(label_dirs, class_id_maps) if class_id_maps else zip(label_dirs, [None] * len(label_dirs))
+        
+        for label_dir, class_id_map in label_iter:
+            label_path = OSP.join(label_dir, label_file)
+            if not OSP.exists(label_path):
+                continue
+            
+            # Read and convert labels
+            with open(label_path, 'r') as f:
+                lines = f.readlines()
+            
+            if class_id_map is not None:
+                lines = convert_class_ids(lines, class_id_map)
+            
+            # Process each label line
+            for line in lines:
+                line_stripped = line.strip()
+                if len(line_stripped) < 5:
+                    continue
+                
+                # Parse label for both IoU filtering and deduplication
+                class_id, x_center, y_center, width, height = parse_label_line(line_stripped)
+                box = [x_center, y_center, width, height]
+                
+                if use_iou_filter:
+                    # Filter label with existing labels
+                    keep_this_label = True
+                    for _, existing_box in merged_labels:
+                        iou = calculate_iou_xywh(box, existing_box)
+                        
+                        if iou > filter_iou_threshold:
+                            keep_this_label = False
+                            break
+                    
+                    if keep_this_label:
+                        merged_labels.append((class_id, box))
+                else:
+                    merged_labels.append((class_id, box))
         
         # Save merged labels
-        if merged_lines:
+        if len(merged_labels) > 0:
             output_path = OSP.join(output_dir, label_file)
             with open(output_path, 'w') as f:
-                f.writelines(merged_lines)
+                for class_id, (x, y, w, h) in merged_labels:
+                    f.write(f'{class_id} {x} {y} {w} {h}\n')
 
 
 # ====== Memory Monitor Utils ======

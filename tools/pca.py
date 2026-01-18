@@ -64,7 +64,7 @@ from utils import RealTimeMemoryMonitor
 
 
 class PCAHooker:
-    def __init__(self, model, layers, modules=None, device="cuda", check=False, unfold=True):
+    def __init__(self, model, layers=None, modules=None, device="cuda", check=False, unfold=True):
         self.model = model
         self.modules = {}
         self.pca_operators = {}

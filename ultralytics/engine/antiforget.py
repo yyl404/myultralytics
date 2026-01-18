@@ -28,12 +28,128 @@ from ultralytics.utils.torch_utils import (
     autocast,
     unset_deterministic,
 )
+
+from ultralytics.utils.nms import non_max_suppression
+from ultralytics.utils.ops import xyxy2xywhn, xywh2xyxy
+from ultralytics.utils.metrics import bbox_iou
 # from ultralytics.engine.distillation import (
 #     KDLoss,
 # )
-from ultralytics.engine.vspreg import (
-    VSPRegLoss,
+from ultralytics.engine.ewpr import (
+    EWPRLoss,
 )
+from ultralytics.engine.ewc import EWCLoss
+from ultralytics.nn.modules.head import Detect
+
+
+def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device):
+    """
+    Generate pseudo labels from base model and merge with GT labels, filtering by IoU.
+    
+    Args:
+        batch: Dict with keys 'img' (B, C, H, W), 'bboxes' (N, 4), 'cls' (N, 1), 'batch_idx' (N,)
+        base_model: Base model for pseudo label generation
+        filter_iou_threshold: IoU threshold for filtering pseudo labels
+        device: Device to run inference on
+    
+    Returns:
+        Modified batch dict with merged labels
+    """
+    base_model_pred = base_model(batch['img'].to(device))
+    if not isinstance(base_model.model[-1], Detect):
+        raise TypeError(f"Unsupported base_model[-1] type: {type(base_model.model[-1])}")
+    
+    detect = base_model.model[-1]
+    # base_model_pred[0]: (batch_size, 4 + nc, num_anchors)
+    base_model_pred = non_max_suppression(
+        prediction=base_model_pred[0],
+        conf_thres=0.25,
+        iou_thres=0.45,
+        max_det=detect.max_det,
+        nc=detect.nc
+    )
+    # base_model_pred: list of (num_boxes, 6) [x1, y1, x2, y2, confidence, class]
+    
+    img_h, img_w = batch['img'].shape[-2:]
+    base_model_pred_xywh = []
+    for pred in base_model_pred:
+        if len(pred) > 0:
+            boxes_xyxy = pred[:, :4]  # (num_boxes, 4)
+            boxes_xywhn = xyxy2xywhn(boxes_xyxy, w=img_w, h=img_h)  # (num_boxes, 4)
+            pred_xywh = torch.cat([boxes_xywhn, pred[:, 4:]], dim=1)  # (num_boxes, 6)
+            base_model_pred_xywh.append(pred_xywh)
+        else:
+            base_model_pred_xywh.append(pred)
+    base_model_pred = base_model_pred_xywh
+    # base_model_pred: list of (num_boxes, 6) [x_center, y_center, width, height, confidence, class]
+    
+    batch_size = batch['img'].shape[0]
+    gt_bboxes = batch['bboxes']  # (N, 4)
+    gt_cls = batch['cls']  # (N, 1)
+    gt_batch_idx = batch['batch_idx']  # (N,)
+    
+    merged_labels = []
+    for img_idx in range(batch_size):
+        gt_mask = (gt_batch_idx == img_idx)
+        if gt_mask.any():
+            gt_boxes_img = gt_bboxes[gt_mask]  # (num_gt, 4)
+            gt_cls_img = gt_cls[gt_mask]  # (num_gt, 1)
+        else:
+            gt_boxes_img = torch.empty((0, 4), device=gt_bboxes.device)
+            gt_cls_img = torch.empty((0, 1), device=gt_cls.device, dtype=torch.long)
+        
+        pseudo_labels_img = base_model_pred[img_idx]  # (num_pseudo, 6)
+        
+        if len(pseudo_labels_img) > 0 and len(gt_boxes_img) > 0:
+            pseudo_boxes_xywh = pseudo_labels_img[:, :4]  # (num_pseudo, 4)
+            pseudo_boxes_xyxy = xywh2xyxy(pseudo_boxes_xywh)  # (num_pseudo, 4)
+            gt_boxes_xyxy = xywh2xyxy(gt_boxes_img)  # (num_gt, 4)
+            
+            pseudo_expanded = pseudo_boxes_xyxy.unsqueeze(1)  # (num_pseudo, 1, 4)
+            gt_expanded = gt_boxes_xyxy.unsqueeze(0)  # (1, num_gt, 4)
+            iou_matrix = bbox_iou(pseudo_expanded, gt_expanded, xywh=False).squeeze(-1)  # (num_pseudo, num_gt)
+            
+            max_iou_per_pseudo = iou_matrix.max(dim=1)[0]  # (num_pseudo,)
+            keep_mask = max_iou_per_pseudo < filter_iou_threshold
+            filtered_pseudo = pseudo_labels_img[keep_mask]
+        else:
+            filtered_pseudo = pseudo_labels_img
+        
+        if len(gt_boxes_img) > 0:
+            gt_labels = torch.cat([
+                gt_boxes_img,  # (num_gt, 4)
+                torch.ones((len(gt_boxes_img), 1), device=gt_boxes_img.device),  # (num_gt, 1)
+                gt_cls_img  # (num_gt, 1)
+            ], dim=1)  # (num_gt, 6)
+        else:
+            gt_labels = torch.empty((0, 6), device=filtered_pseudo.device if len(filtered_pseudo) > 0 else batch['img'].device)
+        
+        if len(filtered_pseudo) > 0:
+            merged = torch.cat([gt_labels, filtered_pseudo], dim=0) if len(gt_labels) > 0 else filtered_pseudo
+        else:
+            merged = gt_labels
+        
+        merged_labels.append(merged)
+    
+    all_bboxes = []
+    all_cls = []
+    all_batch_idx = []
+    for img_idx, merged in enumerate(merged_labels):
+        if len(merged) > 0:
+            all_bboxes.append(merged[:, :4])  # (num_labels, 4)
+            all_cls.append(merged[:, 5].long().unsqueeze(-1))  # (num_labels, 1)
+            all_batch_idx.append(torch.full((len(merged),), img_idx, device=merged.device))
+    
+    if len(all_bboxes) > 0:
+        batch['bboxes'] = torch.cat(all_bboxes, dim=0)  # (N, 4)
+        batch['cls'] = torch.cat(all_cls, dim=0)  # (N, 1)
+        batch['batch_idx'] = torch.cat(all_batch_idx, dim=0)  # (N)
+    else:
+        batch['bboxes'] = torch.empty((0, 4), device=batch['img'].device)
+        batch['cls'] = torch.empty((0, 1), device=batch['img'].device, dtype=torch.long)
+        batch['batch_idx'] = torch.empty((0), device=batch['img'].device, dtype=torch.long)
+    
+    return batch
 
 
 class AntiForgetTrainer(BaseTrainer):
@@ -60,22 +176,28 @@ class AntiForgetTrainer(BaseTrainer):
             p.requires_grad_(False)
         # ============================== END: set up base model =================================================
 
-        # ============================== MODIFIED: set up VSPReg loss ============================================
-        if self.args.vspreg:
-            self.vspreg_loss_weight = self.args.vspreg_loss_weight
-            components, variances = {}, {}
+        # ============================== MODIFIED: set up EWC loss ============================================
+        if self.args.ewc:
+            self.ewc_loss_weight = self.args.ewc_loss_weight
+            self.ewc_importance = torch.load(self.args.importance_path)['running_importance']
+            self.ewc_loss = EWCLoss(self.model, self.base_model, importance=self.ewc_importance)
+        # ============================== END: set up EWC loss =================================================
+
+        # ============================== MODIFIED: set up EWPR loss ============================================
+        if self.args.ewpr:
+            self.ewpr_loss_weight = self.args.ewpr_loss_weight
+            components, eigen_values = {}, {}
             self.pca_cache = joblib.load(self.args.pca_cache_path)
             for name in self.pca_cache.keys():
                 _components = []
-                _variances = []
+                _eigen_values = []
                 for ig in range(len(self.pca_cache[name])):
                     _components.append(self.pca_cache[name][ig].components_)
-                    _variances.append(self.pca_cache[name][ig].explained_variance_)
-                components[name], variances[name] = torch.stack(_components), torch.stack(_variances)
-            self.vspreg_loss = VSPRegLoss(self.model, self.base_model, module_names=self.pca_cache.keys(),
-                                          components=components, variances=variances, keep_ratio=self.args.vspreg_keep_ratio,
-                                          center_ratio=self.args.vspreg_center_ratio, steepness=self.args.vspreg_steepness)
-        # ============================== END: set up VSPReg loss =================================================
+                    _eigen_values.append(self.pca_cache[name][ig].explained_variance_)
+                components[name], eigen_values[name] = torch.stack(_components), torch.stack(_eigen_values)
+            self.ewpr_loss = EWPRLoss(self.model, self.base_model, module_names=self.pca_cache.keys(),
+                                      components=components, eigen_values=eigen_values)
+        # ============================== END: set up EWPR loss =================================================
 
         # ============================== MODIFIED: set up KD loss ================================================
         # if self.args.kd:
@@ -257,8 +379,12 @@ class AntiForgetTrainer(BaseTrainer):
             self.tloss = None
 
             # ============================== MODIFIED: register hook ===========================================
-            if self.args.vspreg:
-                self.vspreg_loss.register_hook() # Register hook for VSPRegLoss
+            if self.args.ewpr:
+                self.ewpr_loss.register_hook()
+            if self.args.ewc:
+                self.ewc_loss.register_hook()
+            
+            if self.args.ewpr or self.args.ewc:
                 # Perform a forward in base model to hook out the base weights
                 with torch.no_grad():
                     _ = self.base_model(torch.randn(1, 3, 640, 640).to(self.device))
@@ -285,18 +411,31 @@ class AntiForgetTrainer(BaseTrainer):
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
+                    # ============================== MODIFIED: generate pseudo labels ===============================
+                    if self.args.pseudo_label:
+                        batch = merge_pseudo_labels_with_gt(
+                            batch, self.base_model, self.args.filter_iou_threshold, self.device
+                        )
+                    # ============================== END: generate pseudo labels ====================================
                     loss, self.loss_items = self.model(batch)
                     # ============================== MODIFIED: make a copy of loss items ===============================
                     loss_items = deepcopy(self.loss_items)
                     # ============================== END: make a copy of loss items ====================================
                     self.loss = loss.sum()
 
-                    # ============================== MODIFIED: calculate VSPReg loss ===================================
-                    if self.args.vspreg:
-                        _vspreg_loss = self.vspreg_loss.get_loss()
-                        self.loss += (_vspreg_loss*self.vspreg_loss_weight)
-                        loss_items = torch.cat([loss_items, torch.tensor([_vspreg_loss], device=loss_items.device)])
-                    # ============================== END: calculate VSPReg loss ========================================
+                    # ============================== MODIFIED: calculate EWPR loss ===================================
+                    if self.args.ewpr:
+                        _ewpr_loss = self.ewpr_loss.get_loss()
+                        self.loss += (_ewpr_loss*self.ewpr_loss_weight)
+                        loss_items = torch.cat([loss_items, torch.tensor([_ewpr_loss], device=loss_items.device)])
+                    # ============================== END: calculate EWPR loss ========================================
+
+                    # ============================== MODIFIED: calculate EWC loss ===================================
+                    if self.args.ewc:
+                        _ewc_loss = self.ewc_loss.get_loss()
+                        self.loss += (_ewc_loss*self.ewc_loss_weight)
+                        loss_items = torch.cat([loss_items, torch.tensor([_ewc_loss], device=loss_items.device)])
+                    # ============================== END: calculate EWC loss ========================================
 
                     # ============================== MODIFIED: calculate distillation loss =============================
                     # if self.args.kd:
@@ -369,8 +508,8 @@ class AntiForgetTrainer(BaseTrainer):
                 self.run_callbacks("on_train_batch_end")
 
             # ============================== MODIFIED: remove hook ===========================================
-            if self.args.vspreg:
-                self.vspreg_loss.remove_handle_() # Remove hook for VSPRegLoss
+            if self.args.ewpr:
+                self.ewpr_loss.remove_handle_() # Remove hook for EWPRLoss
             # if self.args.kd:
             #     self.kd_loss.remove_handle_() # Remove hook for KD loss
             # ============================== END: remove hook ================================================

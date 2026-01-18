@@ -5,19 +5,19 @@ MODEL_CFG="yolov8l.yaml"
 # OUTPUT_DIR can be specified via command line argument or environment variable
 # Usage: bash eval.sh [OUTPUT_DIR]
 # Example: bash eval.sh runs/yolov8l_voc_inc_10_10_fromscratch_naive
-OUTPUT_DIR="${1:-runs/yolov8l_voc_15_5_fromscratch_pseudo_label}"  # Default value if not specified
+OUTPUT_DIR="${1:-runs/yolov8l_voc_inc_10_10_fromscratch_pseudo_label}"  # Default value if not specified
 EVAL_OUTPUT_DIR="${OUTPUT_DIR}/evaluation_results"
 DEVICE=0
 
 # Specify dataset path for each task - should match training script
 TASK_DATASETS=(
-    "data/VOC_15_5/task_1_cls_15/dataset.yaml"
-    "data/VOC_15_5/task_2_cls_5/dataset.yaml"
+    "data/VOC_19_1/task_1_cls_19/dataset.yaml"
+    "data/VOC_19_1/task_2_cls_1/dataset.yaml"
 )
 
 CUMULATIVE_DATASETS=(
-    "data/VOC_15_5/task_1_cls_15/dataset.yaml"
-    "data/VOC_15_5/task_1-2_cls_20/dataset.yaml"
+    "data/VOC_19_1/task_1_cls_19/dataset.yaml"
+    "data/VOC_19_1/task_1-2_cls_20/dataset.yaml"
 )
 
 NUM_TASKS=${#TASK_DATASETS[@]}

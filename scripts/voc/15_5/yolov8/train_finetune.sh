@@ -2,17 +2,13 @@
 
 # Configuration
 MODEL_CFG="yolov8l.yaml"
-OUTPUT_DIR="runs/yolov8l_voc_15_5_fromscratch_pseudo_label"
+OUTPUT_DIR="runs/yolov8l_voc_15_5_fromscratch_finetune"
 EPOCHS=300
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
 DEVICE=0
 PATIENCE=10
-
-# Pseudo Label Configuration
-CONF_THRESHOLD=0.25
-FILTER_IOU_THRESHOLD=0.5
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -114,9 +110,6 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --device $DEVICE \
             --project $TASK_DIR \
             --trainer antiforget"
-
-        # Add pseudo labeling
-        TRAIN_CMD="$TRAIN_CMD --pseudo_label True --conf_threshold $CONF_THRESHOLD --filter_iou_threshold $FILTER_IOU_THRESHOLD"
         
         # Execute training command
         eval $TRAIN_CMD

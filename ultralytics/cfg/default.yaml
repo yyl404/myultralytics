@@ -134,13 +134,20 @@ kd: False # (bool) whether to use knowledge distillation
 distill_layers: None # (list[str], optional)
 distiller: "mgd" # (str) distiller type, choices=[mgd, cwdf, at, atm, skd, pkd]
 
-# projection settings ----------------------------------------------------------------------------------------------------
-vspreg: False # (bool) whether to use VSPReg
-vspreg_loss_weight: 1.0 # (float) the contribution weight of vspreg loss in total loss
+# Pseudo label setting ---------------------------------------------------------------------------------------------
+pseudo_label: False
+conf_threshold: 0.25
+filter_iou_threshold: 0.5
+
+# ewc settings
+ewc: False
+ewc_loss_weight: 1.0
+importance_path: None
+
+# ewpr settings ----------------------------------------------------------------------------------------------------
+ewpr: False # (bool) whether to use EWPR
+ewpr_loss_weight: 1.0 # (float) the contribution weight of ewpr loss in total loss
 pca_cache_path: None # (str, optional)
-vspreg_keep_ratio: 1.0 # (float) keep ratio for VSPReg
-vspreg_center_ratio: 0.9 # (float) center ratio for VSPReg
-vspreg_steepness: 100 # (int) steepness for VSPReg
 
 # prototype replay settings
 proto_rp: False

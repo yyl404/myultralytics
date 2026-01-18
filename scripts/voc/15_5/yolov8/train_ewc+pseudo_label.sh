@@ -2,12 +2,21 @@
 
 # Configuration
 MODEL_CFG="yolov8l.yaml"
-OUTPUT_DIR="runs/yolov8l_voc_inc_10_10_fromscratch_vspreg+pseudo_label"
-EPOCHS=100
+OUTPUT_DIR="runs/yolov8l_voc_15_5_fromscratch_ewc+pseudo_label"
+EPOCHS=300
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
 DEVICE=0
+PATIENCE=10
+
+# Pseudo Label Configuration
+CONF_THRESHOLD=0.25
+FILTER_IOU_THRESHOLD=0.5
+
+# EWC Configuration
+# Can be overridden via command line: EWC_LOSS_WEIGHT=1000.0 bash train_ewc+pseudo_label.sh
+EWC_LOSS_WEIGHT=${EWC_LOSS_WEIGHT:-100.0}
 
 # Start from which task (1-based index, set to 1 to start from beginning)
 # Useful for resuming training from a specific task
@@ -16,8 +25,8 @@ START_TASK=${START_TASK:-1}
 # Specify dataset path for each task
 # Add or remove entries as needed
 TASK_DATASETS=(
-    "data/VOC_inc_10_10/task_1_cls_10/dataset.yaml"
-    "data/VOC_inc_10_10/task_2_cls_10/dataset.yaml"
+    "data/VOC_15_5/task_1_cls_15/dataset.yaml"
+    "data/VOC_15_5/task_2_cls_5/dataset.yaml"
 )
 
 # Validate START_TASK
@@ -26,14 +35,14 @@ if [ $START_TASK -lt 1 ] || [ $START_TASK -gt ${#TASK_DATASETS[@]} ]; then
     exit 1
 fi
 
-# Initialize PREV_PCA_CACHE for first task
-PREV_PCA_CACHE=""
+# Initialize PREV_IMPORTANCE_PATH for first task
+PREV_IMPORTANCE_PATH=""
 
 # If starting from a task other than 1, set PREV_MODEL to the previous task's model
 if [ $START_TASK -gt 1 ]; then
     PREV_TASK=$((START_TASK - 1))
     PREV_MODEL="$OUTPUT_DIR/task-$PREV_TASK/best.pt"
-    PREV_PCA_CACHE="$OUTPUT_DIR/task-$PREV_TASK/pca_cache.pkl"
+    PREV_IMPORTANCE_PATH="$OUTPUT_DIR/task-$PREV_TASK/importance.pth"
     
     if [ ! -f "$PREV_MODEL" ]; then
         echo "Error: Previous task model not found: $PREV_MODEL"
@@ -41,16 +50,16 @@ if [ $START_TASK -gt 1 ]; then
         exit 1
     fi
     
-    if [ ! -f "$PREV_PCA_CACHE" ]; then
-        echo "Warning: Previous task PCA cache not found: $PREV_PCA_CACHE"
-        echo "Training will proceed without PCA cache."
+    if [ ! -f "$PREV_IMPORTANCE_PATH" ]; then
+        echo "Warning: Previous task importance file not found: $PREV_IMPORTANCE_PATH"
+        echo "Training will proceed without importance file."
     fi
     
     echo "=========================================="
     echo "Resuming from Task $START_TASK"
     echo "Using previous model: $PREV_MODEL"
-    if [ -f "$PREV_PCA_CACHE" ]; then
-        echo "Using previous PCA cache: $PREV_PCA_CACHE"
+    if [ -f "$PREV_IMPORTANCE_PATH" ]; then
+        echo "Using previous importance file: $PREV_IMPORTANCE_PATH"
     fi
     echo "=========================================="
     echo ""
@@ -79,22 +88,26 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --data $DATASET_PATH \
             --save_path $TASK_DIR/best.pt \
             --epochs $EPOCHS \
+            --patience $PATIENCE \
             --batch_size $BATCH_SIZE \
             --imgsz $IMGSZ \
             --workers $WORKERS \
             --device $DEVICE \
             --project $TASK_DIR
         
-        # Perform PCA on model's input using original dataset (all layers)
-        echo "Performing PCA analysis on all layers using original dataset..."
-        PCA_CACHE_PATH="$TASK_DIR/pca_cache.pkl"
-        python tools/pca.py \
+        # Calculate parameter importance using Fisher Information Matrix
+        echo "Calculating parameter importance using original dataset..."
+        IMPORTANCE_PATH="$TASK_DIR/importance.pth"
+        python tools/cal_importance.py \
             --model $TASK_DIR/best.pt \
             --dataset $DATASET_PATH \
-            --save_path $PCA_CACHE_PATH
+            --save_path $IMPORTANCE_PATH \
+            --batch_size $BATCH_SIZE \
+            --workers $WORKERS \
+            --device $DEVICE
         
         PREV_MODEL="$TASK_DIR/best.pt"
-        PREV_PCA_CACHE="$PCA_CACHE_PATH"
+        PREV_IMPORTANCE_PATH="$IMPORTANCE_PATH"
     else
         # Subsequent tasks: extract dataset name from path for output directory naming
         DATASET_NAME=$(basename $(dirname $DATASET_PATH))
@@ -108,66 +121,69 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --dataset $DATASET_PATH \
             --save_path $EXPANDED_MODEL
 
-        Generate pseudo labels for task $task_num
-        echo "Generating pseudo labels for task $task_num..."
-        PSEUDO_LABELS_DIR="$TASK_DIR/${DATASET_NAME}_train_pseudo_labels"
-        python tools/generate_pseudo_label.py \
-            --model $PREV_MODEL \
-            --dataset $DATASET_PATH \
-            --output_dir $PSEUDO_LABELS_DIR \
-            --conf_threshold 0.25 \
-            --splits train
+        # Expand importance file if available
+        EXPANDED_IMPORTANCE_PATH=""
+        if [ -n "$PREV_IMPORTANCE_PATH" ] && [ -f "$PREV_IMPORTANCE_PATH" ]; then
+            echo "Expanding importance file for task $task_num..."
+            EXPANDED_IMPORTANCE_PATH="$TASK_DIR/task-$((task_num-1))-importance-expanded.pth"
+            python tools/expand_importance.py \
+                --old_importance $PREV_IMPORTANCE_PATH \
+                --old_model $PREV_MODEL \
+                --new_model $EXPANDED_MODEL \
+                --save_path $EXPANDED_IMPORTANCE_PATH \
+                --copy_importance_init
+            PREV_IMPORTANCE_PATH="$EXPANDED_IMPORTANCE_PATH"
+        fi
 
-        # Merge datasets
-        echo "Merging dataset for task $task_num..."
-        MERGED_DATASET_DIR="$TASK_DIR/${DATASET_NAME}_merged"
-        python tools/merge_datasets.py \
-            --datasets "$PSEUDO_LABELS_DIR/dataset.yaml" "$DATASET_PATH" \
-            --output_dir $MERGED_DATASET_DIR
-
-        # # Convert dataset class IDs
+        # Convert dataset class IDs
         echo "Converting dataset class IDs for task $task_num..."
-        CONVERTED_DATASET="$TASK_DIR/${DATASET_NAME}_converted"
+        ID_CONVERTED_DATASET="$TASK_DIR/${DATASET_NAME}_id_converted"
         python tools/convert_dataset_class_ids.py \
             --model $EXPANDED_MODEL \
-            --dataset $MERGED_DATASET_DIR/dataset.yaml \
-            --output_dir $CONVERTED_DATASET
+            --dataset $DATASET_PATH \
+            --output_dir $ID_CONVERTED_DATASET
         
         echo "Training task $task_num..."
         # Build training command with optional PCA cache and prototypes
         TRAIN_CMD="python tools/train.py --model $EXPANDED_MODEL \
-            --data \"$CONVERTED_DATASET/dataset.yaml\" \
+            --data \"$ID_CONVERTED_DATASET/dataset.yaml\" \
             --save_path $TASK_DIR/best.pt \
             --epochs $EPOCHS \
+            --patience $PATIENCE \
             --batch_size $BATCH_SIZE \
             --imgsz $IMGSZ \
             --workers $WORKERS \
             --device $DEVICE \
             --project $TASK_DIR \
             --trainer antiforget"
+
+        # Add pseudo labeling
+        TRAIN_CMD="$TRAIN_CMD --pseudo_label True --conf_threshold $CONF_THRESHOLD --filter_iou_threshold $FILTER_IOU_THRESHOLD"
         
-        # Add PCA cache if available
-        if [ -n "$PREV_PCA_CACHE" ] && [ -f "$PREV_PCA_CACHE" ]; then
-            echo "Using PCA cache from previous task: $PREV_PCA_CACHE"
-            TRAIN_CMD="$TRAIN_CMD --vspreg True --pca_cache_path $PREV_PCA_CACHE"
+        # Add EWC loss if available
+        if [ -n "$PREV_IMPORTANCE_PATH" ] && [ -f "$PREV_IMPORTANCE_PATH" ]; then
+            echo "Using importance file from previous task: $PREV_IMPORTANCE_PATH"
+            TRAIN_CMD="$TRAIN_CMD --ewc True --importance_path $PREV_IMPORTANCE_PATH --ewc_loss_weight $EWC_LOSS_WEIGHT"
         else
-            echo "Warning: No PCA cache available from previous task, training without PCA cache."
+            echo "Warning: No importance file available from previous task, training without EWC loss."
         fi
         
         # Execute training command
         eval $TRAIN_CMD
 
-        # Perform PCA on model's input using original dataset (all layers)
-        echo "Performing PCA analysis on all layers using original dataset..."
-        PCA_CACHE_PATH="$TASK_DIR/pca_cache.pkl"
-        python tools/pca.py \
+        # Calculate parameter importance using Fisher Information Matrix
+        echo "Calculating parameter importance using original dataset..."
+        IMPORTANCE_PATH="$TASK_DIR/importance.pth"
+        python tools/cal_importance.py \
             --model $TASK_DIR/best.pt \
             --dataset $DATASET_PATH \
-            --load_hist $PREV_PCA_CACHE \
-            --save_path $PCA_CACHE_PATH
+            --save_path $IMPORTANCE_PATH \
+            --batch_size $BATCH_SIZE \
+            --workers $WORKERS \
+            --device $DEVICE
         
         PREV_MODEL="$TASK_DIR/best.pt"
-        PREV_PCA_CACHE="$PCA_CACHE_PATH"
+        PREV_IMPORTANCE_PATH="$IMPORTANCE_PATH"
     fi
     
     echo "Task $task_num completed!"

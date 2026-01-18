@@ -158,6 +158,7 @@ if __name__ == "__main__":
         new_classes = parse_list_string(args.new_classes)
 
     all_classes = list(set(base_classes).union(new_classes))
+    all_classes = sorted(all_classes, key=str)  # Sort lexicographically
     
     base_class_id_map = {}
     for i, cls in enumerate(base_classes):
