@@ -82,9 +82,9 @@ class EWCLoss:
             importance = importance.to(update_w.device, update_w.dtype)
             base_w = base_w.to(update_w.device, update_w.dtype)
             
-            # EWC loss: 0.5 * sum(importance * (theta - theta_star)^2)
+            # EWC loss: 100 * 0.5 * sum(importance * (theta - theta_star)^2)
             delta_w = update_w - base_w
-            loss += 0.5 * (importance * (delta_w ** 2)).sum()
+            loss += 50 * (importance * (delta_w ** 2)).sum()
         
         # Average loss over number of parameters
         num_params = len([p for p in self.importance.keys() 

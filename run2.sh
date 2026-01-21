@@ -1,0 +1,1 @@
+bash scripts/voc/15_5/yolov8/generate_importance.sh

@@ -143,13 +143,8 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
         # Add pseudo labeling
         TRAIN_CMD="$TRAIN_CMD --pseudo_label True --conf_threshold $CONF_THRESHOLD --filter_iou_threshold $FILTER_IOU_THRESHOLD"
         
-        # Add EWPR loss if available
-        if [ -n "$PREV_PCA_CACHE" ] && [ -f "$PREV_PCA_CACHE" ]; then
-            echo "Using PCA cache from previous task: $PREV_PCA_CACHE"
-            TRAIN_CMD="$TRAIN_CMD --ewpr True --pca_cache_path $PREV_PCA_CACHE --ewpr_loss_weight $EWPR_LOSS_WEIGHT"
-        else
-            echo "Warning: No PCA cache available from previous task, training without EWPR loss."
-        fi
+        # Add EWPR loss
+        TRAIN_CMD="$TRAIN_CMD --ewpr True --pca_cache_path $PREV_PCA_CACHE --ewpr_loss_weight $EWPR_LOSS_WEIGHT"
         
         # Execute training command
         eval $TRAIN_CMD

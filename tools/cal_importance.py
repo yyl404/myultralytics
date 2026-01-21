@@ -215,12 +215,20 @@ def calculate_importance(model, dataset, layers=None, modules=None,
         'val': False,
         'plots': False,
         'save': False,
+        'amp': False, # Use float32 to achieve high accuracy
         'model': model.ckpt_path if hasattr(model, 'ckpt_path') else str(model.overrides.get('model', '')),
     }
     
     def on_train_start_callback(trainer):
+        """Callback function executed at the start of training.
+        
+        This callback initializes the importance calculator and overrides the optimizer
+        step to collect gradient statistics for importance calculation without actually
+        updating model parameters.
+        """
         nonlocal calculator
         
+        # Initialize importance calculator for tracking parameter importance
         calculator = ImportanceCalculator(
             trainer.model,
             layers=layers,
@@ -228,42 +236,36 @@ def calculate_importance(model, dataset, layers=None, modules=None,
             device=device
         )
         
+        # Load previously calculated importance as starting point (if provided)
+        # This allows incremental importance calculation across multiple training runs
         if load_hist is not None:
             calculator.load_importance(load_hist)
             LOGGER.info(f"Loaded previous importance from {load_hist} as starting point")
         
-        for param in trainer.model.parameters():
-            param.requires_grad = True
+        # Note: Model parameters' requires_grad is managed by the trainer
+        # for param in trainer.model.parameters():
+        #     param.requires_grad = True
         
         LOGGER.info(f"Registered importance calculation for {len(calculator.modules)} modules")
-    
-    def on_train_start_callback_with_override(trainer):
-        nonlocal calculator
-        on_train_start_callback(trainer)
+
+        def new_optimizer_step():
+            """Override optimizer step to collect gradients for importance calculation without updating model."""
+            trainer.scaler.unscale_(trainer.optimizer)
+            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), max_norm=10.0)
+            calculator.process_gradients()
+            # Skip optimizer.step() - only collect statistics, don't update model
+            # trainer.scaler.step(trainer.optimizer)
+            # trainer.scaler.update()
+            trainer.optimizer.zero_grad()
+            # if trainer.ema:
+            #     trainer.ema.update(trainer.model)
         
-        if calculator is not None:
-            def new_optimizer_step():
-                # Skip if loss is NaN/Inf
-                if hasattr(trainer, 'loss') and trainer.loss is not None:
-                    if isinstance(trainer.loss, torch.Tensor):
-                        if torch.isnan(trainer.loss).any() or torch.isinf(trainer.loss).any():
-                            trainer.optimizer.zero_grad()
-                            return
-                    elif isinstance(trainer.loss, (list, tuple)):
-                        if any(torch.isnan(torch.tensor(l.item() if hasattr(l, 'item') else float(l))).any() or 
-                               torch.isinf(torch.tensor(l.item() if hasattr(l, 'item') else float(l))).any() 
-                               for l in trainer.loss):
-                            trainer.optimizer.zero_grad()
-                            return
-                
-                # Process gradients
-                calculator.process_gradients()
-                trainer.optimizer.zero_grad()
-            
-            trainer.optimizer_step = new_optimizer_step
-    
+        # Override the default optimizer step with our custom version
+        trainer.optimizer_step = new_optimizer_step
+        
+    # Register the callback to be executed when training starts
     callbacks = default_callbacks.copy()
-    callbacks['on_train_start'] = callbacks['on_train_start'] + [on_train_start_callback_with_override]
+    callbacks['on_train_start'] = callbacks['on_train_start'] + [on_train_start_callback]
     
     # Disable validation during and after training
     def disable_validation(trainer):
@@ -302,7 +304,7 @@ def main():
                        help="Path to the dataset YAML file")
     parser.add_argument("--save_path", type=str, required=True,
                        help="Path to save the importance dictionary")
-    parser.add_argument("--batch_size", type=int, default=16,
+    parser.add_argument("--batch_size", type=int, default=8,
                        help="Batch size for training (optional, will use model default if not specified)")
     parser.add_argument("--workers", type=int, default=8,
                        help="Number of data loading workers (default: 8)")

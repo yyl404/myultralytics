@@ -1,3 +1,6 @@
+接下来，展示的是我修改后的antiforget.py
+
+```antiforget.py
 import numpy as np
 import warnings
 from copy import deepcopy
@@ -921,3 +924,409 @@ class AntiForgetTrainer(BaseTrainer):
         self.optimizer.zero_grad()
         if self.ema:
             self.ema.update(self.model)
+```
+
+需要你关注的位置是第540-567行部分，输出模型权重更新值与Null Space夹角余弦值的部分。在我的训练过程中，这一输出值是接近于1的。
+
+但是，当我使用如下的代码可视化权重更新值在各个主成分方向的投影时，却发现更新值在特征值越大的方向上，投影反而越大
+```vis_kernel_proj_pc.py
+"""
+Visualize kernel projection on principal components.
+
+This script visualizes the projection of kernel updates onto principal components
+for each convolutional layer and group. It generates plots showing:
+- Variance distribution (histogram)
+- Elbow point annotation
+- Projection magnitude curve with error bands
+
+Usage:
+    python tools/vis_kernel_proj_pc.py \
+        --base_model <path/to/base_model.pt> \
+        --incremental_model <path/to/incremental_model.pt> \
+        --pca_cache <path/to/pca_cache.pkl> \
+        --save_dir <path/to/save_dir> \
+        [--device cuda] \
+        [--layers "0,1,2"]
+"""
+
+import argparse
+import warnings
+import joblib
+import os
+
+import torch
+from torch import nn
+import numpy as np
+import matplotlib.pyplot as plt
+
+from ultralytics import YOLO
+from ultralytics.engine.ewpr import find_elbow_point
+
+
+def main(args):
+    if args.device == "cuda" and not torch.cuda.is_available():
+        args.device = "cpu"
+        warnings.warn("CUDA is not available, using CPU instead.")
+    
+    base_model = YOLO(args.base_model)
+    incremental_model = YOLO(args.incremental_model)
+    base_model.to(args.device).eval()
+    incremental_model.to(args.device).eval()
+
+    if args.layers is None or args.layers == "":
+        args.layers = list(range(len(base_model.model.model)))
+    else:
+        args.layers = [int(x.strip()) for x in args.layers.split(",")]
+    
+    kernel_updates = {}
+    pca_cache = joblib.load(args.pca_cache)
+    print(f"Loaded PCA cache from {args.pca_cache}")
+    
+    for name, module in base_model.model.named_modules():
+        for layer in args.layers:
+            if f"model.{layer}" in name and isinstance(module, nn.Conv2d) and "dfl" not in name:
+                base_k, base_g, base_c_in, base_c_out = module.kernel_size, module.groups, module.in_channels, module.out_channels
+                base_kernel = module.weight.data.reshape(base_g, base_c_out//base_g, base_c_in//base_g * base_k[0] * base_k[1])
+                
+                if module.bias is not None:
+                    base_kernel = torch.concat((base_kernel, module.bias.data.reshape(base_g, base_c_out//base_g, 1)), dim=2)
+                
+                incremental_module = incremental_model.model.get_submodule(name)
+                inc_k, inc_g, inc_c_in, inc_c_out = incremental_module.kernel_size, incremental_module.groups, incremental_module.in_channels, incremental_module.out_channels
+                
+                if base_c_in == inc_c_in and base_g == inc_g and base_k == inc_k:
+                    incremental_kernel = incremental_module.weight.data.reshape(inc_g, inc_c_out//inc_g, inc_c_in//inc_g * inc_k[0] * inc_k[1])
+                    
+                    if incremental_module.bias is not None:
+                        incremental_kernel = torch.concat((incremental_kernel, incremental_module.bias.data.reshape(inc_g, inc_c_out//inc_g, 1)), dim=2)
+                    
+                    min_c_out = min(base_c_out, inc_c_out)
+                    base_kernel_trimmed = base_kernel[:, :min_c_out//base_g, :]
+                    incremental_kernel_trimmed = incremental_kernel[:, :min_c_out//inc_g, :]
+                    kernel_updates[name] = incremental_kernel_trimmed - base_kernel_trimmed
+                else:
+                    warnings.warn(f"Skipping {name}: channel/groups/kernel_size mismatch "
+                                f"(base: c_in={base_c_in}, c_out={base_c_out}, g={base_g}, k={base_k}; "
+                                f"inc: c_in={inc_c_in}, c_out={inc_c_out}, g={inc_g}, k={inc_k})")
+
+                break
+    
+    print(f"Found {len(kernel_updates)} matching layers for visualization")
+
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    # Count total visualizations to create
+    total_visualizations = 0
+    for name in kernel_updates.keys():
+        if name in pca_cache:
+            total_visualizations += kernel_updates[name].shape[0]
+    
+    print(f"Generating {total_visualizations} visualizations...")
+    
+    visualization_count = 0
+    skipped_count = 0
+    
+    for name in kernel_updates.keys():
+        if name in pca_cache:
+            for ig in range(kernel_updates[name].shape[0]):
+                visualization_count += 1
+                if total_visualizations > 0:
+                    progress = (visualization_count / total_visualizations) * 100
+                    print(f"[{visualization_count}/{total_visualizations} ({progress:.1f}%)] Processing {name}, group {ig}...", end='\r')
+                components = pca_cache[name][ig].components_
+                variances = pca_cache[name][ig].explained_variance_
+                
+                if not isinstance(components, torch.Tensor):
+                    components = torch.from_numpy(components).float()
+                if not isinstance(variances, torch.Tensor):
+                    variances = torch.from_numpy(variances).float()
+                
+                kernel_update_ig = kernel_updates[name][ig]
+                proj_norm = kernel_update_ig @ components.T
+                proj_magnitudes = torch.abs(proj_norm)
+                proj_mean = torch.mean(proj_magnitudes, dim=0)
+                proj_std = torch.std(proj_magnitudes, dim=0)
+                
+                elbow_idx = find_elbow_point(variances)
+                elbow_percentage = (elbow_idx + 1) / len(variances) * 100
+                
+                fig, ax = plt.subplots(figsize=(12, 8))
+                variances_np = variances.cpu().numpy() if isinstance(variances, torch.Tensor) else variances
+                x_indices = np.arange(len(variances_np))
+                ax.bar(x_indices, variances_np, alpha=0.6, color='blue', label='Variances')
+                ax.axvline(x=elbow_idx, color='red', linestyle='--', linewidth=2, 
+                          label=f'Elbow point (index {elbow_idx}, {elbow_percentage:.2f}%)')
+                ax.text(elbow_idx, ax.get_ylim()[1] * 0.95, f'{elbow_percentage:.2f}%', 
+                       rotation=90, verticalalignment='top',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                
+                ax2 = ax.twinx()
+                ax2.plot(x_indices, proj_mean.cpu().numpy(), 'g-', linewidth=2, label='Projection mean')
+                ax2.fill_between(x_indices, 
+                                (proj_mean - proj_std).cpu().numpy(),
+                                (proj_mean + proj_std).cpu().numpy(),
+                                alpha=0.3, color='green', label='±1 std')
+                
+                ax.set_xlabel('Principal Component Index', fontsize=12)
+                ax.set_ylabel('Variance', fontsize=12, color='blue')
+                ax2.set_ylabel('Projection Magnitude', fontsize=12, color='green')
+                ax.tick_params(axis='y', labelcolor='blue')
+                ax2.tick_params(axis='y', labelcolor='green')
+                
+                safe_name = name.replace('.', '_').replace('/', '_')
+                ax.set_title(f'Layer: {name}, Group: {ig}\nVariance Distribution with Projection Magnitude', 
+                           fontsize=14, fontweight='bold')
+                
+                lines1, labels1 = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+                plt.tight_layout()
+                
+                save_path = os.path.join(args.save_dir, f'{safe_name}_group_{ig}.png')
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                plt.close()
+        else:
+            skipped_count += 1
+            warnings.warn(f"Layer {name} not found in PCA cache, skipping")
+    
+    print()  # New line after progress output
+    print(f"Total visualizations created: {visualization_count}")
+    if skipped_count > 0:
+        print(f"Warning: {skipped_count} layer(s) skipped (not found in PCA cache)")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Visualize kernel projection on principal components")
+    parser.add_argument("--base_model", type=str, required=True,
+                       help="Path to the base model checkpoint (.pt file)")
+    parser.add_argument("--incremental_model", type=str, required=True,
+                       help="Path to the incremental model checkpoint (.pt file)")
+    parser.add_argument("--pca_cache", type=str, required=True,
+                       help="Path to the PCA cache file (.pkl file)")
+    parser.add_argument("--save_dir", type=str, required=True,
+                       help="Directory to save visualization plots")
+    parser.add_argument("--device", type=str, default="cuda",
+                       help="Device to use for model inference (default: cuda)")
+    parser.add_argument("--layers", type=str, default=None,
+                       help="Comma-separated layer indices to visualize (e.g., '0,1,2'). If not specified, all layers will be visualized")
+    args = parser.parse_args()
+    
+    main(args)
+```
+
+以下是我运行该代码的脚本
+```vis_prj.sh
+#!/bin/bash
+
+# Configuration
+BASE_MODEL="runs/yolov8l_voc_15_5_fromscratch_nsgp+pseudo_label/task-2/task-1-best-expanded.pt"
+INCREMENTAL_MODEL="runs/yolov8l_voc_15_5_fromscratch_nsgp+pseudo_label/task-2/train2/weights/last.pt"
+PCA_CACHE="runs/yolov8l_voc_15_5_fromscratch_nsgp+pseudo_label/task-1/pca_cache.pkl"
+SAVE_DIR="runs/yolov8l_voc_15_5_fromscratch_nsgp+pseudo_label/task-2/proj_visualizations"
+DEVICE="cuda"
+LAYERS=""
+
+# Execute
+python tools/vis_kernel_proj_pc.py \
+    --base_model "$BASE_MODEL" \
+    --incremental_model "$INCREMENTAL_MODEL" \
+    --pca_cache "$PCA_CACHE" \
+    --save_dir "$SAVE_DIR" \
+    --device "$DEVICE" \
+    ${LAYERS:+--layers "$LAYERS"}
+
+```
+
+以下是nsgp的实现：
+```nsgp.py
+from typing import Dict, List
+
+import torch
+from torch import Tensor
+
+from ultralytics.engine.ewpr import find_elbow_point
+from ultralytics.utils import LOGGER, colorstr
+
+
+class NSGP:
+    """Null Space Gradient Projection (NSGP)
+    
+    Projects gradients onto the principal component directions before the elbow point,
+    then subtracts the projected component from the original gradient with a flexibility weight.
+    This effectively removes gradient components in important principal directions,
+    constraining updates to the less important (null space) directions.
+    """
+    
+    def __init__(self, module_names: List[str], components: Dict[str, Tensor], eigen_values: Dict[str, Tensor]):
+        """
+        Args:
+            module_names: List of module names to apply NSGP
+            components: Dictionary of PCA components for each module, shape [g, c_in//g*k*k, c_in//g*k*k]
+            eigen_values: Dictionary of eigen values for each module, shape [g, c_in//g*k*k]
+            flexibility: Weight for the projected component when subtracting from original gradient
+        """
+        self.module_names = module_names
+        self.components = components
+        self.eigen_values = eigen_values
+        
+        # Freeze PCA attributes
+        for key in components.keys():
+            self.components[key].requires_grad_(False)
+            self.eigen_values[key].requires_grad_(False)
+        
+        # Compute elbow points and create projection masks
+        self.elbow_indices = {}
+        self.projection_masks = {}
+        self._compute_projection_masks()
+    
+    def _compute_projection_masks(self):
+        """Compute elbow points and create projection masks for each module.
+        
+        Now computes pre-elbow components (before and including elbow point) for projection.
+        """
+        for name in self.module_names:
+            if name not in self.components:
+                continue
+            
+            eigen_vals = self.eigen_values[name]  # [g, c_in//g*k*k]
+            components = self.components[name]  # [g, c_in//g*k*k, c_in//g*k*k]
+            g, n = eigen_vals.shape
+            
+            elbow_indices = []
+            projection_components = []
+            
+            for i in range(g):
+                group_eigen_vals = eigen_vals[i]  # [c_in//g*k*k]
+                elbow_idx = find_elbow_point(group_eigen_vals)
+                elbow_idx = max(0, min(elbow_idx, n - 1))  # Ensure valid index
+                elbow_indices.append(elbow_idx)
+                
+                # Get components before and including elbow point (0 to elbow_idx)
+                # Each column in components[i] is a principal component
+                # We want to project onto components from index 0 to elbow_idx (inclusive)
+                if elbow_idx >= 0:
+                    # Extract principal components before and including elbow point
+                    # components[i]: [c_in//g*k*k, c_in//g*k*k], each column is a PC
+                    # We want columns from 0 to elbow_idx (inclusive)
+                    pre_elbow_components = components[i, :, :elbow_idx + 1]  # [c_in//g*k*k, elbow_idx + 1]
+                    projection_components.append(pre_elbow_components)
+                else:
+                    # If no valid elbow point, no components to project onto
+                    # Create zero projection (will keep original gradient)
+                    projection_components.append(torch.zeros(
+                        (n, 0), 
+                        device=components.device, 
+                        dtype=components.dtype
+                    ))
+            
+            self.elbow_indices[name] = elbow_indices
+            
+            # Debug: output elbow indices for each group
+            # LOGGER.info(f"{colorstr('NSGP elbow indices for module')} '{name}': {elbow_indices} (total groups: {g}, dimension: {n})")
+            
+            # Store pre-elbow components for projection
+            # Note: num_pre_elbow_components may vary per group, so we store as a list
+            self.projection_masks[name] = projection_components
+    
+    def apply_projection(self, params_dict: Dict[str, torch.nn.Parameter], flexibility: float = 1.0):
+        """Manually apply gradient projection (alternative to hooks).
+        
+        This method can be called before optimizer step to project gradients.
+        
+        Args:
+            params_dict: Dictionary mapping parameter names (e.g., 'module_name.weight') to 
+                        parameter objects. These should be the exact parameter objects from 
+                        optimizer.param_groups to ensure we modify the gradients that optimizer 
+                        actually uses.
+            flexibility: Weight for the projected component when subtracting from original gradient
+        """
+        for name in self.module_names:
+            # Get the parameter name for weight
+            param_name = name + '.weight'
+            
+            # Get parameter from params_dict
+            if param_name not in params_dict:
+                continue
+            
+            weight_param = params_dict[param_name]
+            
+            if weight_param is None or weight_param.grad is None:
+                continue
+            
+            if name not in self.projection_masks:
+                continue
+            
+            # Get the gradient from the parameter
+            grad = weight_param.grad  # [c_out, c_in, k, k]
+            
+            # Get the number of groups from projection_masks length
+            # projection_masks[name] is a list with one element per group
+            projection_components = self.projection_masks[name]
+            g = len(projection_components)  # Number of groups
+            
+            # Reshape gradient to match weight format: [g, c_out//g, c_in//g*k*k]
+            # Note: Only weight gradients are projected, bias is not considered (consistent with EWPR)
+            c_out, c_in, k_h, k_w = grad.shape
+            grad_reshaped = grad.reshape(g, c_out // g, c_in // g, k_h * k_w)
+            grad_reshaped = grad_reshaped.reshape(g, c_out // g, -1)  # [g, c_out//g, c_in//g*k*k]
+            
+            # Project gradients for each group
+            # New rule: project onto pre-elbow components, then subtract from original gradient
+            projected_weight_grad = grad_reshaped.clone()  # Start with original gradient
+            
+            for i in range(g):
+                pre_elbow_comp = projection_components[i]  # [c_in//g*k*k, num_pre_elbow]
+                # Move to same device as gradient
+                pre_elbow_comp = pre_elbow_comp.to(grad.device, grad.dtype)
+                # Project gradient onto pre-elbow principal components
+                grad_group = grad_reshaped[i]  # [c_out//g, c_in//g*k*k]
+                # Project: grad_group @ pre_elbow_comp @ pre_elbow_comp.T
+                grad_proj = grad_group @ pre_elbow_comp @ pre_elbow_comp.T
+                # Subtract the projected component from original gradient (with flexibility weight)
+                projected_weight_grad[i] = grad_group - flexibility * grad_proj
+            
+            # Reshape weight gradient back to original shape
+            projected_weight_grad = projected_weight_grad.reshape(
+                g, c_out // g, c_in // g, k_h * k_w
+            ).reshape(c_out, c_in, k_h, k_w)
+            
+            # Update weight gradient in-place
+            weight_param.grad.data.copy_(projected_weight_grad)
+
+
+```
+
+find_elbow_point的实现如下：
+```find elbow point
+def find_elbow_point(svals: torch.Tensor) -> int:
+    """Find the elbow point in singular value spectrum using second-order derivatives.
+    
+    Args:
+        svals: Singular values in descending order, shape (N,)
+    
+    Returns:
+        int: Index of the elbow point
+    """
+    points = svals.cpu().numpy()
+    assert points.ndim == 1
+    
+    if len(points) >= 128:
+        fil_points = scipy.ndimage.gaussian_filter1d(points, sigma=10)
+        _delta = 1
+        diff_o1 = fil_points[:-_delta] - fil_points[_delta:]
+        diff_o2 = diff_o1[:-1] - diff_o1[1:]
+        _drop_ratio = 0.03
+        drop_num = int(len(points) * _drop_ratio / 2)
+        assert len(points) - drop_num >= 10
+        valid_o2 = diff_o2[drop_num:-drop_num]
+        thres_val = points[np.argmax(valid_o2) + int((len(points) - len(valid_o2)) / 2)]
+    else:
+        diff_o1 = points[:-1] - points[1:]
+        diff_o2 = diff_o1[:-1] - diff_o1[1:]
+        thres_val = points[np.argmax(diff_o2) + int((len(points) - len(diff_o2)) / 2)]
+    
+    i_thres = np.arange(len(points))[points >= thres_val].max()
+    return int(i_thres)
+```
+
+既然调试信息表明权重更新值与null space夹角的余弦值接近于1，那么说明更新值应该几乎是正交于elbow point之前的成分。但是可视化输出表明更新值在elbow point以前的方向上投影反而比较大。请你为我分析为什么会产生这个矛盾的结果。

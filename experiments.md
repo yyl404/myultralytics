@@ -653,9 +653,9 @@ model-1的False Positive分析：
 <td></td>
 <td></td>
 <td></td>
-<td></td>
-<td></td>
-<td></td>
+<td>60.5</td>
+<td>74.6</td>
+<td>55.5</td>
 <td></td>
 <td></td>
 <td></td>
@@ -665,9 +665,9 @@ model-1的False Positive分析：
 <td></td>
 <td></td>
 <td></td>
-<td>63.3</td>
-<td>74.5</td>
-<td>58.3</td>
+<td>72.8</td>
+<td>73.4</td>
+<td>65.5</td>
 <td></td>
 <td></td>
 <td></td>
@@ -677,26 +677,18 @@ model-1的False Positive分析：
 
 ## 2. EWPR Ablation
 
-sigmoid scale(ewpr loss weight 1.0)
-|sigmoid scale|old|new|all|
-|---|---|---|---|
-|1|53.7|75.4|51.0|
-|10|51.7|75.7|49.1|
-|100|55.3|74.1|51.7|
-|1000|63.3|74.5|58.3|
-|10000|71.2|74.1|63.6|
-|100000|72.9|69.8|64.8|
-
-ewpr loss weight(sigmoid scale=10)
+ewpr loss weight
 |ewpr loss weight|old|new|all|
 |---|---|---|---|
-|1|51.9|76.1|49.5|
-|10|50.7|76.1|47.9|
-|100|54.3|76.3|51.8|
-|1000|63.3|74.5|58.3|
-<!-- |1000|57.6|75.6|53.3| -->
+|1|54.3|78.9|51.4|
+|10|66.2|74.2|60.6|
+|100|72.8|73.4|65.5|
+|1000|72.9|69.4|64.5|
 
-ewpr loss weight(mode=2)
-|ewpr loss weight|old|new|all|
+ewc loss weight
+|ewc loss weight|old|new|all|
 |---|---|---|---|
-|1000|63.3|74.5|58.3|
+|1|50.8|76.3|48.9|
+|10|52.3|76.0|49.6|
+|100|50.7|73.8|48.3|
+|1000|50.2|75.9|48.4|
