@@ -4,6 +4,10 @@ This tool converts the class IDs in a dataset to match the class IDs used by a t
 It reads the model's class list and the dataset's class list, creates a mapping between them,
 and converts all label files accordingly.
 
+Supports both detection (xywh) and OBB (oriented bounding box, xyxyxyxy) datasets: the label
+format is inferred from the model task (model.task), so OBB models (e.g. yolov8l-obb) will
+convert OBB-format labels (class_id x1 y1 x2 y2 x3 y3 x4 y4) correctly.
+
 Usage:
     $ python tools/convert_dataset_class_ids.py \
         --model <path/to/model.pt> \
@@ -52,6 +56,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     model = YOLO(args.model)
+    task = getattr(model, "task", None) or "detect"
     model_classes = [model.names[i] for i in sorted(model.names.keys())]
 
     data_cfg = YAML.load(args.dataset)
@@ -84,7 +89,9 @@ if __name__ == "__main__":
             source_labels = source_images.replace('images', 'labels')
 
             os.makedirs(OSP.join(args.output_dir, f"labels/{split}"), exist_ok=True)
-            convert_class_ids_from_dir(source_labels, class_id_map, OSP.join(args.output_dir, f"labels/{split}"))
+            convert_class_ids_from_dir(
+                source_labels, class_id_map, OSP.join(args.output_dir, f"labels/{split}"), task=task
+            )
 
             shutil.copytree(source_images, OSP.join(args.output_dir, f"images/{split}"))
             config[split] = f"images/{split}"

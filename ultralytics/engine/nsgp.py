@@ -3,7 +3,7 @@ from typing import Dict, List
 import torch
 from torch import Tensor
 
-from ultralytics.engine.ewpr import find_elbow_point
+from ultralytics.engine.espreg import find_elbow_point
 from ultralytics.utils import LOGGER, colorstr
 
 
@@ -48,11 +48,11 @@ class NSGP:
                 continue
             
             eigen_vals = self.eigen_values[name]  # [g, c_in//g*k*k]
-            components = self.components[name]  # [g, c_in//g*k*k, c_in//g*k*k]
+            components_T = self.components[name].transpose(1, 2)  # [g, c_in//g*k*k, c_in//g*k*k]
             g, n = eigen_vals.shape
             
             elbow_indices = []
-            projection_components = []
+            projection_components_T = []
             
             for i in range(g):
                 group_eigen_vals = eigen_vals[i]  # [c_in//g*k*k]
@@ -67,15 +67,15 @@ class NSGP:
                     # Extract principal components before and including elbow point
                     # components[i]: [c_in//g*k*k, c_in//g*k*k], each column is a PC
                     # We want columns from 0 to elbow_idx (inclusive)
-                    pre_elbow_components = components[i, :, :elbow_idx + 1]  # [c_in//g*k*k, elbow_idx + 1]
-                    projection_components.append(pre_elbow_components)
+                    pre_elbow_components_T = components_T[i, :, :elbow_idx + 1]  # [c_in//g*k*k, elbow_idx + 1]
+                    projection_components_T.append(pre_elbow_components_T)
                 else:
                     # If no valid elbow point, no components to project onto
                     # Create zero projection (will keep original gradient)
-                    projection_components.append(torch.zeros(
+                    projection_components_T.append(torch.zeros(
                         (n, 0), 
-                        device=components.device, 
-                        dtype=components.dtype
+                        device=components_T.device, 
+                        dtype=components_T.dtype
                     ))
             
             self.elbow_indices[name] = elbow_indices
@@ -85,7 +85,7 @@ class NSGP:
             
             # Store pre-elbow components for projection
             # Note: num_pre_elbow_components may vary per group, so we store as a list
-            self.projection_masks[name] = projection_components
+            self.projection_masks[name] = projection_components_T
     
     def apply_projection(self, params_dict: Dict[str, torch.nn.Parameter], flexibility: float = 1.0):
         """Manually apply gradient projection (alternative to hooks).
@@ -102,12 +102,13 @@ class NSGP:
         for name in self.module_names:
             # Get the parameter name for weight
             param_name = name + '.weight'
+            bias_name = name + '.bias'
             
             # Get parameter from params_dict
             if param_name not in params_dict:
                 continue
-            
             weight_param = params_dict[param_name]
+            bias_param = params_dict.get(bias_name, None)
             
             if weight_param is None or weight_param.grad is None:
                 continue
@@ -116,39 +117,62 @@ class NSGP:
                 continue
             
             # Get the gradient from the parameter
-            grad = weight_param.grad  # [c_out, c_in, k, k]
+            grad_w = weight_param.grad  # [c_out, c_in, k, k]
+            grad_b = bias_param.grad if (bias_param is not None and bias_param.grad is not None) else None
             
             # Get the number of groups from projection_masks length
             # projection_masks[name] is a list with one element per group
             projection_components = self.projection_masks[name]
             g = len(projection_components)  # Number of groups
             
-            # Reshape gradient to match weight format: [g, c_out//g, c_in//g*k*k]
-            # Note: Only weight gradients are projected, bias is not considered (consistent with EWPR)
-            c_out, c_in, k_h, k_w = grad.shape
-            grad_reshaped = grad.reshape(g, c_out // g, c_in // g, k_h * k_w)
-            grad_reshaped = grad_reshaped.reshape(g, c_out // g, -1)  # [g, c_out//g, c_in//g*k*k]
+            # Reshape weight gradient: [g, c_out//g, c_in//g*k*k]
+            c_out, c_in, k_h, k_w = grad_w.shape
+            grad_w_reshaped = grad_w.reshape(g, c_out // g, c_in // g, k_h * k_w)
+            grad_w_reshaped = grad_w_reshaped.reshape(g, c_out // g, -1)  # [g, c_out//g, c_in//g*k*k]
+            
+            # If bias exists, reshape and concatenate as an extra feature dim
+            if grad_b is not None:
+                grad_b_reshaped = grad_b.reshape(g, c_out // g, 1)  # [g, c_out//g, 1]
+                grad_concat = torch.cat([grad_w_reshaped, grad_b_reshaped], dim=-1)  # [g, c_out//g, c_in//g*k*k + 1]
+            else:
+                grad_concat = grad_w_reshaped
             
             # Project gradients for each group
             # New rule: project onto pre-elbow components, then subtract from original gradient
-            projected_weight_grad = grad_reshaped.clone()  # Start with original gradient
+            projected_grad = grad_concat.clone()  # Start with original gradient
             
             for i in range(g):
-                pre_elbow_comp = projection_components[i]  # [c_in//g*k*k, num_pre_elbow]
-                # Move to same device as gradient
-                pre_elbow_comp = pre_elbow_comp.to(grad.device, grad.dtype)
-                # Project gradient onto pre-elbow principal components
-                grad_group = grad_reshaped[i]  # [c_out//g, c_in//g*k*k]
-                # Project: grad_group @ pre_elbow_comp @ pre_elbow_comp.T
+                # pre_elbow_comp is already in augmented form (includes bias dimension if present during PCA)
+                pre_elbow_comp = projection_components[i]  # [feature_dim, num_pre_elbow] - already augmented
+                    # Move to same device as gradient
+                pre_elbow_comp = pre_elbow_comp.to(grad_concat.device, grad_concat.dtype)
+                    
+                        # Project gradient onto pre-elbow principal components
+                grad_group = grad_concat[i]  # [c_out//g, feature_dim]
+                # Project: grad_group @ P @ P^T
                 grad_proj = grad_group @ pre_elbow_comp @ pre_elbow_comp.T
                 # Subtract the projected component from original gradient (with flexibility weight)
-                projected_weight_grad[i] = grad_group - flexibility * grad_proj
+                projected_grad[i] = grad_group - flexibility * grad_proj
             
-            # Reshape weight gradient back to original shape
-            projected_weight_grad = projected_weight_grad.reshape(
-                g, c_out // g, c_in // g, k_h * k_w
-            ).reshape(c_out, c_in, k_h, k_w)
+            # Split back to weight and bias if needed
+            if grad_b is not None:
+                projected_weight_grad = projected_grad[:, :, :-1]
+                projected_bias_grad = projected_grad[:, :, -1]
             
-            # Update weight gradient in-place
+                # Reshape weight gradient back to original shape
+                projected_weight_grad = projected_weight_grad.reshape(
+                    g, c_out // g, c_in // g, k_h * k_w
+                ).reshape(c_out, c_in, k_h, k_w)
+            
+                # Reshape bias gradient back to original shape [c_out]
+                projected_bias_grad = projected_bias_grad.reshape(c_out)
+                
+                # Update in-place
+                weight_param.grad.data.copy_(projected_weight_grad)
+                bias_param.grad.data.copy_(projected_bias_grad)
+            else:
+                projected_weight_grad = projected_grad.reshape(
+                    g, c_out // g, c_in // g, k_h * k_w
+                ).reshape(c_out, c_in, k_h, k_w)
             weight_param.grad.data.copy_(projected_weight_grad)
 

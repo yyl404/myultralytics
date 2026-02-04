@@ -121,7 +121,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --device $DEVICE \
             --project $TASK_DIR \
             --trainer antiforget \
-            --vspreg False \
+            --espreg False \
             --proto_rp False \
             --patience $PATIENCE \
             --freeze $FREEZE_INC"

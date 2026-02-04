@@ -1,10 +1,14 @@
 #!/bin/bash
 
 # Configuration
-BASE_MODEL="runs/yolov8l_voc_15_5_fromscratch_nsgp+pseudo_label/task-2/task-1-best-expanded.pt"
-INCREMENTAL_MODEL="runs/yolov8l_voc_15_5_fromscratch_nsgp+pseudo_label/task-2/train2/weights/last.pt"
-PCA_CACHE="runs/yolov8l_voc_15_5_fromscratch_nsgp+pseudo_label/task-1/pca_cache.pkl"
-SAVE_DIR="runs/yolov8l_voc_15_5_fromscratch_nsgp+pseudo_label/task-2/proj_visualizations"
+# BASE_MODEL="/root/hy-tmp/runs_old/yolov8l_voc_15_5_fromscratch_pseudo_label/task-2/task-1-best-expanded.pt"
+# INCREMENTAL_MODEL="/root/hy-tmp/runs_old/yolov8l_voc_15_5_fromscratch_pseudo_label/task-2/best.pt"
+# PCA_CACHE="/root/hy-tmp/runs_old/yolov8l_voc_15_5_fromscratch_ewpr+pseudo_label/task-1/pca_cache.pkl"
+# SAVE_DIR="/root/hy-tmp/runs_old/yolov8l_voc_15_5_fromscratch_pseudo_label/task-2/proj_visualizations"
+BASE_MODEL="/root/hy-tmp/runs_old/yolov8l_voc_15_5_fromscratch_ewpr+pseudo_label/task-2/task-1-best-expanded.pt"
+INCREMENTAL_MODEL="/root/hy-tmp/runs_old/yolov8l_voc_15_5_fromscratch_ewpr+pseudo_label/task-2/train-w100/weights/best.pt"
+PCA_CACHE="/root/hy-tmp/runs_old/yolov8l_voc_15_5_fromscratch_ewpr+pseudo_label/task-1/pca_cache.pkl"
+SAVE_DIR="/root/hy-tmp/runs_old/yolov8l_voc_15_5_fromscratch_ewpr+pseudo_label/task-2/proj_visualizations"
 DEVICE="cuda"
 LAYERS=""
 

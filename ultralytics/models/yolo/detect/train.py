@@ -342,8 +342,8 @@ class AntiForgetDetectionTrainer(AntiForgetTrainer):
         """Return a DetectionValidator for YOLO model validation."""
         self.loss_names = ["box_loss", "cls_loss", "dfl_loss"]
         
-        if self.args.ewpr:
-            self.loss_names.append("ewpr_loss")
+        if self.args.espreg:
+            self.loss_names.append("espreg_loss")
         if self.args.ewc:
             self.loss_names.append("ewc_loss")
         if self.args.kd:

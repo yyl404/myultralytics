@@ -622,7 +622,7 @@ L_total = L_detection + λ_vspreg * L_vspreg + λ_proto * L_proto
 ### 脚本结构
 
 ```bash
-# scripts/4-domain/yoloev8/train_vspreg+proto_rp+sample_rp.sh
+# scripts/4-domain/yoloev8/train_pseudo_label+espreg+proto_rp+sample_rp.sh
 
 # 配置参数
 MODEL_CFG="yolov8l.yaml"
@@ -699,14 +699,14 @@ patience=15                 # 早停耐心值
 
 ```bash
 # 运行增量学习训练脚本
-bash scripts/4-domain/yoloev8/train_vspreg+proto_rp+sample_rp.sh
+bash scripts/4-domain/yoloev8/train_pseudo_label+espreg+proto_rp+sample_rp.sh
 ```
 
 ### 从特定任务恢复
 
 ```bash
 # 从任务3开始训练
-START_TASK=3 bash scripts/4-domain/yoloev8/train_vspreg+proto_rp+sample_rp.sh
+START_TASK=3 bash scripts/4-domain/yoloev8/train_pseudo_label+espreg+proto_rp+sample_rp.sh
 ```
 
 ### 自定义配置
@@ -762,7 +762,7 @@ tools/
 └── train.py                   # 训练入口
 scripts/
 └── 4-domain/yoloev8/
-    └── train_vspreg+proto_rp+sample_rp.sh  # 训练脚本
+    └── train_pseudo_label+espreg+proto_rp+sample_rp.sh  # 训练脚本
 ```
 
 ## 总结

@@ -535,3 +535,65 @@ YOLOFiLM 通过集成 FiLM 机制和 CLIP 文本编码器，实现了基于自�
 
 该实现为条件目标检测提供了一个完整的解决方案，可以应用于需要根据额外属性信息进行检测的各种场景。
 
+```mermaid
+graph LR
+    %% 定义节点及其显示的文本
+    Visual["视觉特征 Fv <br/> (受损/含噪)"]
+    Text["额外状态描述 T_state <br/> ('烟雾遮挡', '主体断裂')"]
+    Encoder["属性编码器"]
+    Emb["状态嵌入 E_state"]
+    MLP_Gamma["MLP φ_γ"]
+    MLP_Beta["MLP φ_β"]
+    Gamma["尺度因子 γ <br/> (去噪/滤波)"]
+    Beta["偏置因子 β <br/> (补全/填补)"]
+    Op_Mult(("(X)"))
+    Op_Add(("(+)"))
+    Restored["修复后特征 F_new <br/> (清晰/完整)"]
+    Head["检测头"]
+
+    subgraph Input_Stream ["输入流"]
+        direction TB
+        Visual
+        Text
+    end
+
+    subgraph Modulation_Engine ["FiLM 调制引擎"]
+        direction TB
+        Encoder --> Emb
+        Emb --> MLP_Gamma
+        Emb --> MLP_Beta
+        MLP_Gamma --> Gamma
+        MLP_Beta --> Beta
+    end
+
+    subgraph Repair_Process ["逆向修复过程"]
+        direction LR
+        %% 逻辑流
+        Visual --> Op_Mult
+        Gamma -.->|"通道加权(去噪)"| Op_Mult
+        Op_Mult --> Op_Add
+        Beta -.->|"特征注入(补全)"| Op_Add
+    end
+
+    subgraph Output_Stream ["输出流"]
+        Op_Add --> Restored
+        Restored --> Head
+    end
+
+    %% 信号源连接
+    Text --> Encoder
+
+    %% 定义样式
+    classDef visual fill:#ffcccc,stroke:#333,stroke-width:2px;
+    classDef text fill:#e1f5fe,stroke:#333,stroke-width:2px;
+    classDef gamma fill:#fff9c4,stroke:#fbc02d,stroke-dasharray: 5 5;
+    classDef beta fill:#fff9c4,stroke:#fbc02d,stroke-dasharray: 5 5;
+    classDef restored fill:#c8e6c9,stroke:#333,stroke-width:2px;
+
+    %% 应用样式
+    class Visual visual;
+    class Text text;
+    class Gamma gamma;
+    class Beta beta;
+    class Restored restored;
+```

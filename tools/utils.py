@@ -99,48 +99,100 @@ def calculate_iou_xywh(box1, box2):
 
 
 def parse_label_line(line):
-    """Parse a YOLO format label line.
-    
+    """Parse a YOLO detection format label line.
+
     Args:
         line (str): Label line in YOLO format: "class_id x_center y_center width height"
-    
+
     Returns:
         tuple: (class_id, x_center, y_center, width, height) or None if invalid
     """
     parts = line.strip().split()
-    class_id = int(parts[0])
-    x_center = float(parts[1])
-    y_center = float(parts[2])
-    width = float(parts[3])
-    height = float(parts[4])
-    return (class_id, x_center, y_center, width, height)
+    if len(parts) != 5:
+        return None
+    try:
+        class_id = int(parts[0])
+        x_center = float(parts[1])
+        y_center = float(parts[2])
+        width = float(parts[3])
+        height = float(parts[4])
+        return (class_id, x_center, y_center, width, height)
+    except (ValueError, IndexError):
+        return None
 
 
-def convert_class_ids(label_lines, class_id_map):
-    """Convert the class IDs in the label lines by the class_id_map"""
+def parse_label_line_obb(line):
+    """Parse a YOLO OBB format label line (oriented bounding box).
+
+    OBB format: class_id x1 y1 x2 y2 x3 y3 x4 y4 (normalized polygon corners).
+
+    Args:
+        line (str): Label line in YOLO OBB format.
+
+    Returns:
+        tuple: (class_id, [x1, y1, x2, y2, x3, y3, x4, y4]) or None if invalid
+    """
+    parts = line.strip().split()
+    if len(parts) != 9:
+        return None
+    try:
+        class_id = int(parts[0])
+        coords = [float(parts[i]) for i in range(1, 9)]
+        return (class_id, coords)
+    except (ValueError, IndexError):
+        return None
+
+
+def convert_class_ids(label_lines, class_id_map, task="detect"):
+    """Convert the class IDs in the label lines by the class_id_map.
+
+    Args:
+        label_lines: List of label file lines.
+        class_id_map: Dict mapping old class id -> new class id.
+        task: "detect" for xywh format, "obb" for xyxyxyxy (4 corner) format.
+    """
     converted_lines = []
     for line in label_lines:
-        parsed = parse_label_line(line.strip())
-        if parsed is None:
+        s = line.strip()
+        if not s:
             continue
-        old_cat_id, x, y, w, h = parsed
-        if old_cat_id in class_id_map:
-            new_cat_id = class_id_map[old_cat_id]
-            converted_lines.append(f'{new_cat_id} {x} {y} {w} {h}\n')
+        if task == "obb":
+            parsed = parse_label_line_obb(s)
+            if parsed is None:
+                continue
+            old_cat_id, coords = parsed
+            if old_cat_id in class_id_map:
+                new_cat_id = class_id_map[old_cat_id]
+                converted_lines.append(f"{new_cat_id} " + " ".join(str(c) for c in coords) + "\n")
+        else:
+            parsed = parse_label_line(s)
+            if parsed is None:
+                continue
+            old_cat_id, x, y, w, h = parsed
+            if old_cat_id in class_id_map:
+                new_cat_id = class_id_map[old_cat_id]
+                converted_lines.append(f"{new_cat_id} {x} {y} {w} {h}\n")
     return converted_lines
 
 
-def convert_class_ids_from_dir(labels_dir, class_id_map, output_dir):
-    """Read all label files in a directory and convert class IDs."""
+def convert_class_ids_from_dir(labels_dir, class_id_map, output_dir, task="detect"):
+    """Read all label files in a directory and convert class IDs.
+
+    Args:
+        labels_dir: Directory containing .txt label files.
+        class_id_map: Dict mapping old class id -> new class id.
+        output_dir: Directory to write converted labels.
+        task: "detect" for detection (xywh) labels, "obb" for OBB (xyxyxyxy) labels.
+    """
     for label_file in os.listdir(labels_dir):
-        if label_file.endswith('.txt'):
+        if label_file.endswith(".txt"):
             label_path = OSP.join(labels_dir, label_file)
-            with open(label_path, 'r') as f:
+            with open(label_path, "r") as f:
                 lines = f.readlines()
-            converted_lines = convert_class_ids(lines, class_id_map)
+            converted_lines = convert_class_ids(lines, class_id_map, task=task)
 
             output_path = OSP.join(output_dir, label_file)
-            with open(output_path, 'w') as f:
+            with open(output_path, "w") as f:
                 f.writelines(converted_lines)
 
 

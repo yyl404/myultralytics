@@ -13,7 +13,8 @@ Usage:
         [--workers <num_workers>] \
         [--device <device>] \
         [--layers <layer1> <layer2> ...] \
-        [--modules <module1> <module2> ...]
+        [--modules <module1> <module2> ...] \
+        [--module_pattern <pattern1> [<pattern2> ...]]
 
 Arguments:
     --model: Path to the model checkpoint (.pt file)
@@ -23,10 +24,9 @@ Arguments:
     --workers: Number of data loading workers (default: 8)
     --device: Device to use (default: "cuda")
     --layers: (optional) Layers to calculate importance for, space-separated.
-        If specified, only parameters in these layers will be calculated.
-    --modules: (optional) Specific module names to calculate importance for, space-separated.
-        Provides more detailed control than --layers. Module names should match
-        the parameter name prefix (e.g., "model.10.conv", "model.11.bn").
+    --modules: (optional) Exact module names to calculate importance for, space-separated.
+    --module_pattern: (optional) Module name pattern(s) with wildcard *, e.g. "model.10.*".
+        Only one of --layers, --modules, --module_pattern may be set.
 
 Example:
     $ python tools/cal_importance.py \
@@ -47,9 +47,16 @@ Example:
         --dataset data/VOC_inc_10_10/task_1_cls_10/dataset.yaml \
         --save_path runs/task1/importance.pth \
         --modules model.10.conv model.11.bn
+
+    $ python tools/cal_importance.py \
+        --model runs/task1/best.pt \
+        --dataset data/VOC_inc_10_10/task_1_cls_10/dataset.yaml \
+        --save_path runs/task1/importance.pth \
+        --module_pattern "model.10.*" "model.11.*"
 """
 
 import argparse
+import fnmatch
 import os
 import torch
 
@@ -60,13 +67,14 @@ from ultralytics.models.yolo.detect import DetectionTrainer
 
 
 class ImportanceCalculator:
-    def __init__(self, model, layers=None, modules=None, device="cuda"):
+    def __init__(self, model, layers=None, modules=None, module_pattern=None, device="cuda"):
         """Initialize ImportanceCalculator.
-        
+
         Args:
             model: Model to calculate importance for
             layers: List of layer IDs to calculate importance for (optional)
             modules: List of module name prefixes to calculate importance for (optional)
+            module_pattern: List of fnmatch patterns for module names, e.g. ["model.10.*"] (optional)
             device: Device to use (default: "cuda")
         """
         self.model = model
@@ -77,11 +85,15 @@ class ImportanceCalculator:
             device = "cpu"
             LOGGER.warning("CUDA is not available, using CPU")
         self.device = device
-        
+
         def _match(n, lid):
             return f"model.{lid}." in n and "dfl" not in n
 
-        if modules is not None:
+        if module_pattern is not None:
+            for n, m in model.named_modules():
+                if "dfl" not in n and any(fnmatch.fnmatch(n, p) for p in module_pattern):
+                    self.modules[n] = m
+        elif modules is not None:
             for n, m in model.named_modules():
                 if n in modules:
                     self.modules[n] = m
@@ -184,17 +196,18 @@ class ImportanceCalculator:
         LOGGER.info(f"Loaded importance from {load_path}")
 
 
-def calculate_importance(model, dataset, layers=None, modules=None, 
+def calculate_importance(model, dataset, layers=None, modules=None, module_pattern=None,
                          workers=8, device="cuda", epochs=1, batch_size=None, load_hist=None):
     """Calculate parameter importance using Fisher Information Matrix approximation.
-    
+
     Args:
         model: YOLO model instance
         dataset: Path to dataset YAML file or dataset config dict
         layers: List of layer IDs to calculate importance for (optional)
         modules: List of module name prefixes to calculate importance for (optional)
-            If both layers and modules are None, importance will be calculated for all modules
-            (excluding DFL layer which is always frozen)
+        module_pattern: List of fnmatch patterns for module names, e.g. ["model.10.*"] (optional)
+            If layers, modules and module_pattern are all None, importance will be calculated
+            for all modules (excluding DFL layer which is always frozen)
         workers: Number of data loading workers
         device: Device to use for training
         epochs: Number of epochs to train (default: 1)
@@ -233,6 +246,7 @@ def calculate_importance(model, dataset, layers=None, modules=None,
             trainer.model,
             layers=layers,
             modules=modules,
+            module_pattern=module_pattern,
             device=device
         )
         
@@ -312,32 +326,36 @@ def main():
                        help="Device to use (default: cuda)")
     parser.add_argument("--layers", nargs="+", type=int, default=None,
                        help="Layers to calculate importance for, space-separated. "
-                            "If specified, only parameters in these layers will be calculated. "
-                            "If both --layers and --modules are not specified, importance will be "
-                            "calculated for all modules (excluding DFL layer).")
+                            "Only one of --layers, --modules, --module_pattern may be set.")
     parser.add_argument("--modules", nargs="+", type=str, default=None,
-                       help="Specific module names to calculate importance for, space-separated. "
-                            "Provides more detailed control than --layers. Module names should "
-                            "match the parameter name prefix (e.g., 'model.10.conv', 'model.11.bn'). "
-                            "If both --layers and --modules are not specified, importance will be "
-                            "calculated for all modules (excluding DFL layer).")
+                       help="Exact module names to calculate importance for, space-separated "
+                            "(e.g. 'model.10.conv' 'model.11.bn'). "
+                            "Only one of --layers, --modules, --module_pattern may be set.")
+    parser.add_argument("--module_pattern", nargs="+", type=str, default=None,
+                       help="Module name pattern(s) with wildcard *, e.g. 'model.10.*' or "
+                            "'model.1*.conv'. Only one of --layers, --modules, --module_pattern may be set.")
     parser.add_argument("--load_hist", type=str, default=None,
                        help="Path to previously saved importance file to load as starting point. "
                             "If specified, importance calculation will continue from the loaded state.")
     
     args = parser.parse_args()
-    
+
+    provided = sum(1 for x in (args.layers, args.modules, args.module_pattern) if x is not None)
+    if provided > 1:
+        parser.error("Only one of --layers, --modules, --module_pattern may be set.")
+
     LOGGER.info(f"Loading model from {args.model}...")
     model = YOLO(args.model)
     
     importance_calculator = calculate_importance(
-        model, 
+        model,
         dataset=args.dataset,
         batch_size=args.batch_size,
         workers=args.workers,
         device=args.device,
         layers=args.layers,
         modules=args.modules,
+        module_pattern=args.module_pattern,
         load_hist=args.load_hist
     )
     

@@ -2,7 +2,7 @@
 
 # Configuration
 MODEL_CFG="yolov8l.yaml"
-OUTPUT_DIR="runs/yolov8l_voc_15_5_fromscratch_ewc+pseudo_label"
+OUTPUT_DIR="runs/yolov8l_voc_15_5_fromscratch_pseudo_label+ewc"
 EPOCHS=300
 BATCH_SIZE=16
 IMGSZ=640
@@ -15,7 +15,7 @@ CONF_THRESHOLD=0.25
 FILTER_IOU_THRESHOLD=0.5
 
 # EWC Configuration
-# Can be overridden via command line: EWC_LOSS_WEIGHT=1000.0 bash train_ewc+pseudo_label.sh
+# Can be overridden via command line: EWC_LOSS_WEIGHT=1000.0 bash train_pseudo_label+ewc.sh
 EWC_LOSS_WEIGHT=${EWC_LOSS_WEIGHT:-100.0}
 
 # Start from which task (1-based index, set to 1 to start from beginning)

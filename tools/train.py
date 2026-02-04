@@ -62,6 +62,7 @@ import argparse
 
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect import DetectionTrainer, AntiForgetDetectionTrainer
+from ultralytics.models.yolo.obb import AntiForgetOBBTrainer
 
 
 def _coerce_value(raw: str):
@@ -171,12 +172,16 @@ def main():
     model = YOLO(args.model)
     if args.weight is not None:
         # This is for loading weights of heterogeneous models while preserving the architecture of the originally initialized model
-        model.load(args.weight) 
-    
+        model.load(args.weight)
+
+    # Select trainer by model task and user-specified trainer type.
+    # When trainer is None, do not pass trainer so the model uses its task-specific default (OBBTrainer for obb, etc.).
+    # When trainer is "antiforget", use the task-appropriate anti-forget trainer.
+    task = getattr(model, "task", "detect")
     if args.trainer == "antiforget":
-        trainer = AntiForgetDetectionTrainer
+        trainer = AntiForgetOBBTrainer if task == "obb" else AntiForgetDetectionTrainer
     else:
-        trainer = DetectionTrainer
+        trainer = None  # use model's default (OBBTrainer for obb, DetectionTrainer for detect, etc.)
     model.train(data=args.data, epochs=args.epochs, batch=args.batch_size, workers=args.workers,
                 device=args.device, project=args.project, trainer=trainer, **dynamic_kwargs)
     model.save(args.save_path)

@@ -56,7 +56,20 @@ import torch.nn.functional as F
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER, TQDM, YAML
 from ultralytics.utils.plotting import Annotator, colors
-from ultralytics.utils.metrics import bbox_iou
+from ultralytics.utils.metrics import bbox_iou, batch_probiou
+from ultralytics.nn.modules.head import Detect, OBB
+
+
+def _unpack_head_output(detect, captured_outputs):
+    """Unpack hook output for Detect or OBB head.
+    Returns (decoded_preds, raw_preds) for Detect; (decoded_preds_full, raw_preds) for OBB.
+    OBB decoded_preds_full is (B, 4+nc+1, num_anchors) so bbox (first 4) and angle (last 1) can be used for rotated IoU.
+    """
+    if isinstance(detect, OBB):
+        decoded_cat, (raw_preds, _) = captured_outputs  # decoded_cat (B, 4+nc+ne, sum(HW))
+        return decoded_cat, raw_preds
+    decoded, raw_preds = captured_outputs[0], captured_outputs[1]
+    return decoded, raw_preds
 
 
 def run_kmeans(features, k, max_iters=100):
@@ -103,35 +116,39 @@ def run_kmeans(features, k, max_iters=100):
     return dists_to_centers.argmin(dim=0)
 
 
-def extract_pos_patches_from_layer(feat, bbox_map_px, cls_map, reg_map, gt_bbox_px, gt_cls, conf_thresh=0.25, iou_threshold=0.5):
+def extract_pos_patches_from_layer(
+    feat, bbox_map_px, cls_map, reg_map, gt_bbox_px, gt_cls,
+    conf_thresh=0.25, iou_threshold=0.5, angle_map=None, gt_bbox_px_5=None
+):
     """
     Extracts 5x5 feature patches from a single layer that match the GT.
+    For OBB: pass angle_map (B, 1, H, W) and gt_bbox_px_5 (num_gt, 5) xywhr for rotated IoU.
     Returns list of: (y, x, patch, reg, cls, pad_mask, iou, gt_idx)
-    where gt_idx indicates which GT bbox each result corresponds to.
     """
     B, C, H, W = feat.shape
-    # Pad and unfold to get 5x5 patches: (1, C, H, W, 25) -> (H*W, C*25)
     feat_padded = F.pad(feat, (2, 2, 2, 2))
     patches = feat_padded.unfold(2, 5, 1).unfold(3, 5, 1)
-    patches_flat = patches.permute(0, 2, 3, 1, 4, 5).reshape(H * W, -1) # [H*W, C*25]
+    patches_flat = patches.permute(0, 2, 3, 1, 4, 5).reshape(H * W, -1)
 
-    # Create unpadded region mask
     unpadded_mask = F.pad(torch.ones([feat.shape[0], 1, *feat.shape[2:4]], dtype=torch.float32, device=feat_padded.device), (2, 2, 2, 2))
     unpadded_mask = unpadded_mask.unfold(2, 5, 1).unfold(3, 5, 1)
-    unpadded_mask = unpadded_mask.permute(0, 2, 3, 1, 4, 5).reshape(H * W, -1) # [H*W, 25]
+    unpadded_mask = unpadded_mask.permute(0, 2, 3, 1, 4, 5).reshape(H * W, -1)
 
-    # Flatten maps for vectorized operations
-    bbox_pred_px = bbox_map_px.permute(0, 2, 3, 1).reshape(H * W, 4) # xywh, [H*W, 4]
-    cls_flat = cls_map.permute(0, 2, 3, 1).reshape(H * W, -1) # [H*W, num_cls]
-    reg_flat = reg_map.permute(0, 2, 3, 1).reshape(H * W, -1) # [H*W, 4*reg_max]
-    
-    # Filter 1: Valid dimensions
-    valid_mask = (bbox_pred_px[:, 2] > 0) & (bbox_pred_px[:, 3] > 0) # [H*W]
-    
-    # Filter 2: IOU with GT
-    # gt_bbox_px: [num_gt, 4]
-    ious = bbox_iou(gt_bbox_px.unsqueeze(1), bbox_pred_px.unsqueeze(0), xywh=True)
-    ious = torch.nan_to_num(ious).clamp(0, 1).squeeze(-1) # [num_gt, H*W]
+    bbox_pred_px = bbox_map_px.permute(0, 2, 3, 1).reshape(H * W, 4)  # xywh [H*W, 4]
+    cls_flat = cls_map.permute(0, 2, 3, 1).reshape(H * W, -1)
+    reg_flat = reg_map.permute(0, 2, 3, 1).reshape(H * W, -1)
+
+    valid_mask = (bbox_pred_px[:, 2] > 0) & (bbox_pred_px[:, 3] > 0)
+
+    # IoU with GT: use rotated IoU (batch_probiou) when angle_map and gt_bbox_px_5 are provided (OBB)
+    if angle_map is not None and gt_bbox_px_5 is not None:
+        angle_flat = angle_map.permute(0, 2, 3, 1).reshape(H * W, 1)  # [H*W, 1]
+        pred_xywhr = torch.cat([bbox_pred_px, angle_flat], dim=1)  # [H*W, 5]
+        ious = batch_probiou(gt_bbox_px_5, pred_xywhr)  # [num_gt, H*W]
+        ious = torch.nan_to_num(ious).clamp(0, 1)
+    else:
+        ious = bbox_iou(gt_bbox_px.unsqueeze(1), bbox_pred_px.unsqueeze(0), xywh=True)
+        ious = torch.nan_to_num(ious).clamp(0, 1).squeeze(-1)  # [num_gt, H*W]
     
     # Filter 3: Correct Classification
     conf, cls_preds = cls_flat.sigmoid().max(dim=1)  # [H*W], [H*W]
@@ -512,26 +529,27 @@ def generate_prototypes(args):
         # Inference (triggers hooks)
         model.model(img_tensor)
         
-        # Parse Outputs
-        # decoded_preds: (B, 4+nc, sum(HW))
-        # raw_preds: list of (B, reg_max*4+nc, H, W)
-        decoded_preds, raw_preds = captured_outputs
-        
-        # Split decoded bboxes back to layers
+        # Parse Outputs (support both Detect and OBB head)
+        decoded_preds, raw_preds = _unpack_head_output(detect, captured_outputs)
+        is_obb = isinstance(detect, OBB)
+        # Detect: decoded_preds (B, 4+nc, sum(HW)); OBB: (B, 4+nc+1, sum(HW)) with angle in last channel
         bbox_maps_px = []
+        angle_maps = []  # OBB only: list of (B, 1, H, W) per layer
         start = 0
         HWs = []
         for lid, raw in enumerate(raw_preds):
             B, _, H, W = raw.shape
-            # decoded_preds contains xywh
-            bbox_layer = decoded_preds[:, :4, start:start + H*W].view(B, 4, H, W)
-            if is_xyxy: # All bbox should be converted to xywh format
+            bbox_layer = decoded_preds[:, :4, start:start + H * W].view(B, 4, H, W)
+            if is_xyxy:
                 bbox_layer_xyxy = bbox_layer.clone()
-                bbox_layer[:,[0,1],:] = ( bbox_layer_xyxy[:,[0,1],:]+bbox_layer_xyxy[:,[2,3],:]) / 2
-                bbox_layer[:,[2,3],:] = (-bbox_layer_xyxy[:,[0,1],:]+bbox_layer_xyxy[:,[2,3],:]) / 2
-            if bbox_layer.max() < 2: # All bbox should be unnormalized
+                bbox_layer[:, [0, 1], :] = (bbox_layer_xyxy[:, [0, 1], :] + bbox_layer_xyxy[:, [2, 3], :]) / 2
+                bbox_layer[:, [2, 3], :] = (-bbox_layer_xyxy[:, [0, 1], :] + bbox_layer_xyxy[:, [2, 3], :]) / 2
+            if bbox_layer.max() < 2:
                 bbox_layer *= args.imgsz
             bbox_maps_px.append(bbox_layer)
+            if is_obb:
+                angle_layer = decoded_preds[:, -1:, start:start + H * W].view(B, 1, H, W)
+                angle_maps.append(angle_layer)
             start += H * W
             HWs.append((H, W))
 
@@ -544,26 +562,50 @@ def generate_prototypes(args):
             continue
         
         # Use the class map dict to map class id to model's output order
+        # OBB labels: class_id + (cx,cy,w,h,angle) xywhr or class_id + 8 corners; detection: class_id + xywh
         gt_cls_batch = []
         gt_bbox_norm = []
         for x in gt_lines:
-            if int(x[0]) in class_id_map.keys():
+            if int(x[0]) not in class_id_map.keys():
+                continue
+            vals = [float(v) for v in x[1:]]
+            if len(vals) >= 4:
+                if len(vals) >= 8:
+                    xs, ys = vals[0::2], vals[1::2]
+                    x_min, x_max = min(xs), max(xs)
+                    y_min, y_max = min(ys), max(ys)
+                    cx = (x_min + x_max) / 2
+                    cy = (y_min + y_max) / 2
+                    w, h = x_max - x_min, y_max - y_min
+                    gt_bbox_norm.append([cx, cy, w, h])
+                elif is_obb and len(vals) >= 5:
+                    gt_bbox_norm.append(vals[:5])  # xywhr for OBB
+                else:
+                    gt_bbox_norm.append(vals[:4])
                 gt_cls_batch.append(class_id_map[int(x[0])])
-                gt_bbox_norm.append([float(v) for v in x[1:]])
+        if not gt_cls_batch:
+            continue
         gt_cls_batch = torch.tensor(gt_cls_batch, device=device)
         gt_bbox_norm = torch.tensor(gt_bbox_norm, device=device)
         gt_bbox_px = gt_bbox_norm.clone()
-        gt_bbox_px *= args.imgsz
+        if is_obb and gt_bbox_px.shape[1] == 5:
+            gt_bbox_px[:, :4] *= args.imgsz  # scale xywh only; angle (rad) unchanged
+        else:
+            gt_bbox_px *= args.imgsz
 
         # Collect Prototypes
         for layer_idx, (feat, raw_pred, bbox_map_px) in enumerate(zip(captured_inputs, raw_preds, bbox_maps_px)):
             reg_map = raw_pred[:, :detect.reg_max * 4]
             cls_map = raw_pred[:, detect.reg_max * 4:]
-            
+            angle_map = angle_maps[layer_idx] if is_obb else None
+            gt_bbox_px_5 = gt_bbox_px if (is_obb and gt_bbox_px.shape[1] == 5) else None
             pos_result = extract_pos_patches_from_layer(
-                feat, bbox_map_px, cls_map, reg_map, 
-                gt_bbox_px, gt_cls_batch,
-                args.pos_conf_threshold, args.iou_threshold
+                feat, bbox_map_px, cls_map, reg_map,
+                gt_bbox_px[:, :4] if gt_bbox_px_5 is not None else gt_bbox_px,
+                gt_cls_batch,
+                args.pos_conf_threshold, args.iou_threshold,
+                angle_map=angle_map,
+                gt_bbox_px_5=gt_bbox_px_5,
             )
 
             neg_result = extract_neg_patches_from_layer(

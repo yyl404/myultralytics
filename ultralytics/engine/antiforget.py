@@ -31,22 +31,83 @@ from ultralytics.utils.torch_utils import (
 
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.ops import xyxy2xywhn, xywh2xyxy
-from ultralytics.utils.metrics import bbox_iou
+from ultralytics.utils.metrics import bbox_iou, batch_probiou
 # from ultralytics.engine.distillation import (
 #     KDLoss,
 # )
-from ultralytics.engine.ewpr import (
-    EWPRLoss,
-    find_elbow_point,
+from ultralytics.engine.espreg import (
+    EWPRegLoss,
 )
 from ultralytics.engine.ewc import EWCLoss
 from ultralytics.engine.nsgp import NSGP
-from ultralytics.nn.modules.head import Detect
+from ultralytics.nn.modules.head import Detect, OBB
+
+
+def _get_detect_head(model):
+    """Return the detection head module (Detect or OBB)."""
+    head = model.model[-1]
+    if isinstance(head, (Detect, OBB)):
+        return head
+    raise TypeError(f"Unsupported head type: {type(head)}")
+
+
+def _head_raw_output_to_list(head, raw_output, img_h, img_w):
+    """Convert head raw output to list of detections per image for merging.
+    Detect: list of (num_boxes, 6) [xywhn, conf, cls].
+    OBB: list of (num_boxes, 7) [xywhn, conf, cls, angle] with rotated NMS and angle preserved.
+    """
+    if isinstance(head, OBB):
+        # OBB: pass full (4+nc+1) for rotated NMS; keep angle in output
+        decoded_cat = raw_output[0]  # (bs, 4+nc+ne, num_anchors)
+        prediction = decoded_cat if decoded_cat.dim() == 3 else decoded_cat.unsqueeze(0)
+        pred = non_max_suppression(
+            prediction=prediction,
+            conf_thres=0.25,
+            iou_thres=0.45,
+            max_det=head.max_det,
+            nc=head.nc,
+            rotated=True,
+        )
+        # pred: list of (num_boxes, 7) [xywh_px, conf, cls, angle_rad]; convert xywh to xywhn
+        out = []
+        for p in pred:
+            if len(p) > 0:
+                xywh_px = p[:, :4].clone()
+                xywh_px[:, 0] /= img_w
+                xywh_px[:, 1] /= img_h
+                xywh_px[:, 2] /= img_w
+                xywh_px[:, 3] /= img_h
+                pred_7 = torch.cat([xywh_px, p[:, 4:]], dim=1)  # [xywhn, conf, cls, angle]
+                out.append(pred_7)
+            else:
+                out.append(torch.empty((0, 7), device=decoded_cat.device, dtype=decoded_cat.dtype))
+        return out
+    # Detect: (decoded, raw); NMS returns xyxy then we convert to xywhn
+    decoded, _ = raw_output
+    prediction = decoded if decoded.dim() == 3 else decoded[0]
+    pred = non_max_suppression(
+        prediction=prediction,
+        conf_thres=0.25,
+        iou_thres=0.45,
+        max_det=head.max_det,
+        nc=head.nc,
+    )
+    base_model_pred_xywh = []
+    for p in pred:
+        if len(p) > 0:
+            boxes_xyxy = p[:, :4]
+            boxes_xywhn = xyxy2xywhn(boxes_xyxy, w=img_w, h=img_h)
+            pred_xywh = torch.cat([boxes_xywhn, p[:, 4:]], dim=1)
+            base_model_pred_xywh.append(pred_xywh)
+        else:
+            base_model_pred_xywh.append(p)
+    return base_model_pred_xywh
 
 
 def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device):
     """
     Generate pseudo labels from base model and merge with GT labels, filtering by IoU.
+    Supports both Detect (axis-aligned) and OBB (oriented) heads.
     
     Args:
         batch: Dict with keys 'img' (B, C, H, W), 'bboxes' (N, 4), 'cls' (N, 1), 'batch_idx' (N,)
@@ -58,96 +119,78 @@ def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device)
         Modified batch dict with merged labels
     """
     base_model_pred = base_model(batch['img'].to(device))
-    if not isinstance(base_model.model[-1], Detect):
-        raise TypeError(f"Unsupported base_model[-1] type: {type(base_model.model[-1])}")
-    
-    detect = base_model.model[-1]
-    # base_model_pred[0]: (batch_size, 4 + nc, num_anchors)
-    base_model_pred = non_max_suppression(
-        prediction=base_model_pred[0],
-        conf_thres=0.25,
-        iou_thres=0.45,
-        max_det=detect.max_det,
-        nc=detect.nc
-    )
-    # base_model_pred: list of (num_boxes, 6) [x1, y1, x2, y2, confidence, class]
-    
+    head = _get_detect_head(base_model)
     img_h, img_w = batch['img'].shape[-2:]
-    base_model_pred_xywh = []
-    for pred in base_model_pred:
-        if len(pred) > 0:
-            boxes_xyxy = pred[:, :4]  # (num_boxes, 4)
-            boxes_xywhn = xyxy2xywhn(boxes_xyxy, w=img_w, h=img_h)  # (num_boxes, 4)
-            pred_xywh = torch.cat([boxes_xywhn, pred[:, 4:]], dim=1)  # (num_boxes, 6)
-            base_model_pred_xywh.append(pred_xywh)
-        else:
-            base_model_pred_xywh.append(pred)
-    base_model_pred = base_model_pred_xywh
-    # base_model_pred: list of (num_boxes, 6) [x_center, y_center, width, height, confidence, class]
-    
+    base_model_pred = _head_raw_output_to_list(head, base_model_pred, img_h, img_w)
+    is_obb = isinstance(head, OBB)
+    # Detect: list of (num_boxes, 6) [xywhn, conf, cls]. OBB: list of (num_boxes, 7) [xywhn, conf, cls, angle].
+
     batch_size = batch['img'].shape[0]
-    gt_bboxes = batch['bboxes']  # (N, 4)
+    gt_bboxes = batch['bboxes']  # (N, 4) or (N, 5) for OBB xywhr
     gt_cls = batch['cls']  # (N, 1)
     gt_batch_idx = batch['batch_idx']  # (N,)
-    
+    n_bbox_cols = gt_bboxes.shape[1]  # 4 or 5
+    merged_cols = 4 + 1 + 1 if not is_obb else 5 + 1 + 1  # bbox_cols + conf + cls
+
     merged_labels = []
     for img_idx in range(batch_size):
         gt_mask = (gt_batch_idx == img_idx)
         if gt_mask.any():
-            gt_boxes_img = gt_bboxes[gt_mask]  # (num_gt, 4)
+            gt_boxes_img = gt_bboxes[gt_mask]  # (num_gt, 4) or (num_gt, 5)
             gt_cls_img = gt_cls[gt_mask]  # (num_gt, 1)
         else:
-            gt_boxes_img = torch.empty((0, 4), device=gt_bboxes.device)
+            gt_boxes_img = torch.empty((0, n_bbox_cols), device=gt_bboxes.device)
             gt_cls_img = torch.empty((0, 1), device=gt_cls.device, dtype=torch.long)
-        
-        pseudo_labels_img = base_model_pred[img_idx]  # (num_pseudo, 6)
-        
+
+        pseudo_labels_img = base_model_pred[img_idx]  # (num_pseudo, 6) or (num_pseudo, 7)
+
         if len(pseudo_labels_img) > 0 and len(gt_boxes_img) > 0:
-            pseudo_boxes_xywh = pseudo_labels_img[:, :4]  # (num_pseudo, 4)
-            pseudo_boxes_xyxy = xywh2xyxy(pseudo_boxes_xywh)  # (num_pseudo, 4)
-            gt_boxes_xyxy = xywh2xyxy(gt_boxes_img)  # (num_gt, 4)
-            
-            pseudo_expanded = pseudo_boxes_xyxy.unsqueeze(1)  # (num_pseudo, 1, 4)
-            gt_expanded = gt_boxes_xyxy.unsqueeze(0)  # (1, num_gt, 4)
-            iou_matrix = bbox_iou(pseudo_expanded, gt_expanded, xywh=False).squeeze(-1)  # (num_pseudo, num_gt)
-            
-            max_iou_per_pseudo = iou_matrix.max(dim=1)[0]  # (num_pseudo,)
+            if is_obb:
+                # OBB: use rotated IoU (batch_probiou) with xywhr format
+                pseudo_xywhr = pseudo_labels_img[:, [0, 1, 2, 3, 6]]  # (num_pseudo, 5)
+                iou_matrix = batch_probiou(gt_boxes_img, pseudo_xywhr)  # (num_gt, num_pseudo)
+                max_iou_per_pseudo = iou_matrix.max(dim=0)[0]  # (num_pseudo,)
+            else:
+                pseudo_boxes_xywh = pseudo_labels_img[:, :4]
+                pseudo_boxes_xyxy = xywh2xyxy(pseudo_boxes_xywh)
+                gt_boxes_xyxy = xywh2xyxy(gt_boxes_img)
+                iou_matrix = bbox_iou(pseudo_boxes_xyxy.unsqueeze(1), gt_boxes_xyxy.unsqueeze(0), xywh=False).squeeze(-1)
+                max_iou_per_pseudo = iou_matrix.max(dim=1)[0]
             keep_mask = max_iou_per_pseudo < filter_iou_threshold
             filtered_pseudo = pseudo_labels_img[keep_mask]
         else:
             filtered_pseudo = pseudo_labels_img
-        
+
         if len(gt_boxes_img) > 0:
             gt_labels = torch.cat([
-                gt_boxes_img,  # (num_gt, 4)
-                torch.ones((len(gt_boxes_img), 1), device=gt_boxes_img.device),  # (num_gt, 1)
-                gt_cls_img  # (num_gt, 1)
-            ], dim=1)  # (num_gt, 6)
+                gt_boxes_img,
+                torch.ones((len(gt_boxes_img), 1), device=gt_boxes_img.device),
+                gt_cls_img
+            ], dim=1)  # (num_gt, 6) or (num_gt, 7)
         else:
-            gt_labels = torch.empty((0, 6), device=filtered_pseudo.device if len(filtered_pseudo) > 0 else batch['img'].device)
-        
+            gt_labels = torch.empty((0, merged_cols), device=filtered_pseudo.device if len(filtered_pseudo) > 0 else batch['img'].device)
+
         if len(filtered_pseudo) > 0:
             merged = torch.cat([gt_labels, filtered_pseudo], dim=0) if len(gt_labels) > 0 else filtered_pseudo
         else:
             merged = gt_labels
-        
         merged_labels.append(merged)
-    
+
     all_bboxes = []
     all_cls = []
     all_batch_idx = []
     for img_idx, merged in enumerate(merged_labels):
         if len(merged) > 0:
-            all_bboxes.append(merged[:, :4])  # (num_labels, 4)
-            all_cls.append(merged[:, 5].long().unsqueeze(-1))  # (num_labels, 1)
+            all_bboxes.append(merged[:, :n_bbox_cols])
+            all_cls.append(merged[:, n_bbox_cols + 1].long().unsqueeze(-1))  # cls column
             all_batch_idx.append(torch.full((len(merged),), img_idx, device=merged.device))
-    
+
     if len(all_bboxes) > 0:
-        batch['bboxes'] = torch.cat(all_bboxes, dim=0)  # (N, 4)
-        batch['cls'] = torch.cat(all_cls, dim=0)  # (N, 1)
-        batch['batch_idx'] = torch.cat(all_batch_idx, dim=0)  # (N)
+        batch['bboxes'] = torch.cat(all_bboxes, dim=0)
+        batch['cls'] = torch.cat(all_cls, dim=0)
+        batch['batch_idx'] = torch.cat(all_batch_idx, dim=0)
     else:
-        batch['bboxes'] = torch.empty((0, 4), device=batch['img'].device)
+        batch['bboxes'] = torch.empty((0, n_bbox_cols), device=batch['img'].device)
         batch['cls'] = torch.empty((0, 1), device=batch['img'].device, dtype=torch.long)
         batch['batch_idx'] = torch.empty((0), device=batch['img'].device, dtype=torch.long)
     
@@ -185,9 +228,9 @@ class AntiForgetTrainer(BaseTrainer):
             self.ewc_loss = EWCLoss(self.model, self.base_model, importance=self.ewc_importance)
         # ============================== END: set up EWC loss =================================================
 
-        # ============================== MODIFIED: set up EWPR loss ============================================
-        if self.args.ewpr:
-            self.ewpr_loss_weight = self.args.ewpr_loss_weight
+        # ============================== MODIFIED: set up ESPReg loss ============================================
+        if self.args.espreg:
+            self.espreg_loss_weight = self.args.espreg_loss_weight
             components, eigen_values = {}, {}
             self.pca_cache = joblib.load(self.args.pca_cache_path)
             for name in self.pca_cache.keys():
@@ -197,14 +240,14 @@ class AntiForgetTrainer(BaseTrainer):
                     _components.append(self.pca_cache[name][ig].components_)
                     _eigen_values.append(self.pca_cache[name][ig].explained_variance_)
                 components[name], eigen_values[name] = torch.stack(_components), torch.stack(_eigen_values)
-            self.ewpr_loss = EWPRLoss(self.model, self.base_model, module_names=self.pca_cache.keys(),
-                                      components=components, eigen_values=eigen_values)
-        # ============================== END: set up EWPR loss =================================================
+            self.espreg_loss = EWPRegLoss(self.model, self.base_model, module_names=self.pca_cache.keys(),
+                                         components=components, eigen_values=eigen_values)
+        # ============================== END: set up ESPReg loss =================================================
 
         # ============================== MODIFIED: set up NSGP ============================================
         if self.args.nsgp:
             components, eigen_values = {}, {}
-            # Reuse pca_cache if already loaded for EWPR, otherwise load it
+            # Reuse pca_cache if already loaded for ESPReg, otherwise load it
             if hasattr(self, 'pca_cache'):
                 pca_cache_nsgp = self.pca_cache
             else:
@@ -385,15 +428,6 @@ class AntiForgetTrainer(BaseTrainer):
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
                 self.scheduler.step()
 
-            # ============================== MODIFIED: save model params at epoch start for null space debug ====================
-            if self.args.nsgp:
-                model_to_use = self.model.module if hasattr(self.model, 'module') else self.model
-                self.epoch_start_params = {}
-                for name, param in model_to_use.named_parameters():
-                    if param.requires_grad:
-                        self.epoch_start_params[name] = param.detach().clone()
-            # ============================== END: save model params at epoch start ==========================================
-
             self._model_train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
@@ -409,12 +443,12 @@ class AntiForgetTrainer(BaseTrainer):
             self.tloss = None
 
             # ============================== MODIFIED: register hook ===========================================
-            if self.args.ewpr:
-                self.ewpr_loss.register_hook()
+            if self.args.espreg:
+                self.espreg_loss.register_hook()
             if self.args.ewc:
                 self.ewc_loss.register_hook()
             
-            if self.args.ewpr or self.args.ewc:
+            if self.args.espreg or self.args.ewc:
                 # Perform a forward in base model to hook out the base weights
                 with torch.no_grad():
                     _ = self.base_model(torch.randn(1, 3, 640, 640).to(self.device))
@@ -453,12 +487,12 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== END: make a copy of loss items ====================================
                     self.loss = loss.sum()
 
-                    # ============================== MODIFIED: calculate EWPR loss ===================================
-                    if self.args.ewpr:
-                        _ewpr_loss = self.ewpr_loss.get_loss()
-                        self.loss += (_ewpr_loss*self.ewpr_loss_weight)
-                        loss_items = torch.cat([loss_items, torch.tensor([_ewpr_loss], device=loss_items.device)])
-                    # ============================== END: calculate EWPR loss ========================================
+                    # ============================== MODIFIED: calculate ESPReg loss ===================================
+                    if self.args.espreg:
+                        _espreg_loss = self.espreg_loss.get_loss()
+                        self.loss += (_espreg_loss * self.espreg_loss_weight)
+                        loss_items = torch.cat([loss_items, torch.tensor([_espreg_loss], device=loss_items.device)])
+                    # ============================== END: calculate ESPReg loss ========================================
 
                     # ============================== MODIFIED: calculate EWC loss ===================================
                     if self.args.ewc:
@@ -537,38 +571,9 @@ class AntiForgetTrainer(BaseTrainer):
 
                 self.run_callbacks("on_train_batch_end")
 
-            # ============================== MODIFIED: compute cosine similarity with null space for epoch update ====================
-            if self.args.nsgp and hasattr(self, 'epoch_start_params'):
-                model_to_use = self.model.module if hasattr(self.model, 'module') else self.model
-                cos_sim_epoch_update_ns = 0.
-                num_param_conv = 0
-                for name, module in model_to_use.named_modules():
-                    if name in self.nsgp_operator.module_names and isinstance(module, nn.Conv2d):
-                        weight = module.weight.data.detach().clone()
-                        param_name = name + '.weight'
-                        if param_name not in self.epoch_start_params:
-                            continue
-                        weight_before = self.epoch_start_params[param_name]
-                        c_out, c_in, k_h, k_w = weight.shape
-                        g = module.groups
-                        weight = weight.reshape(g, c_out // g, c_in // g, k_h * k_w).reshape(g, c_out // g, -1)  # [g, c_out//g, c_in//g*k*k]
-                        weight_before = weight_before.reshape(g, c_out // g, c_in // g, k_h * k_w).reshape(g, c_out // g, -1)  # [g, c_out//g, c_in//g*k*k]
-                        weight_delta = weight - weight_before
-                        projection_components = self.nsgp_operator.projection_masks[name]
-                        for i in range(g):
-                            pre_elbow_comp = projection_components[i]  # [c_in//g*k*k, num_pre_elbow]
-                            pre_elbow_comp = pre_elbow_comp.to(weight.device, weight.dtype)
-                            weight_delta_projected = weight_delta[i] - weight_delta[i] @ pre_elbow_comp @ pre_elbow_comp.T  # [c_out//g, c_in//g*k*k]
-                            cos_sim_epoch_update_ns += ((weight_delta[i] * weight_delta_projected).sum(dim=1) / (weight_delta[i].norm(dim=1) * weight_delta_projected.norm(dim=1) + 1e-8)).sum()  # [c_out//g]
-                            num_param_conv += weight_delta_projected.shape[0]
-                if num_param_conv > 0:
-                    cos_sim_epoch_update_ns /= num_param_conv + 1e-6
-                    LOGGER.info(f"{colorstr('Epoch')} {epoch}: {colorstr('cos_sim_epoch_update_nullspace:')} {cos_sim_epoch_update_ns.item():.6f}, {colorstr('num_param_conv:')} {num_param_conv}")
-            # ============================== END: compute cosine similarity with null space for epoch update ========================
-
             # ============================== MODIFIED: remove hook ===========================================
-            if self.args.ewpr:
-                self.ewpr_loss.remove_handle_() # Remove hook for EWPRLoss
+            if self.args.espreg:
+                self.espreg_loss.remove_handle_()  # Remove hook for ESPReg
             # if self.args.kd:
             #     self.kd_loss.remove_handle_() # Remove hook for KD loss
             # ============================== END: remove hook ================================================
@@ -874,49 +879,7 @@ class AntiForgetTrainer(BaseTrainer):
             params_dict = {name: param for name, param in model_to_use.named_parameters()}
             self.nsgp_operator.apply_projection(params_dict, self.nsgp_flexibility)
         # ============================== END: apply NSGP gradient projection ========================
-        # model_to_use = self.model.module if hasattr(self.model, 'module') else self.model
-        # param_before = {}
-        # param_grad = {}
-        # for name, param in model_to_use.named_parameters():
-        #     if param.requires_grad and param.grad is not None:
-        #         param_before[name] = param.detach().clone()
-        #         param_grad[name] = param.grad.detach().clone()
         self.scaler.step(self.optimizer)
-        # cos_sim_update_grad = 0.
-        # num_param = 0
-        # for name, param in model_to_use.named_parameters():
-        #     if name in param_before:
-        #         param_update = param.detach().clone() - param_before[name]
-        #         neg_grad = - param_grad[name]
-        #         cos_sim_update_grad += torch.nn.functional.cosine_similarity(param_update.flatten().unsqueeze(0), 
-        #                                                                      neg_grad.flatten().unsqueeze(0))
-        #         num_param += 1
-        # cos_sim_update_grad /= num_param + 1e-6
-
-        # if self.args.nsgp:
-        #     cos_sim_update_ns = 0.
-        #     num_param_conv = 0
-        #     for name, module in model_to_use.named_modules():
-        #         if name in self.nsgp_operator.module_names and isinstance(module, nn.Conv2d):
-        #             weight = module.weight.data.detach().clone()
-        #             weight_before = param_before[name+'.weight']
-        #             c_out, c_in, k_h, k_w = weight.shape
-        #             g = module.groups
-        #             weight = weight.reshape(g, c_out // g, c_in // g, k_h * k_w).reshape(g, c_out // g, -1)  # [g, c_out//g, c_in//g*k*k]
-        #             weight_before = weight_before.reshape(g, c_out // g, c_in // g, k_h * k_w).reshape(g, c_out // g, -1)  # [g, c_out//g, c_in//g*k*k]
-        #             weight_delta = weight - weight_before
-        #             projection_components = self.nsgp_operator.projection_masks[name]
-        #             for i in range(g):
-        #                 pre_elbow_comp = projection_components[i]  # [c_in//g*k*k, num_pre_elbow]
-        #                 pre_elbow_comp = pre_elbow_comp.to(weight.device, weight.dtype)
-        #                 weight_delta_projected = weight_delta[i] - weight_delta[i] @  pre_elbow_comp @ pre_elbow_comp.T # [c_out//g, c_in//g*k*k]
-        #                 cos_sim_update_ns += ((weight_delta[i] * weight_delta_projected).sum(dim=1) / (weight_delta[i].norm(dim=1)*weight_delta_projected.norm(dim=1))).sum() # [c_out//g]
-        #                 num_param_conv += weight_delta_projected.shape[0]
-        #     cos_sim_update_ns /= num_param_conv + 1e-6
-
-        # LOGGER.info(f"{colorstr('cos_sim_update_grad:')} {cos_sim_update_grad.item():.6f}, {colorstr('num_param:')} {num_param}")
-        # if self.args.nsgp:
-        #     LOGGER.info(f"{colorstr('cos_sim_update_nullspace:')} {cos_sim_update_ns.item():.6f}, {colorstr('num_param_conv:')} {num_param_conv}")
         self.scaler.update()
         self.optimizer.zero_grad()
         if self.ema:

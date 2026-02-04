@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-OUTPUT_DIR="${1:-runs/yolov8l_4-domain_pretrained-yoloe_vspreg}"  # Default value if not specified
+OUTPUT_DIR="${1:-runs/yolov8l_4-domain_pretrained-yoloe_espreg}"  # Default value if not specified
 DEVICE=0
 
 # Start from which task (1-based index, set to 1 to start from beginning)

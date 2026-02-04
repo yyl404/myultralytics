@@ -144,15 +144,15 @@ ewc: False
 ewc_loss_weight: 1.0
 importance_path: None
 
-# ewpr settings ----------------------------------------------------------------------------------------------------
-ewpr: False # (bool) whether to use EWPR
-ewpr_loss_weight: 1.0 # (float) the contribution weight of ewpr loss in total loss
+# ESPReg (Eigen-value Scaled Projection Regularization) settings -----------------------------------------------
+espreg: False # (bool) whether to use ESPReg
+espreg_loss_weight: 1.0 # (float) the contribution weight of ESPReg loss in total loss
 pca_cache_path: None # (str, optional)
 
 # NSGP settings ----------------------------------------------------------------------------------------------------
 nsgp: False # (bool) whether to use Null Space Gradient Projection
 nsgp_flexibility: 1.0 # (float) weight for the projected component when subtracting from original gradient
-# Note: NSGP uses pca_cache_path from EWPR settings above
+# Note: NSGP uses pca_cache_path from ESPReg settings above
 
 # prototype replay settings
 proto_rp: False

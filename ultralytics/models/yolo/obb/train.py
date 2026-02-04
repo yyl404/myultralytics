@@ -77,3 +77,42 @@ class OBBTrainer(yolo.detect.DetectionTrainer):
         return yolo.obb.OBBValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
+
+
+class AntiForgetOBBTrainer(yolo.detect.AntiForgetDetectionTrainer):
+    """Anti-forgetting trainer for OBB (Oriented Bounding Box) detection.
+
+    Extends AntiForgetDetectionTrainer with OBB-specific model and validator.
+    """
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
+        if overrides is None:
+            overrides = {}
+        overrides["task"] = "obb"
+        super().__init__(cfg, overrides, _callbacks)
+
+    def get_model(
+        self, cfg: str | dict | None = None, weights: str | Path | None = None, verbose: bool = True
+    ) -> OBBModel:
+        model = OBBModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        if weights:
+            model.load(weights)
+        return model
+
+    def get_validator(self):
+        self.loss_names = ["box_loss", "cls_loss", "dfl_loss"]
+        if self.args.espreg:
+            self.loss_names.append("espreg_loss")
+        if self.args.ewc:
+            self.loss_names.append("ewc_loss")
+        if self.args.kd:
+            self.loss_names.append("kd_loss")
+        if self.args.proto_rp:
+            if self.args.proto_use_neg:
+                self.loss_names.extend(["cls_loss_pr", "reg_loss_pr", "cls_pr_neg"])
+            else:
+                self.loss_names.extend(["cls_loss_pr", "reg_loss_pr"])
+        self.loss_names = tuple(self.loss_names)
+        return yolo.obb.OBBValidator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )

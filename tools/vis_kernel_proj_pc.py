@@ -125,8 +125,8 @@ def main(args):
                 ax.axvline(x=elbow_idx, color='red', linestyle='--', linewidth=2, 
                           label=f'Elbow point (index {elbow_idx}, {elbow_percentage:.2f}%)')
                 ax.text(elbow_idx, ax.get_ylim()[1] * 0.95, f'{elbow_percentage:.2f}%', 
-                       rotation=90, verticalalignment='top',
-                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                       rotation=0, horizontalalignment='center', verticalalignment='top', fontsize=25,
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.9))
                 
                 ax2 = ax.twinx()
                 ax2.plot(x_indices, proj_mean.cpu().numpy(), 'g-', linewidth=2, label='Projection mean')
@@ -135,19 +135,21 @@ def main(args):
                                 (proj_mean + proj_std).cpu().numpy(),
                                 alpha=0.3, color='green', label='±1 std')
                 
-                ax.set_xlabel('Principal Component Index', fontsize=12)
-                ax.set_ylabel('Variance', fontsize=12, color='blue')
-                ax2.set_ylabel('Projection Magnitude', fontsize=12, color='green')
-                ax.tick_params(axis='y', labelcolor='blue')
-                ax2.tick_params(axis='y', labelcolor='green')
+                ax.set_xlabel('Principal Component Index', fontsize=25, labelpad=15)
+                ax.set_ylabel('Eigenvalue', fontsize=25, color='blue', labelpad=15)
+                ax2.set_ylabel('Projection Magnitude', fontsize=25, color='green', labelpad=15)
+                ax.tick_params(axis='x', labelsize=25)
+                ax.tick_params(axis='y', labelsize=25, labelcolor='blue')
+                ax2.tick_params(axis='y', labelsize=25, labelcolor='green')
                 
                 safe_name = name.replace('.', '_').replace('/', '_')
-                ax.set_title(f'Layer: {name}, Group: {ig}\nVariance Distribution with Projection Magnitude', 
-                           fontsize=14, fontweight='bold')
+                ax.set_title(f'Layer: {name}, Group: {ig}\nEigenvalue Distribution with Projection Magnitude', 
+                           fontsize=25, fontweight='bold')
                 
                 lines1, labels1 = ax.get_legend_handles_labels()
                 lines2, labels2 = ax2.get_legend_handles_labels()
-                ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+                ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=25, 
+                         framealpha=0.9)
                 plt.tight_layout()
                 
                 save_path = os.path.join(args.save_dir, f'{safe_name}_group_{ig}.png')
