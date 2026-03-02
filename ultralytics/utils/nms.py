@@ -27,11 +27,10 @@ def non_max_suppression(
     end2end: bool = False,
     return_idxs: bool = False,
 ):
-    """
-    Perform non-maximum suppression (NMS) on prediction results.
+    """Perform non-maximum suppression (NMS) on prediction results.
 
-    Applies NMS to filter overlapping bounding boxes based on confidence and IoU thresholds. Supports multiple
-    detection formats including standard boxes, rotated boxes, and masks.
+    Applies NMS to filter overlapping bounding boxes based on confidence and IoU thresholds. Supports multiple detection
+    formats including standard boxes, rotated boxes, and masks.
 
     Args:
         prediction (torch.Tensor): Predictions with shape (batch_size, num_classes + 4 + num_masks, num_boxes)
@@ -52,8 +51,8 @@ def non_max_suppression(
         return_idxs (bool): Whether to return the indices of kept detections.
 
     Returns:
-        output (List[torch.Tensor]): List of detections per image with shape (num_boxes, 6 + num_masks)
-            containing (x1, y1, x2, y2, confidence, class, mask1, mask2, ...).
+        output (List[torch.Tensor]): List of detections per image with shape (num_boxes, 6 + num_masks) containing (x1,
+            y1, x2, y2, confidence, class, mask1, mask2, ...).
         keepi (List[torch.Tensor]): Indices of kept detections if return_idxs=True.
     """
     # Checks
@@ -168,8 +167,7 @@ def non_max_suppression(
 
 
 class TorchNMS:
-    """
-    Ultralytics custom NMS implementation optimized for YOLO.
+    """Ultralytics custom NMS implementation optimized for YOLO.
 
     This class provides static methods for performing non-maximum suppression (NMS) operations on bounding boxes,
     including both standard NMS and batched NMS for multi-class scenarios.
@@ -193,8 +191,7 @@ class TorchNMS:
         use_triu: bool = True,
         iou_func=box_iou,
     ) -> torch.Tensor:
-        """
-        Fast-NMS implementation from https://arxiv.org/pdf/1904.02689 using upper triangular matrix operations.
+        """Fast-NMS implementation from https://arxiv.org/pdf/1904.02689 using upper triangular matrix operations.
 
         Args:
             boxes (torch.Tensor): Bounding boxes with shape (N, 4) in xyxy format.
@@ -236,8 +233,7 @@ class TorchNMS:
 
     @staticmethod
     def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
-        """
-        Optimized NMS with early termination that matches torchvision behavior exactly.
+        """Optimized NMS with early termination that matches torchvision behavior exactly.
 
         Args:
             boxes (torch.Tensor): Bounding boxes with shape (N, 4) in xyxy format.
@@ -311,8 +307,7 @@ class TorchNMS:
         iou_threshold: float,
         use_fast_nms: bool = False,
     ) -> torch.Tensor:
-        """
-        Batched NMS for class-aware suppression.
+        """Batched NMS for class-aware suppression.
 
         Args:
             boxes (torch.Tensor): Bounding boxes with shape (N, 4) in xyxy format.
