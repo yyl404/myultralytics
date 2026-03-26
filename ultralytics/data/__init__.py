@@ -10,7 +10,6 @@ from .dataset import (
     YOLODataset,
     YOLOMultiModalDataset,
 )
-from .dataset_json import JSONAttributeDataset
 
 __all__ = (
     "BaseDataset",
@@ -24,5 +23,4 @@ __all__ = (
     "build_grounding",
     "build_yolo_dataset",
     "load_inference_source",
-    "JSONAttributeDataset"
 )
