@@ -5,6 +5,7 @@ import os
 import os.path as OSP
 import threading
 import time
+import shutil
 
 from torch import nn
 import torch.nn.functional as F
@@ -175,25 +176,77 @@ def convert_class_ids(label_lines, class_id_map, task="detect"):
     return converted_lines
 
 
-def convert_class_ids_from_dir(labels_dir, class_id_map, output_dir, task="detect"):
-    """Read all label files in a directory and convert class IDs.
+def convert_class_ids_from_dir(labels_dir, class_id_map, output_dir, task="detect", pbar=None):
+    """Read all .txt label files under labels_dir (recursively) and convert class IDs.
+
+    Nested layout under ``labels_dir`` is mirrored under ``output_dir`` (same relative paths).
 
     Args:
-        labels_dir: Directory containing .txt label files.
+        labels_dir: Root directory of YOLO-format ``*.txt`` labels (flat or nested).
         class_id_map: Dict mapping old class id -> new class id.
-        output_dir: Directory to write converted labels.
+        output_dir: Root directory to write converted labels (subdirs created as needed).
         task: "detect" for detection (xywh) labels, "obb" for OBB (xyxyxyxy) labels.
+        pbar: Optional progress bar with an ``update()`` method; incremented once per label file.
     """
-    for label_file in os.listdir(labels_dir):
-        if label_file.endswith(".txt"):
-            label_path = OSP.join(labels_dir, label_file)
+    labels_dir = OSP.abspath(labels_dir)
+    output_dir = OSP.abspath(output_dir)
+    for root, _, files in os.walk(labels_dir):
+        rel_root = OSP.relpath(root, labels_dir)
+        out_sub = output_dir if rel_root == "." else OSP.join(output_dir, rel_root)
+        for label_file in files:
+            if not label_file.endswith(".txt"):
+                continue
+            label_path = OSP.join(root, label_file)
+            os.makedirs(out_sub, exist_ok=True)
             with open(label_path, "r") as f:
                 lines = f.readlines()
             converted_lines = convert_class_ids(lines, class_id_map, task=task)
-
-            output_path = OSP.join(output_dir, label_file)
+            output_path = OSP.join(out_sub, label_file)
             with open(output_path, "w") as f:
                 f.writelines(converted_lines)
+            if pbar is not None:
+                pbar.update()
+
+
+def mirror_image_files(source_dir: str, dest_dir: str, pbar=None, *, no_use_link: bool) -> None:
+    """Mirror ``source_dir`` into ``dest_dir`` with the same subtree layout.
+
+    Each leaf file is either a symlink to the source file (default) or a full copy. We do **not**
+    symlink the whole ``source_dir`` as ``dest_dir``: Ultralytics resolves dataset image roots
+    with ``Path.resolve()``, which follows a **directory** symlink and makes ``img2label_paths()``
+    point at the source ``labels/`` tree instead of converted labels under ``output_dir``.
+
+    Args:
+        source_dir: Root of the image tree to mirror (walked recursively).
+        dest_dir: Root output directory; any existing path at this name is removed first.
+        pbar: Optional progress object with ``update()``; called once per mirrored file.
+        no_use_link: If True, copy each file with ``shutil.copy2``. If False, create a symlink with
+            ``os.symlink`` pointing at the absolute source path (saves disk space).
+    """
+    source_dir = OSP.abspath(source_dir)
+    if OSP.lexists(dest_dir):
+        if OSP.islink(dest_dir):
+            os.unlink(dest_dir)
+        elif OSP.isdir(dest_dir):
+            shutil.rmtree(dest_dir)
+        else:
+            os.remove(dest_dir)
+    for root, _, files in os.walk(source_dir):
+        rel = OSP.relpath(root, source_dir)
+        dest_sub = dest_dir if rel == "." else OSP.join(dest_dir, rel)
+        os.makedirs(dest_sub, exist_ok=True)
+        for name in files:
+            src = OSP.join(root, name)
+            dst = OSP.join(dest_sub, name)
+            # Replace existing file or symlink (lexists covers broken symlinks on some OSes).
+            if OSP.lexists(dst):
+                os.unlink(dst)
+            if no_use_link:
+                shutil.copy2(src, dst)
+            else:
+                os.symlink(OSP.abspath(src), dst)
+            if pbar is not None:
+                pbar.update()
 
 
 def merge_labels_from_dir(label_dirs, output_dir, class_id_maps=None, filter_iou_threshold=None):

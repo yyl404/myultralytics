@@ -9,13 +9,13 @@ EVAL_OUTPUT_DIR="${OUTPUT_DIR}/evaluation_results"
 DEVICE=0
 
 TASK_DATASETS=(
-    "data/VOC_15+5/task_1_cls_15/dataset.yaml"
-    "data/VOC_15+5/task_2_cls_5/dataset.yaml"
+    "data/VOC-TINY_15+5/task_1_cls_15/dataset.yaml"
+    "data/VOC-TINY_15+5/task_2_cls_5/dataset.yaml"
 )
 
 CUMULATIVE_DATASETS=(
-    "data/VOC_15+5/task_1_cls_15/dataset.yaml"
-    "data/VOC_15+5/task_1-2_cls_20/dataset.yaml"
+    "data/VOC-TINY_15+5/task_1_cls_15/dataset.yaml"
+    "data/VOC-TINY_15+5/task_1-2_cls_20/dataset.yaml"
 )
 
 NUM_TASKS=${#TASK_DATASETS[@]}

@@ -55,12 +55,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics import YOLO
+from ultralytics.nn.modules.head import CosineConv2d
 from ultralytics.utils import (
     LOGGER, YAML
 )
 
 from pca_on_gpu import IncrementalPCAonGPU as IncrementalPCA
 from utils import RealTimeMemoryMonitor
+
+
+def conv_meta(module):
+    if isinstance(module, nn.Conv2d):
+        return {
+            "kernel_size": module.kernel_size,
+            "stride": module.stride,
+            "padding": module.padding,
+            "groups": module.groups,
+            "dilation": module.dilation,
+            "in_channels": module.in_channels,
+            "out_channels": module.out_channels,
+        }
+    # CosineConv2d is a 1x1 dense classifier (no groups/dilation/padding by design).
+    return {
+        "kernel_size": (1, 1),
+        "stride": (1, 1),
+        "padding": (0, 0),
+        "groups": 1,
+        "dilation": (1, 1),
+        "in_channels": module.weight.shape[1],
+        "out_channels": module.weight.shape[0],
+    }
+
+
+def is_supported_conv_module(module):
+    return isinstance(module, (nn.Conv2d, CosineConv2d))
 
 
 class PCAHooker:
@@ -77,7 +105,7 @@ class PCAHooker:
         
         def _match(n, m, lid):
             "dfl layer is always frozen, so we don't need to calculate PCA for it"
-            return f"model.{lid}." in n and isinstance(m, nn.Conv2d) and "dfl" not in n
+            return f"model.{lid}." in n and is_supported_conv_module(m) and "dfl" not in n
 
         self.feature_caches, self._handles = {}, []
 
@@ -85,7 +113,8 @@ class PCAHooker:
             # If modules are provided, only calculate PCA for the specified modules
             for n, m in model.named_modules():
                 if n in modules:
-                    k, c_in, g = m.kernel_size, m.in_channels, m.groups
+                    meta = conv_meta(m)
+                    k, c_in, g = meta["kernel_size"], meta["in_channels"], meta["groups"]
                     self.modules[n] = m
                     self.pca_operators[n] = []
                     for i in range(g):
@@ -100,7 +129,8 @@ class PCAHooker:
                 # If layers are provided, calculate PCA for all conv modules within layers
                 for n, m in model.named_modules():
                     if _match(n, m, lid):
-                        k, c_in, g = m.kernel_size, m.in_channels, m.groups
+                        meta = conv_meta(m)
+                        k, c_in, g = meta["kernel_size"], meta["in_channels"], meta["groups"]
                         self.modules[n] = m
                         self.pca_operators[n] = []
                         for i in range(g):
@@ -133,9 +163,17 @@ class PCAHooker:
         otherwise, the input feature will be reshaped into a matrix with shape [c_in, bs*h_out*w_out].
         """
         def fn(module, feat_in, feat_out):
-            if isinstance(module, nn.Conv2d):
-                k, s, p, g, d, c_in, c_out = module.kernel_size, module.stride, module.padding, \
-                    module.groups, module.dilation, module.in_channels, module.out_channels
+            if is_supported_conv_module(module):
+                meta = conv_meta(module)
+                k, s, p, g, d, c_in, c_out = (
+                    meta["kernel_size"],
+                    meta["stride"],
+                    meta["padding"],
+                    meta["groups"],
+                    meta["dilation"],
+                    meta["in_channels"],
+                    meta["out_channels"],
+                )
 
                 feat_in = feat_in[0]  # Module may accept multiple input features, and we only extract the first
                 if p[0] > 0 or p[1] > 0:
@@ -198,13 +236,13 @@ class PCAHooker:
                     LOGGER.info(f"Module {module_name}'s unfolding error: {F.mse_loss(feat_out, feat_out_reshaped_reversed)}")
 
                 sample_feature_indices = self._get_sample_feature_indices(bs, h_out, w_out)
+                if sample_feature_indices.shape[0] == 0:
+                    # Some batches may have no bounding boxes, so we need to return here
+                    return
                 if sample_feature_indices.max() >= feat_reshaped.shape[2]:
                     raise RuntimeError(f"Sample feature indices out of range: {sample_feature_indices.max()} >= {feat_reshaped.shape[2]}")
                 if sample_feature_indices.min() < 0:
                     raise RuntimeError(f"Sample feature indices out of range: {sample_feature_indices.min()} < 0")
-                if sample_feature_indices.shape[0] == 0:
-                    # Some batches may have no bounding boxes, so we need to return here
-                    return
                 feat_sampled = feat_reshaped[:, :, sample_feature_indices]
                 # unfold true: [g, c_in//g*k*k, len(sample_feature_indices)] | unfold false: [g, c_in//g, len(sample_feature_indices)]
                 
@@ -366,10 +404,6 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
             LOGGER.warning(f"Historical PCA cache file not found: {load_hist}. Starting from scratch.")
 
     memory_monitor = RealTimeMemoryMonitor(update_interval=0.2)  # Monitor memory and CUDA memory usage
-    pbar = tqdm(range(sample_num), desc="PCA computing", total=sample_num)
-    memory_monitor.set_progress_bar(pbar)
-    memory_monitor.start_monitoring()
-
     if sample_dir is not None:
         image_extensions = ['jpg', 'png', 'jpeg', 'bmp']
         sample_files = []
@@ -383,7 +417,6 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
                 sample_files.extend(glob.glob(OSP.join(sample_dir, f'*.{ext.lower()}')))
                 sample_files.extend(glob.glob(OSP.join(sample_dir, f'*.{ext.upper()}')))
         random.shuffle(sample_files)
-        sample_files = sample_files[:sample_num]
         
         if label_dir is not None:
             label_files = []
@@ -406,6 +439,10 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
                         label_files.append(None)
                         LOGGER.warning(f"Label file {_label_name} not found in {label_dir}")
         
+        
+        pbar = tqdm(range(min(sample_num, len(sample_files))), desc="PCA computing", total=min(sample_num, len(sample_files)))
+        memory_monitor.set_progress_bar(pbar)
+        memory_monitor.start_monitoring()
         for i in pbar:
             image = cv2.imread(sample_files[i])
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -432,6 +469,9 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
             pca_hooker.remove_handle_()
     else:
         LOGGER.warning("No sample images provided, using random images for PCA")
+        pbar = tqdm(range(sample_num), desc="PCA computing", total=sample_num)
+        memory_monitor.set_progress_bar(pbar)
+        memory_monitor.start_monitoring()
         for i in pbar:
             image = torch.randn(3, 640, 640).to(device)
             pca_hooker.register_hook()
