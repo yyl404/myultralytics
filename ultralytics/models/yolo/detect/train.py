@@ -416,3 +416,27 @@ class AntiForgetDetectionTrainer(AntiForgetTrainer):
         max_num_obj = max(len(label["cls"]) for label in train_dataset.labels) * 4  # 4 for mosaic augmentation
         del train_dataset  # free memory
         return super().auto_batch(max_num_obj)
+
+class ABRDetectionTrainer(AntiForgetDetectionTrainer):
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        super().__init__(cfg, overrides, _callbacks)
+        self.abr_replay = None
+
+    def preprocess_batch(self, batch: dict) -> dict:
+        batch = super().preprocess_batch(batch)
+
+        if getattr(self.args, "abr", False):
+            if self.abr_replay is None:
+                from ultralytics.engine.abr import ABRReplay
+                self.abr_replay = ABRReplay(
+                    memory_json=self.args.abr_memory,
+                    ratio=tuple(self.args.abr_ratio),
+                    iou_thr=float(self.args.abr_iou_thr),
+                    max_mix_boxes=int(self.args.abr_max_mix_boxes),
+                    mix_beta=float(self.args.abr_mix_beta),
+                    mosaic_scale=tuple(self.args.abr_mosaic_scale),
+                    seed=int(getattr(self.args, "seed", 0)),
+                )
+            batch = self.abr_replay(batch)
+
+        return batch

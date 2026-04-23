@@ -61,7 +61,7 @@ Examples:
 import argparse
 
 from ultralytics import YOLO
-from ultralytics.models.yolo.detect import DetectionTrainer, AntiForgetDetectionTrainer
+from ultralytics.models.yolo.detect import DetectionTrainer, AntiForgetDetectionTrainer, ABRDetectionTrainer
 from ultralytics.models.yolo.obb import AntiForgetOBBTrainer
 
 
@@ -180,6 +180,8 @@ def main():
     task = getattr(model, "task", "detect")
     if args.trainer == "antiforget":
         trainer = AntiForgetOBBTrainer if task == "obb" else AntiForgetDetectionTrainer
+    elif args.trainer == "abr":
+        trainer = ABRDetectionTrainer
     else:
         trainer = None  # use model's default (OBBTrainer for obb, DetectionTrainer for detect, etc.)
     model.train(data=args.data, epochs=args.epochs, batch=args.batch_size, workers=args.workers,
