@@ -44,8 +44,8 @@ MODEL_WEIGHT_NAME="yolov8x-cls"
 # Dataset Config
 DATASET_NAME="VOC"
 CLASS_SPLITS=(
-    15
-    5
+    19
+    1
 )
 
 # Train Config
@@ -57,11 +57,10 @@ DEVICE=0
 FREEZE_LAYERS=None
 
 # Method Config
-ANTIFORGET_METHOD="pseudo_label+dist+espreg"
+ANTIFORGET_METHOD="pseudo_label+espreg"
 PSEUDO_LABEL=True
 CONF_THRESHOLD=0.25
 FILTER_IOU_THRESHOLD=0.5
-DIST_LOSS_WEIGHT=${DIST_LOSS_WEIGHT:-100.0}
 ESPREG_LOSS_WEIGHT=${ESPREG_LOSS_WEIGHT:-100.0}
 
 # Auto Build Variables
@@ -144,7 +143,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             fi
         fi
 
-        # run_step "train task ${task_num}" "${TRAIN_CMD[@]}"
+        run_step "train task ${task_num}" "${TRAIN_CMD[@]}"
 
         PREV_MODEL="$TASK_DIR/best.pt"
 
@@ -192,11 +191,6 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --pseudo_label "$PSEUDO_LABEL"
             --conf_threshold "$CONF_THRESHOLD"
             --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
-        )
-        # Add distillation parameters
-        TRAIN_CMD+=(
-            --distillation True
-            --dist_loss_weight "$DIST_LOSS_WEIGHT"
         )
         # Add ESPReg
         TRAIN_CMD+=(

@@ -44,8 +44,8 @@ MODEL_WEIGHT_NAME="yolov8x-cls"
 # Dataset Config
 DATASET_NAME="VOC"
 CLASS_SPLITS=(
-    15
-    5
+    19
+    1
 )
 
 # Train Config
@@ -53,7 +53,7 @@ EPOCHS=100
 BATCH_SIZE=16
 IMGSZ=640
 WORKERS=8
-DEVICE=0
+DEVICE=1
 FREEZE_LAYERS=None
 
 # Method Config
@@ -144,7 +144,7 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             fi
         fi
 
-        # run_step "train task ${task_num}" "${TRAIN_CMD[@]}"
+        run_step "train task ${task_num}" "${TRAIN_CMD[@]}"
 
         PREV_MODEL="$TASK_DIR/best.pt"
 

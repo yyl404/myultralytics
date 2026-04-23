@@ -716,10 +716,10 @@ espreg loss weight
 |1000|80.8|29.9|68.1|
 
 使用label-filter模式构造数据集，使用pseudo_label+dist+espreg方法
-espreg loss weight
-|espreg loss weight|old|new|all|
-|---|---|---|---|
-|1||||
-|10||||
-|100||||
-|1000|80.3|61.6|72.3|
+espreg loss weight vs dist loss weight
+|espreg_loss_weight \ dist_loss_weight|1 (old/new/all)|10 (old/new/all)|100 (old/new/all)|1000 (old/new/all)|
+|---|---|---|---|---|
+|1|/ /|/ /|/ /|/ /|
+|10|/ /|/ /|74.5 / 78.3 / 69.2|/ /|
+|100|/ /|80.3 / 77.5 / 73.6|80.4 / 77.1 / 75.0|/ /|
+|1000|77.3 / 78.3 / 72.5|80.9 / 72.0 / 73.4| 81.4 / 68.6 / 73.6 |79.9 / 63.0 / 71.0|

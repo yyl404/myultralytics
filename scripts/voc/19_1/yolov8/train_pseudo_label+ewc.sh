@@ -44,8 +44,8 @@ MODEL_WEIGHT_NAME="yolov8x-cls"
 # Dataset Config
 DATASET_NAME="VOC"
 CLASS_SPLITS=(
-    15
-    5
+    19
+    1
 )
 
 # Train Config
@@ -57,12 +57,11 @@ DEVICE=0
 FREEZE_LAYERS=None
 
 # Method Config
-ANTIFORGET_METHOD="pseudo_label+dist+espreg"
+ANTIFORGET_METHOD="pseudo_label+ewc"
 PSEUDO_LABEL=True
 CONF_THRESHOLD=0.25
 FILTER_IOU_THRESHOLD=0.5
-DIST_LOSS_WEIGHT=${DIST_LOSS_WEIGHT:-100.0}
-ESPREG_LOSS_WEIGHT=${ESPREG_LOSS_WEIGHT:-100.0}
+EWC_LOSS_WEIGHT=${EWC_LOSS_WEIGHT:-100.0}
 
 # Auto Build Variables
 MODEL_CFG="${MODEL_NAME}.yaml"
@@ -95,17 +94,17 @@ if [ $START_TASK -lt 1 ] || [ $START_TASK -gt ${#TASK_DATASETS[@]} ]; then
 fi
 
 PREV_MODEL=""
-PREV_PCA_CACHE=""
+PREV_IMPORTANCE_PATH=""
 if [ $START_TASK -gt 1 ]; then
     PREV_TASK=$((START_TASK - 1))
     PREV_MODEL="$OUTPUT_DIR/task-$PREV_TASK/best.pt"
-    PREV_PCA_CACHE="$OUTPUT_DIR/task-$PREV_TASK/pca_cache.pkl"
+    PREV_IMPORTANCE_PATH="$OUTPUT_DIR/task-$PREV_TASK/importance.pth"
     if [ ! -f "$PREV_MODEL" ]; then
         log_error "Previous task model not found: $PREV_MODEL"
         exit 1
     fi
-    if [ ! -f "$PREV_PCA_CACHE" ]; then
-        log_warn "Previous task PCA cache not found: $PREV_PCA_CACHE"
+    if [ ! -f "$PREV_IMPORTANCE_PATH" ]; then
+        log_warn "Previous task importance not found: $PREV_IMPORTANCE_PATH"
     fi
     log_info "Resuming from Task $START_TASK"
 fi
@@ -144,17 +143,20 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             fi
         fi
 
-        # run_step "train task ${task_num}" "${TRAIN_CMD[@]}"
+        run_step "train task ${task_num}" "${TRAIN_CMD[@]}"
 
         PREV_MODEL="$TASK_DIR/best.pt"
 
-        log_info "Performing PCA analysis..."
-        PCA_CACHE_PATH="$TASK_DIR/pca_cache.pkl"
-        run_step "pca analysis task ${task_num}" python tools/pca.py \
+        log_info "Calculating parameter importance..."
+        IMPORTANCE_PATH="$TASK_DIR/importance.pth"
+        run_step "cal importance task ${task_num}" python tools/cal_importance.py \
             --model "$TASK_DIR/best.pt" \
             --dataset "$DATASET_PATH" \
-            --save_path "$PCA_CACHE_PATH"
-        PREV_PCA_CACHE="$PCA_CACHE_PATH"
+            --save_path "$IMPORTANCE_PATH" \
+            --batch_size "$BATCH_SIZE" \
+            --workers "$WORKERS" \
+            --device "$DEVICE"
+        PREV_IMPORTANCE_PATH="$IMPORTANCE_PATH"
     else
         DATASET_NAME=$(basename $(dirname $DATASET_PATH))
         EXPANDED_MODEL="$TASK_DIR/task-$((task_num-1))-best-expanded.pt"
@@ -172,6 +174,16 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --model $EXPANDED_MODEL \
             --dataset $DATASET_PATH \
             --output_dir $ID_CONVERTED_DATASET
+
+        log_info "Expanding importance file..."
+        EXPANDED_IMPORTANCE_PATH="$TASK_DIR/task-$((task_num-1))-importance-expanded.pth"
+        run_step "expand importance task ${task_num}" python tools/expand_importance.py \
+            --old_importance "$PREV_IMPORTANCE_PATH" \
+            --old_model "$PREV_MODEL" \
+            --new_model "$EXPANDED_MODEL" \
+            --save_path "$EXPANDED_IMPORTANCE_PATH" \
+            --copy_importance_init
+        PREV_IMPORTANCE_PATH="$EXPANDED_IMPORTANCE_PATH"
 
         log_info "Training task $task_num with ${ANTIFORGET_METHOD}"
         TRAIN_CMD=(
@@ -193,16 +205,10 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
             --conf_threshold "$CONF_THRESHOLD"
             --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
         )
-        # Add distillation parameters
         TRAIN_CMD+=(
-            --distillation True
-            --dist_loss_weight "$DIST_LOSS_WEIGHT"
-        )
-        # Add ESPReg
-        TRAIN_CMD+=(
-            --espreg True
-            --pca_cache_path "$PREV_PCA_CACHE"
-            --espreg_loss_weight "$ESPREG_LOSS_WEIGHT"
+            --ewc True
+            --importance_path "$PREV_IMPORTANCE_PATH"
+            --ewc_loss_weight "$EWC_LOSS_WEIGHT"
         )
 
         if [ "$FREEZE_LAYERS" != "None" ]; then
@@ -215,14 +221,16 @@ for DATASET_PATH in "${TASK_DATASETS[@]}"; do
 
         PREV_MODEL="$TASK_DIR/best.pt"
 
-        log_info "Performing PCA analysis..."
-        PCA_CACHE_PATH="$TASK_DIR/pca_cache.pkl"
-        run_step "pca analysis task ${task_num}" python tools/pca.py \
+        log_info "Calculating parameter importance..."
+        IMPORTANCE_PATH="$TASK_DIR/importance.pth"
+        run_step "cal importance task ${task_num}" python tools/cal_importance.py \
             --model "$TASK_DIR/best.pt" \
-            --dataset "$DATASET_PATH" \
-            --load_hist "$PREV_PCA_CACHE" \
-            --save_path "$PCA_CACHE_PATH"
-        PREV_PCA_CACHE="$PCA_CACHE_PATH"
+            --dataset "$ID_CONVERTED_DATASET/dataset.yaml" \
+            --save_path "$IMPORTANCE_PATH" \
+            --batch_size "$BATCH_SIZE" \
+            --workers "$WORKERS" \
+            --device "$DEVICE"
+        PREV_IMPORTANCE_PATH="$IMPORTANCE_PATH"
     fi
 
     log_success "Task $task_num completed!"
