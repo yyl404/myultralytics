@@ -146,6 +146,8 @@ data
 data/
 runs
 runs/
+runs_old/*
+runs_second/*
 wandb/
 .DS_Store
 
