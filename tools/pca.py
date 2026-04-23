@@ -55,7 +55,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics import YOLO
-from ultralytics.nn.modules.head import CosineConv2d
 from ultralytics.utils import (
     LOGGER, YAML
 )
@@ -88,7 +87,7 @@ def conv_meta(module):
 
 
 def is_supported_conv_module(module):
-    return isinstance(module, (nn.Conv2d, CosineConv2d))
+    return isinstance(module, nn.Conv2d)
 
 
 class PCAHooker:

@@ -139,6 +139,10 @@ pseudo_label: False
 conf_threshold: 0.25
 filter_iou_threshold: 0.5
 
+# distillation setting
+distillation: False
+dist_loss_weight: 1.0
+
 # ewc settings
 ewc: False
 ewc_loss_weight: 1.0

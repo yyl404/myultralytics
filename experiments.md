@@ -696,6 +696,8 @@ ewc loss weight
 # 2026/04/21
 
 新的消融实验：
+
+使用sample-filter模式构造数据集，使用pseudo_label+espreg方法
 espreg loss weight
 |espreg loss weight|old|new|all|
 |---|---|---|---|
@@ -703,3 +705,21 @@ espreg loss weight
 |10||||
 |100|73.7|78.5|68.1|
 |1000|76.7|73.7|70.1|
+
+使用label-filter模式构造数据集，使用pseudo_label+espreg方法
+espreg loss weight
+|espreg loss weight|old|new|all|
+|---|---|---|---|
+|1||||
+|10||||
+|100|80.6|68.8|77.7|
+|1000|80.8|29.9|68.1|
+
+使用label-filter模式构造数据集，使用pseudo_label+dist+espreg方法
+espreg loss weight
+|espreg loss weight|old|new|all|
+|---|---|---|---|
+|1||||
+|10||||
+|100||||
+|1000|80.3|61.6|72.3|

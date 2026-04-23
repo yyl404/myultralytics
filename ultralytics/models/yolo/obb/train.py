@@ -101,6 +101,8 @@ class AntiForgetOBBTrainer(yolo.detect.AntiForgetDetectionTrainer):
 
     def get_validator(self):
         self.loss_names = ["box_loss", "cls_loss", "dfl_loss"]
+        if self.args.distillation:
+            self.loss_names.append("dist_loss")
         if self.args.espreg:
             self.loss_names.append("espreg_loss")
         if self.args.ewc:

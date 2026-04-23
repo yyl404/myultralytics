@@ -43,6 +43,16 @@ from ultralytics.engine.nsgp import NSGP
 from ultralytics.nn.modules.head import Detect, OBB
 
 
+def get_model_raw_output(batch, model, device):
+    """Run model forward on the current batch images and return raw head output.
+
+    This helper keeps prediction retrieval explicit in training code and returns the
+    un-decoded model output as-is (before NMS/post-processing).
+    """
+    model_pred = model(batch['img'].to(device))
+    return model_pred
+
+
 def _get_detect_head(model):
     """Return the detection head module (Detect or OBB)."""
     head = model.model[-1]
@@ -104,7 +114,7 @@ def _head_raw_output_to_list(head, raw_output, img_h, img_w):
     return base_model_pred_xywh
 
 
-def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device):
+def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device, base_model_pred=None):
     """
     Generate pseudo labels from base model and merge with GT labels, filtering by IoU.
     Supports both Detect (axis-aligned) and OBB (oriented) heads.
@@ -114,14 +124,15 @@ def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device)
         base_model: Base model for pseudo label generation
         filter_iou_threshold: IoU threshold for filtering pseudo labels
         device: Device to run inference on
-    
+        base_model_pred (Optional): The prediction of base model
     Returns:
         Modified batch dict with merged labels
     """
-    base_model_pred = base_model(batch['img'].to(device))
+    if base_model_pred is None:
+        base_model_pred = base_model(batch['img'].to(device))
     head = _get_detect_head(base_model)
     img_h, img_w = batch['img'].shape[-2:]
-    base_model_pred = _head_raw_output_to_list(head, base_model_pred, img_h, img_w)
+    base_model_pred_list = _head_raw_output_to_list(head, base_model_pred, img_h, img_w)
     is_obb = isinstance(head, OBB)
     # Detect: list of (num_boxes, 6) [xywhn, conf, cls]. OBB: list of (num_boxes, 7) [xywhn, conf, cls, angle].
 
@@ -142,7 +153,7 @@ def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device)
             gt_boxes_img = torch.empty((0, n_bbox_cols), device=gt_bboxes.device)
             gt_cls_img = torch.empty((0, 1), device=gt_cls.device, dtype=torch.long)
 
-        pseudo_labels_img = base_model_pred[img_idx]  # (num_pseudo, 6) or (num_pseudo, 7)
+        pseudo_labels_img = base_model_pred_list[img_idx]  # (num_pseudo, 6) or (num_pseudo, 7)
 
         if len(pseudo_labels_img) > 0 and len(gt_boxes_img) > 0:
             if is_obb:
@@ -195,6 +206,32 @@ def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device)
         batch['batch_idx'] = torch.empty((0), device=batch['img'].device, dtype=torch.long)
     
     return batch
+
+
+def get_dist_loss(model_pred, base_model_pred, model):
+    eps = 1e-6
+    head = _get_detect_head(model)
+    nc = head.nc
+    model_pred = head._inference(model_pred)
+    cls_start, cls_end = 4, 4 + nc
+    student_cls = model_pred[:, cls_start:cls_end, :]
+    teacher_cls = base_model_pred[:, cls_start:cls_end, :]
+
+    # Mask each anchor by teacher confidence (max class score at this position).
+    anchor_mask, max_idx = teacher_cls.max(dim=1)  # (B, A), (B, A)
+    student_at_max = torch.gather(student_cls, 1, max_idx.unsqueeze(1)).squeeze(1)  # (B, A)
+
+    # Binary KL(teacher || student) on the channel where teacher responds strongest:
+    # p,q in (0,1) from sigmoid cls; complementary mass is 1-p / 1-q.
+    dtype = model_pred.dtype
+    p = anchor_mask.to(torch.float32).clamp(eps, 1.0 - eps)
+    q = student_at_max.to(torch.float32).clamp(eps, 1.0 - eps)
+    teacher_bin = torch.stack((p, 1 - p), dim=1)  # (B, 2, A)
+    student_bin = torch.stack((q, 1 - q), dim=1)  # (B, 2, A)
+    kl_per_anchor = F.kl_div(student_bin.log(), teacher_bin, reduction="none").sum(dim=1).to(dtype)
+
+    # Weighted average over anchors.
+    return (kl_per_anchor * anchor_mask).sum() / anchor_mask.sum().clamp_min(eps)
 
 
 class AntiForgetTrainer(BaseTrainer):
@@ -475,18 +512,38 @@ class AntiForgetTrainer(BaseTrainer):
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
+
+                    # ============================== MODIFIED: get raw preds ==================================
+                    if self.args.pseudo_label or self.args.distillation:
+                        with torch.no_grad():
+                            base_model_pred = get_model_raw_output(batch, self.base_model, self.device)
+                    model_pred = get_model_raw_output(batch, self.model, self.device)
+                    # ============================== END: get raw preds =======================================
+
                     # ============================== MODIFIED: generate pseudo labels ===============================
                     if self.args.pseudo_label:
                         batch = merge_pseudo_labels_with_gt(
-                            batch, self.base_model, self.args.filter_iou_threshold, self.device
+                            batch, self.base_model, self.args.filter_iou_threshold, self.device, base_model_pred
                         )
                     # ============================== END: generate pseudo labels ====================================
-                    loss, self.loss_items = self.model(batch)
+                    
+                    # ============================== MODIFIED: get det loss ===============================
+                    loss, self.loss_items = self.model(batch, preds=model_pred)
+                    # ============================== END: get det loss ====================================
+                    
                     # ============================== MODIFIED: make a copy of loss items ===============================
                     loss_items = deepcopy(self.loss_items)
                     # ============================== END: make a copy of loss items ====================================
+                    
                     self.loss = loss.sum()
 
+                    # ============================== MODIFIED: calculate KLD distillation loss ==========================
+                    if self.args.distillation:
+                        _dist_loss = get_dist_loss(model_pred, base_model_pred[0], self.model)
+                        self.loss += (_dist_loss * self.args.dist_loss_weight)
+                        loss_items = torch.cat([loss_items, torch.tensor([_dist_loss], device=loss_items.device)])
+                    # ============================== END: calculate KL distillation loss ===============================
+                    
                     # ============================== MODIFIED: calculate ESPReg loss ===================================
                     if self.args.espreg:
                         _espreg_loss = self.espreg_loss.get_loss()
