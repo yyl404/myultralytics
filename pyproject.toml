@@ -74,7 +74,7 @@ dependencies = [
     "psutil", # system utilization
     "py-cpuinfo", # display CPU info
     "polars",
-    "ultralytics-thop>=2.0.0", # FLOPs computation https://github.com/ultralytics/thop
+    "ultralytics-thop>=2.0.19", # FLOPs computation https://github.com/ultralytics/thop
 ]
 
 # Optional dependencies ------------------------------------------------------------------------------------------------
