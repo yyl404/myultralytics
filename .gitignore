@@ -146,6 +146,8 @@ data
 data/
 runs
 runs/
+runs-protected
+runs-protected/
 runs_old/*
 runs_second/*
 wandb/

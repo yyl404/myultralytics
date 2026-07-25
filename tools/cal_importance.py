@@ -67,7 +67,9 @@ from ultralytics.models.yolo.detect import DetectionTrainer
 
 
 class ImportanceCalculator:
-    def __init__(self, model, layers=None, modules=None, module_pattern=None, device="cuda"):
+    def __init__(
+        self, model, layers=None, modules=None, module_pattern=None, device="cuda", normalize=True
+    ):
         """Initialize ImportanceCalculator.
 
         Args:
@@ -85,6 +87,7 @@ class ImportanceCalculator:
             device = "cpu"
             LOGGER.warning("CUDA is not available, using CPU")
         self.device = device
+        self.normalize = normalize
 
         def _match(n, lid):
             return f"model.{lid}." in n and "dfl" not in n
@@ -124,29 +127,31 @@ class ImportanceCalculator:
                 if param.requires_grad and param.grad is not None:
                     full_param_name = f"{module_name}.{param_name}" if module_name else param_name
                     
-                    # Apply gradient clipping: replace NaN/Inf and clip to reasonable range
-                    param.grad = torch.nan_to_num(
-                        param.grad, 
-                        nan=0.0, 
-                        posinf=max_grad_norm, 
-                        neginf=-max_grad_norm
-                    )
-                    param.grad = torch.clamp(param.grad, min=-max_grad_norm, max=max_grad_norm)
-                    
-                    # Calculate gradient squared (now safe from overflow)
+                    if self.normalize:
+                        param.grad = torch.nan_to_num(
+                            param.grad,
+                            nan=0.0,
+                            posinf=max_grad_norm,
+                            neginf=-max_grad_norm,
+                        )
+                        param.grad = torch.clamp(param.grad, min=-max_grad_norm, max=max_grad_norm)
+
                     grad_squared = param.grad ** 2
-                    
-                    # Normalize gradient squared
-                    grad_max_val = torch.max(grad_squared).item()
-                    grad_squared_normalized = grad_squared / (grad_max_val + 1e-12)
+                    if self.normalize:
+                        grad_max_val = torch.max(grad_squared).item()
+                        importance_batch = grad_squared / (grad_max_val + 1e-12)
+                    else:
+                        importance_batch = grad_squared
                     
                     if full_param_name not in self.running_importance.keys():
-                        self.running_importance[full_param_name] = torch.zeros_like(grad_squared_normalized, device=param.device)
+                        self.running_importance[full_param_name] = torch.zeros_like(
+                            importance_batch, device=param.device
+                        )
                         self.n_batch[full_param_name] = 0
                     
                     n_batch = self.n_batch[full_param_name]
                     self.running_importance[full_param_name] = n_batch / (n_batch + 1) * self.running_importance[full_param_name] + \
-                        grad_squared_normalized / (n_batch+1)
+                        importance_batch / (n_batch+1)
                     self.n_batch[full_param_name] += 1
 
     def save_importance(self, save_path):
@@ -197,7 +202,8 @@ class ImportanceCalculator:
 
 
 def calculate_importance(model, dataset, layers=None, modules=None, module_pattern=None,
-                         workers=8, device="cuda", epochs=1, batch_size=None, load_hist=None):
+                         workers=8, device="cuda", epochs=1, batch_size=None, load_hist=None,
+                         normalize=True):
     """Calculate parameter importance using Fisher Information Matrix approximation.
 
     Args:
@@ -247,6 +253,7 @@ def calculate_importance(model, dataset, layers=None, modules=None, module_patte
             layers=layers,
             modules=modules,
             module_pattern=module_pattern,
+            normalize=normalize,
             device=device
         )
         
@@ -337,6 +344,8 @@ def main():
     parser.add_argument("--load_hist", type=str, default=None,
                        help="Path to previously saved importance file to load as starting point. "
                             "If specified, importance calculation will continue from the loaded state.")
+    parser.add_argument("--raw", action="store_true",
+                       help="Accumulate raw squared gradients without clipping or per-tensor normalization.")
     
     args = parser.parse_args()
 
@@ -356,6 +365,7 @@ def main():
         layers=args.layers,
         modules=args.modules,
         module_pattern=args.module_pattern,
+        normalize=not args.raw,
         load_hist=args.load_hist
     )
     

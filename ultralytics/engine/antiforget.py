@@ -40,6 +40,7 @@ from ultralytics.engine.espreg import (
 )
 from ultralytics.engine.ewc import EWCLoss
 from ultralytics.engine.nsgp import NSGP
+from ultralytics.engine.repre import RegionalPrototypeReplay
 from ultralytics.nn.modules.head import Detect, OBB
 
 
@@ -61,7 +62,22 @@ def _get_detect_head(model):
     raise TypeError(f"Unsupported head type: {type(head)}")
 
 
-def _head_raw_output_to_list(head, raw_output, img_h, img_w):
+def _get_nsgp_backbone_names(model, module_names):
+    """Return PCA module names that belong to the configured YOLO backbone."""
+    backbone_config = getattr(model, "yaml", {}).get("backbone")
+    if not isinstance(backbone_config, list):
+        raise ValueError("Cannot identify YOLO backbone layers for normalized NSGP projection")
+    backbone_layer_count = len(backbone_config)
+    backbone_names = []
+    for name in module_names:
+        parts = name.split(".")
+        if len(parts) >= 2 and parts[0] == "model" and parts[1].isdigit():
+            if int(parts[1]) < backbone_layer_count:
+                backbone_names.append(name)
+    return backbone_names
+
+
+def _head_raw_output_to_list(head, raw_output, img_h, img_w, conf_threshold):
     """Convert head raw output to list of detections per image for merging.
     Detect: list of (num_boxes, 6) [xywhn, conf, cls].
     OBB: list of (num_boxes, 7) [xywhn, conf, cls, angle] with rotated NMS and angle preserved.
@@ -72,7 +88,7 @@ def _head_raw_output_to_list(head, raw_output, img_h, img_w):
         prediction = decoded_cat if decoded_cat.dim() == 3 else decoded_cat.unsqueeze(0)
         pred = non_max_suppression(
             prediction=prediction,
-            conf_thres=0.25,
+            conf_thres=conf_threshold,
             iou_thres=0.45,
             max_det=head.max_det,
             nc=head.nc,
@@ -97,7 +113,7 @@ def _head_raw_output_to_list(head, raw_output, img_h, img_w):
     prediction = decoded if decoded.dim() == 3 else decoded[0]
     pred = non_max_suppression(
         prediction=prediction,
-        conf_thres=0.25,
+        conf_thres=conf_threshold,
         iou_thres=0.45,
         max_det=head.max_det,
         nc=head.nc,
@@ -114,7 +130,9 @@ def _head_raw_output_to_list(head, raw_output, img_h, img_w):
     return base_model_pred_xywh
 
 
-def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device, base_model_pred=None):
+def merge_pseudo_labels_with_gt(
+    batch, base_model, conf_threshold, filter_iou_threshold, device, base_model_pred=None
+):
     """
     Generate pseudo labels from base model and merge with GT labels, filtering by IoU.
     Supports both Detect (axis-aligned) and OBB (oriented) heads.
@@ -122,6 +140,7 @@ def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device,
     Args:
         batch: Dict with keys 'img' (B, C, H, W), 'bboxes' (N, 4), 'cls' (N, 1), 'batch_idx' (N,)
         base_model: Base model for pseudo label generation
+        conf_threshold: Minimum teacher confidence retained by NMS
         filter_iou_threshold: IoU threshold for filtering pseudo labels
         device: Device to run inference on
         base_model_pred (Optional): The prediction of base model
@@ -132,7 +151,9 @@ def merge_pseudo_labels_with_gt(batch, base_model, filter_iou_threshold, device,
         base_model_pred = base_model(batch['img'].to(device))
     head = _get_detect_head(base_model)
     img_h, img_w = batch['img'].shape[-2:]
-    base_model_pred_list = _head_raw_output_to_list(head, base_model_pred, img_h, img_w)
+    base_model_pred_list = _head_raw_output_to_list(
+        head, base_model_pred, img_h, img_w, conf_threshold
+    )
     is_obb = isinstance(head, OBB)
     # Detect: list of (num_boxes, 6) [xywhn, conf, cls]. OBB: list of (num_boxes, 7) [xywhn, conf, cls, angle].
 
@@ -262,7 +283,13 @@ class AntiForgetTrainer(BaseTrainer):
         if self.args.ewc:
             self.ewc_loss_weight = self.args.ewc_loss_weight
             self.ewc_importance = torch.load(self.args.importance_path)['running_importance']
-            self.ewc_loss = EWCLoss(self.model, self.base_model, importance=self.ewc_importance)
+            self.ewc_loss = EWCLoss(
+                self.model,
+                self.base_model,
+                importance=self.ewc_importance,
+                internal_scale=self.args.ewc_internal_scale,
+                average_parameters=self.args.ewc_average_parameters,
+            )
         # ============================== END: set up EWC loss =================================================
 
         # ============================== MODIFIED: set up ESPReg loss ============================================
@@ -297,8 +324,26 @@ class AntiForgetTrainer(BaseTrainer):
                     _eigen_values.append(pca_cache_nsgp[name][ig].explained_variance_)
                 components[name], eigen_values[name] = torch.stack(_components), torch.stack(_eigen_values)
             self.nsgp_flexibility = getattr(self.args, 'nsgp_flexibility', 1.0)
-            self.nsgp_operator = NSGP(module_names=pca_cache_nsgp.keys(), components=components, eigen_values=eigen_values)
+            module_names = tuple(pca_cache_nsgp)
+            self.nsgp_operator = NSGP(
+                module_names=module_names,
+                components=components,
+                eigen_values=eigen_values,
+                normalized_module_names=_get_nsgp_backbone_names(self.model, module_names),
+            )
         # ============================== END: set up NSGP =================================================
+
+        # ============================== MODIFIED: set up RePRE ===========================================
+        if self.args.repre:
+            prototype_data = torch.load(self.args.repre_prototypes, map_location="cpu")
+            detect_head = _get_detect_head(self.model)
+            self.repre_loss_weight = self.args.repre_loss_weight
+            self.repre = RegionalPrototypeReplay(
+                detect_head=detect_head,
+                prototype_data=prototype_data,
+                device=self.device,
+            )
+        # ============================== END: set up RePRE ===============================================
 
         # ============================== MODIFIED: set up KD loss ================================================
         # if self.args.kd:
@@ -523,7 +568,12 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== MODIFIED: generate pseudo labels ===============================
                     if self.args.pseudo_label:
                         batch = merge_pseudo_labels_with_gt(
-                            batch, self.base_model, self.args.filter_iou_threshold, self.device, base_model_pred
+                            batch,
+                            self.base_model,
+                            self.args.conf_threshold,
+                            self.args.filter_iou_threshold,
+                            self.device,
+                            base_model_pred,
                         )
                     # ============================== END: generate pseudo labels ====================================
                     
@@ -584,6 +634,13 @@ class AntiForgetTrainer(BaseTrainer):
                             loss_items = torch.cat([loss_items, torch.tensor([cls_loss_proto, reg_loss_proto], device=loss_items.device)])
                             self.loss += (cls_loss_proto + reg_loss_proto)*self.proto_rp_loss_weight
                     # ============================== END: replay prototypes ==============================================
+
+                    # ============================== MODIFIED: replay regional prototypes ================================
+                    if self.args.repre:
+                        repre_loss = self.repre.compute_loss()
+                        self.loss += repre_loss * self.repre_loss_weight
+                        loss_items = torch.cat((loss_items, repre_loss.detach().reshape(1)))
+                    # ============================== END: replay regional prototypes ====================================
 
                     if RANK != -1:
                         self.loss *= world_size                   
@@ -926,17 +983,27 @@ class AntiForgetTrainer(BaseTrainer):
 
     def optimizer_step(self):
         """Perform a single step of the training optimizer with gradient clipping and EMA update.
-        Modified to apply NSGP gradient projection after gradient clipping.
+        NSGP projects the completed optimizer update, matching the reference optimizer.
         """
         self.scaler.unscale_(self.optimizer)  # unscale gradients
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-        # ============================== MODIFIED: apply NSGP gradient projection ====================
+        # ============================== MODIFIED: capture NSGP parameters ============================
+        nsgp_params = None
+        parameters_before_step = None
         if self.args.nsgp:
             model_to_use = self.model.module if hasattr(self.model, 'module') else self.model
-            params_dict = {name: param for name, param in model_to_use.named_parameters()}
-            self.nsgp_operator.apply_projection(params_dict, self.nsgp_flexibility)
-        # ============================== END: apply NSGP gradient projection ========================
+            nsgp_params = {name: param for name, param in model_to_use.named_parameters()}
+            parameters_before_step = self.nsgp_operator.capture_parameters(nsgp_params)
+        # ============================== END: capture NSGP parameters ================================
         self.scaler.step(self.optimizer)
+        # ============================== MODIFIED: apply NSGP update projection ======================
+        if self.args.nsgp:
+            self.nsgp_operator.apply_parameter_projection(
+                params_dict=nsgp_params,
+                parameters_before_step=parameters_before_step,
+                flexibility=self.nsgp_flexibility,
+            )
+        # ============================== END: apply NSGP update projection ===========================
         self.scaler.update()
         self.optimizer.zero_grad()
         if self.ema:

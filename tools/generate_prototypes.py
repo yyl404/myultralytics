@@ -116,6 +116,43 @@ def run_kmeans(features, k, max_iters=100):
     return dists_to_centers.argmin(dim=0)
 
 
+def select_density_aware_groups(features, num_prototypes=10, radius=0.6):
+    """Select one coarse group and density-aware fine-grained groups.
+
+    Args:
+        features (torch.Tensor): Feature matrix shaped (N, D).
+        num_prototypes (int): Total prototypes, including one coarse prototype.
+        radius (float): Cosine-similarity radius used to define hyperspheres.
+
+    Returns:
+        list[torch.Tensor]: Boolean membership masks shaped (N,).
+    """
+    if features.ndim != 2 or features.shape[0] == 0:
+        raise ValueError(f"Expected non-empty features shaped (N, D), got {tuple(features.shape)}")
+    if num_prototypes < 1:
+        raise ValueError(f"num_prototypes must be positive, got {num_prototypes}")
+    if not -1.0 <= radius <= 1.0:
+        raise ValueError(f"radius must be in [-1, 1], got {radius}")
+
+    normalized = F.normalize(features.float(), dim=1)
+    similarity = normalized @ normalized.T  # (N, N)
+    neighborhoods = similarity >= radius
+    densities, density_order = neighborhoods.sum(dim=1).sort(descending=True)
+
+    groups = [torch.ones(features.shape[0], device=features.device, dtype=torch.bool)]
+    low_density_index = max((features.shape[0] + 2) // 3, 1)
+    density_threshold = densities[-low_density_index]
+    excluded_centers = neighborhoods.sum(dim=1) <= density_threshold
+    for center_idx in density_order:
+        if excluded_centers[center_idx]:
+            continue
+        groups.append(neighborhoods[center_idx])
+        excluded_centers.logical_or_(neighborhoods[center_idx])
+        if len(groups) == num_prototypes:
+            break
+    return groups
+
+
 def extract_pos_patches_from_layer(
     feat, bbox_map_px, cls_map, reg_map, gt_bbox_px, gt_cls,
     conf_thresh=0.25, iou_threshold=0.5, angle_map=None, gt_bbox_px_5=None
@@ -647,11 +684,15 @@ def generate_prototypes(args):
     final_metas_pos = [[] for _ in range(detect.nl)]
     final_protos_neg = [None] * detect.nl
     final_metas_neg = [[] for _ in range(detect.nl)]
+    repre_levels = []
     
     LOGGER.info("Clustering prototypes...")
     for layer_idx in range(detect.nl):
         # Collect and clustering positive protos
         layer_tensors = []
+        repre_features = []
+        repre_masks = []
+        repre_labels = []
         
         for cls_idx in range(detect.nc):
             items = collector_pos[layer_idx][cls_idx]
@@ -661,26 +702,57 @@ def generate_prototypes(args):
             # Unzip
             patches, regs, clss, masks, metas = zip(*items)
             patch_tensor = torch.stack(patches)
-            
-            # K-Means
-            indices = run_kmeans(patch_tensor, k=args.num_protos)
-            
-            # Select
-            sel_patches = patch_tensor[indices]
-            sel_regs = torch.stack(regs)[indices]
-            sel_clss = torch.stack(clss)[indices]
-            sel_masks = torch.stack(masks)[indices]
-            sel_metas = [metas[i] for i in indices]
+            reg_tensor = torch.stack(regs)
+            cls_tensor = torch.stack(clss)
+            mask_tensor = torch.stack(masks)
+
+            if args.selection == "density":
+                groups = select_density_aware_groups(
+                    patch_tensor,
+                    num_prototypes=args.num_protos,
+                    radius=args.radius,
+                )
+                sel_patches = torch.stack([patch_tensor[group].mean(dim=0) for group in groups])
+                sel_regs = torch.stack([reg_tensor[group].mean(dim=0) for group in groups])
+                sel_clss = torch.stack([cls_tensor[group].mean(dim=0) for group in groups])
+                sel_masks = torch.stack([mask_tensor[group].mean(dim=0) for group in groups])
+                sel_metas = [metas[0]] * len(groups)
+            else:
+                indices = run_kmeans(patch_tensor, k=args.num_protos)
+                sel_patches = patch_tensor[indices]
+                sel_regs = reg_tensor[indices]
+                sel_clss = cls_tensor[indices]
+                sel_masks = mask_tensor[indices]
+                sel_metas = [metas[i] for i in indices]
             
             # Combine: [Feat(25C) | Reg | Cls | Mask(25)]
             combined = torch.cat([sel_patches, sel_regs, sel_clss, sel_masks], dim=1)
             layer_tensors.append(combined)
             final_metas_pos[layer_idx].extend(sel_metas)
+            repre_features.append(sel_patches)
+            repre_masks.append(sel_masks)
+            repre_labels.append(torch.full((sel_patches.shape[0],), cls_idx, device=sel_patches.device))
 
         if layer_tensors:
             final_protos_pos[layer_idx] = torch.cat(layer_tensors, dim=0).cpu()
+            channels = captured_inputs[layer_idx].shape[1]
+            repre_levels.append(
+                {
+                    "features": torch.cat(repre_features).reshape(-1, channels, 5, 5).cpu(),
+                    "valid_masks": torch.cat(repre_masks).reshape(-1, 5, 5).cpu(),
+                    "labels": torch.cat(repre_labels).long().cpu(),
+                }
+            )
         else:
             LOGGER.warning(f"No prototypes collected from layer {layer_idx}")
+            channels = captured_inputs[layer_idx].shape[1]
+            repre_levels.append(
+                {
+                    "features": torch.empty((0, channels, 5, 5)),
+                    "valid_masks": torch.empty((0, 5, 5)),
+                    "labels": torch.empty((0,), dtype=torch.long),
+                }
+            )
 
         # Collect and randomly sample negative protos
         num_neg_items = len(collector_neg[layer_idx])
@@ -700,22 +772,35 @@ def generate_prototypes(args):
     # 7. Merge History
     if args.load_hist:
         hist = torch.load(args.load_hist, map_location='cpu')
+        if args.selection == "density" and "repre" not in hist:
+            raise KeyError(f"Historical prototype artifact '{args.load_hist}' has no RePRE data")
         for lid in range(detect.nl):
-            if hist['prototypes'][lid] is not None:
+            if args.selection != "density" and hist['prototypes'][lid] is not None:
                 p_new = final_protos_pos[lid]
                 p_old = hist['prototypes'][lid]
                 final_protos_pos[lid] = torch.cat([p_old, p_new]) if p_new is not None else p_old
                 final_metas_pos[lid] = hist['meta_info'][lid] + final_metas_pos[lid]
-            if hist['prototypes_neg'][lid] is not None:
+            if args.selection != "density" and hist['prototypes_neg'][lid] is not None:
                 p_new = final_protos_neg[lid]
                 p_old = hist['prototypes_neg'][lid]
                 meta_old = hist['meta_info_neg'][lid]
                 p_old, meta_old = filter_old_neg_protos(p_old, meta_old, detect, lid, args.neg_conf_threshold)
                 final_protos_neg[lid] = torch.cat([p_old, p_new]) if p_new is not None else p_old
                 final_metas_neg[lid] = meta_old + final_metas_neg[lid]
+            if "repre" in hist:
+                for key in ("features", "valid_masks", "labels"):
+                    repre_levels[lid][key] = torch.cat((hist["repre"][lid][key], repre_levels[lid][key]))
 
-    torch.save({"prototypes": final_protos_pos, "meta_info": final_metas_pos, "prototypes_neg": final_protos_neg, "meta_info_neg": final_metas_neg},
-        args.output)
+    torch.save(
+        {
+            "prototypes": final_protos_pos,
+            "meta_info": final_metas_pos,
+            "prototypes_neg": final_protos_neg,
+            "meta_info_neg": final_metas_neg,
+            "repre": repre_levels,
+        },
+        args.output,
+    )
     LOGGER.info(f"Saved to {args.output}")
 
     # 7. Visualize prototypes
@@ -738,6 +823,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="0")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--num_protos", type=int, default=10)
+    parser.add_argument("--selection", choices=["kmeans", "density"], default="kmeans")
+    parser.add_argument("--radius", type=float, default=0.6)
     parser.add_argument("--pos_conf_threshold", type=float, default=0.1)
     parser.add_argument("--neg_conf_threshold", type=float, default=0.25)
     parser.add_argument("--iou_threshold", type=float, default=0.5)

@@ -114,6 +114,8 @@ class AntiForgetOBBTrainer(yolo.detect.AntiForgetDetectionTrainer):
                 self.loss_names.extend(["cls_loss_pr", "reg_loss_pr", "cls_pr_neg"])
             else:
                 self.loss_names.extend(["cls_loss_pr", "reg_loss_pr"])
+        if self.args.repre:
+            self.loss_names.append("repre_loss")
         self.loss_names = tuple(self.loss_names)
         return yolo.obb.OBBValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks

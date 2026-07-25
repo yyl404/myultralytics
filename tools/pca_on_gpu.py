@@ -283,3 +283,52 @@ class IncrementalPCAonGPU():
         """
         self.fit(X, check_input=check_input)
         return self.transform(X)
+
+
+class UncenteredPCAonGPU:
+    """Accumulate an uncentered input Gram matrix and expose its eigensystem."""
+
+    def __init__(self, n_components, device="cuda"):
+        self.n_components = n_components
+        self.device = torch.device(device if "cuda" not in device or torch.cuda.is_available() else "cpu")
+        self.gram_matrix = None
+        self.n_samples_seen_ = 0
+        self.components_ = None
+        self.explained_variance_ = None
+
+    def _validate_data(self, x):
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x, dtype=torch.float32)
+        if x.ndim != 2 or x.shape[1] != self.n_components:
+            raise ValueError(
+                f"Expected samples shaped (N, {self.n_components}), got {tuple(x.shape)}"
+            )
+        return x.to(self.device, dtype=torch.float32)
+
+    @torch.no_grad()
+    def partial_fit(self, x, check_input=True):
+        """Accumulate X^T X for samples shaped (N, input_dim)."""
+        x = self._validate_data(x) if check_input else x.to(self.device, dtype=torch.float32)
+        batch_gram = x.T @ x
+        self.gram_matrix = batch_gram if self.gram_matrix is None else self.gram_matrix + batch_gram
+        self.n_samples_seen_ += x.shape[0]
+        self.components_ = None
+        self.explained_variance_ = None
+        return self
+
+    def fit(self, x, check_input=True):
+        self.gram_matrix = None
+        self.n_samples_seen_ = 0
+        self.partial_fit(x, check_input=check_input)
+        self.finalize()
+        return self
+
+    @torch.no_grad()
+    def finalize(self):
+        """Compute the reference SVD of the accumulated Gram matrix."""
+        if self.gram_matrix is None or self.n_samples_seen_ == 0:
+            raise RuntimeError("Cannot finalize an empty uncentered covariance")
+        _, singular_values, right_vectors = torch.svd(self.gram_matrix, some=False)
+        self.explained_variance_ = singular_values
+        self.components_ = right_vectors.T.contiguous()
+        return self

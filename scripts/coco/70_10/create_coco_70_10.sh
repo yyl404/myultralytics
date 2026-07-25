@@ -1,0 +1,7 @@
+#!/bin/bash
+set -euo pipefail
+python tools/create_incremental_dataset.py \
+    --source_cfg data/coco-yolo/coco.yaml \
+    --output_dir data/COCO_70+10 \
+    --n_classes 70 10 \
+    --workers "${WORKERS:-8}"

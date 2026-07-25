@@ -1,146 +1,322 @@
-"""Convert dataset class IDs to adapt to model's classification head.
+"""Align dataset class IDs with a model output space using parallel file I/O."""
 
-This tool converts the class IDs in a dataset to match the class IDs used by a trained model.
-It reads the model's class list and the dataset's class list, creates a mapping between them,
-and converts all label files accordingly.
-
-Supports both detection (xywh) and OBB (oriented bounding box, xyxyxyxy) datasets: the label
-format is inferred from the model task (model.task), so OBB models (e.g. yolov8l-obb) will
-convert OBB-format labels (class_id x1 y1 x2 y2 x3 y3 x4 y4) correctly.
-
-Usage:
-    $ python tools/convert_dataset_class_ids.py \
-        --model <path/to/model.pt> \
-        --dataset <path/to/dataset.yaml> \
-        --output_dir <path/to/output_dir> \
-        --splits <split1> <split2> ... (optional) \
-        --keep_unrecognized_classes (optional) \
-        --no-use-link (optional)
-
-    Arguments:
-        --model: Path to the model checkpoint (.pt file)
-        --dataset: Path to the source dataset YAML file
-        --output_dir: Path to the output directory where converted dataset will be saved
-        --splits: Dataset splits to convert class IDs for (default: "train val test")
-        --keep_unrecognized_classes: Whether to keep classes not in the model's class list
-            (default: False, unrecognized classes will be skipped)
-        --no-use-link: Copy images to output directory instead of creating symlinks
-            (default: False, per-file symlinks are used; see note below)
-
-    Note on symlinks:
-        Ultralytics resolves dataset image directories with Path.resolve(), which follows
-        a symlinked *directory*. That makes image paths point into the original dataset,
-        so img2label_paths() then opens the original labels/ instead of converted labels.
-        To save disk while keeping label paths under output_dir, we create a real
-        images/{split}/ directory and add one symlink per image file (or copy with
-        --no-use-link).
-
-Examples:
-    $ python tools/convert_dataset_class_ids.py \
-        --model runs/yolov8l_voc_inc_10_10_fromscratch_vspreg/task-2/task-1-best-expanded.pt \
-        --dataset data/VOC_inc_10_10/task_2_cls_10/dataset.yaml \
-        --output_dir runs/yolov8l_voc_inc_10_10_fromscratch_vspreg/task-2/task_2_cls_10_val-test_converted \
-        --splits val test
-"""
-
+from __future__ import annotations
 
 import argparse
-import os.path as OSP
 import os
 import shutil
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TypeVar
+
 from tqdm import tqdm
 
 from ultralytics import YOLO
-from ultralytics.utils import YAML, LOGGER
+from ultralytics.utils import LOGGER, YAML
 
-from utils import convert_class_ids_from_dir, mirror_image_files
-
-
-def _count_label_txt_under(root: str) -> int:
-    """Count YOLO-format ``*.txt`` files under ``root`` (recursive, any nesting depth)."""
-    return sum(1 for _r, _, fs in os.walk(root) for f in fs if f.endswith(".txt"))
+from utils import convert_class_ids
 
 
-def _count_files_under(root: str) -> int:
-    """Count all files under ``root`` recursively (same leaves as ``mirror_image_files``)."""
-    return sum(len(files) for _, _, files in os.walk(root))
+_T = TypeVar("_T")
+_R = TypeVar("_R")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True, help="Path to the model checkpoint (.pt file)")
-    parser.add_argument("--dataset", type=str, required=True, help="Path to the dataset YAML file")
-    parser.add_argument("--output_dir", type=str, required=True, help="Path to the output directory")
-    parser.add_argument("--splits", type=str, required=False, default=["train", "val", "test"], nargs="+",
-        help="Dataset splits to convert class IDs for (default: ['train', 'val', 'test'])")
-    parser.add_argument("--keep_unrecognized_classes", type=bool, required=False, default=False,
-        help="Whether to keep unrecognized classes (default: False)")
+@dataclass(frozen=True)
+class LabelJob:
+    """One label conversion with mirrored relative path."""
+
+    source: Path
+    destination: Path
+
+
+@dataclass(frozen=True)
+class ImageJob:
+    """One image link or copy with mirrored relative path."""
+
+    source: Path
+    destination: Path
+
+
+def _bounded_map(
+    executor: ThreadPoolExecutor,
+    function: Callable[[_T], _R],
+    items: Iterable[_T],
+    max_pending: int,
+) -> Iterator[_R]:
+    """Map in input order while bounding queued Future objects."""
+    if max_pending < 1:
+        raise ValueError(f"max_pending must be positive, got {max_pending}")
+
+    item_iterator = iter(items)
+    pending: list[Future[_R]] = []
+    for _ in range(max_pending):
+        try:
+            pending.append(executor.submit(function, next(item_iterator)))
+        except StopIteration:
+            break
+
+    while pending:
+        future = pending.pop(0)
+        yield future.result()
+        try:
+            pending.append(executor.submit(function, next(item_iterator)))
+        except StopIteration:
+            pass
+
+
+def _normalize_names(names: list[str] | Mapping[int | str, str], source: str) -> dict[int, str]:
+    """Return class names keyed by integer IDs."""
+    if isinstance(names, list):
+        return dict(enumerate(names))
+    if not isinstance(names, Mapping):
+        raise TypeError(f"Class names in {source} must be a list or mapping, got {type(names)}")
+    normalized = {int(class_id): class_name for class_id, class_name in names.items()}
+    expected_ids = list(range(len(normalized)))
+    if sorted(normalized) != expected_ids:
+        raise ValueError(
+            f"Class IDs in {source} must be contiguous from 0, got {sorted(normalized)}"
+        )
+    return normalized
+
+
+def _build_class_mapping(
+    source_names: Mapping[int, str],
+    model_names: Mapping[int, str],
+    keep_unrecognized: bool,
+) -> tuple[dict[int, int], dict[int, str]]:
+    """Map source class IDs into the model output space."""
+    output_names = dict(model_names)
+    model_ids_by_name = {}
+    for class_id, class_name in model_names.items():
+        model_ids_by_name.setdefault(class_name, class_id)
+
+    class_id_map = {}
+    for source_id, class_name in source_names.items():
+        model_id = model_ids_by_name.get(class_name)
+        if model_id is not None:
+            class_id_map[source_id] = model_id
+        elif keep_unrecognized:
+            new_id = len(output_names)
+            class_id_map[source_id] = new_id
+            output_names[new_id] = class_name
+            model_ids_by_name[class_name] = new_id
+        else:
+            LOGGER.warning(f"Class '{class_name}' was not found in model classes and will be skipped")
+    return class_id_map, output_names
+
+
+def _resolve_split_roots(
+    dataset_path: Path,
+    dataset_config: Mapping,
+    split: str,
+) -> tuple[list[Path], list[Path]]:
+    """Resolve image and corresponding label roots for one split."""
+    split_value = dataset_config[split]
+    split_entries = [split_value] if isinstance(split_value, str) else split_value
+    if not isinstance(split_entries, Sequence) or not split_entries:
+        raise TypeError(f"Dataset split '{split}' must be a path or non-empty list of paths")
+
+    configured_root = dataset_config.get("path")
+    if configured_root is None:
+        dataset_root = dataset_path.parent
+    else:
+        dataset_root = Path(configured_root)
+        if not dataset_root.is_absolute():
+            dataset_root = dataset_path.parent / dataset_root
+
+    image_roots = []
+    label_roots = []
+    for entry in split_entries:
+        if not isinstance(entry, str):
+            raise TypeError(f"Dataset split '{split}' contains a non-path entry: {entry!r}")
+        image_root = Path(entry)
+        if not image_root.is_absolute():
+            image_root = dataset_root / image_root
+        image_root = image_root.resolve()
+        label_root = Path(str(image_root).replace("images", "labels"))
+        if not image_root.is_dir():
+            raise FileNotFoundError(f"Image directory for split '{split}' does not exist: {image_root}")
+        if not label_root.is_dir():
+            raise FileNotFoundError(f"Label directory for split '{split}' does not exist: {label_root}")
+        image_roots.append(image_root)
+        label_roots.append(label_root)
+    return image_roots, label_roots
+
+
+def _collect_mirrored_jobs(
+    source_roots: Sequence[Path],
+    destination_root: Path,
+    *,
+    suffix: str | None = None,
+) -> list[tuple[Path, Path]]:
+    """Enumerate source files once and validate destination uniqueness."""
+    jobs = []
+    destinations: dict[Path, Path] = {}
+    for source_root in source_roots:
+        for directory, _, file_names in os.walk(source_root):
+            relative_directory = Path(directory).relative_to(source_root)
+            for file_name in file_names:
+                source = Path(directory) / file_name
+                if suffix is not None and source.suffix.lower() != suffix:
+                    continue
+                destination = destination_root / relative_directory / file_name
+                previous = destinations.setdefault(destination, source)
+                if previous != source:
+                    raise ValueError(
+                        f"Multiple source files map to '{destination}': '{previous}' and '{source}'"
+                    )
+                jobs.append((source, destination))
+    return jobs
+
+
+def _convert_label(job: LabelJob, class_id_map: Mapping[int, int], task: str) -> None:
+    """Convert and write one YOLO label file."""
+    try:
+        lines = job.source.read_text(encoding="utf-8").splitlines(keepends=True)
+        converted_lines = convert_class_ids(lines, class_id_map, task=task)
+        job.destination.write_text("".join(converted_lines), encoding="utf-8")
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"Failed to convert label '{job.source}': {error}") from error
+
+
+def _mirror_image(job: ImageJob, no_use_link: bool) -> None:
+    """Create one image symlink, or copy it when explicitly requested."""
+    try:
+        if no_use_link:
+            shutil.copy2(job.source, job.destination)
+        else:
+            job.destination.symlink_to(job.source)
+    except OSError as error:
+        action = "copy" if no_use_link else "symlink"
+        raise RuntimeError(
+            f"Failed to {action} image '{job.source}' to '{job.destination}': {error}"
+        ) from error
+
+
+def _run_parallel(
+    jobs: Sequence[_T],
+    function: Callable[[_T], None],
+    workers: int,
+    description: str,
+) -> None:
+    """Execute independent I/O jobs in chunks to reduce Future overhead."""
+    if not jobs:
+        return
+    for parent in {job.destination.parent for job in jobs}:
+        parent.mkdir(parents=True, exist_ok=True)
+
+    chunk_size = max(16, min(256, (len(jobs) + workers * 8 - 1) // (workers * 8)))
+    chunks = [jobs[start : start + chunk_size] for start in range(0, len(jobs), chunk_size)]
+
+    def process_chunk(chunk: Sequence[_T]) -> int:
+        for job in chunk:
+            function(job)
+        return len(chunk)
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="class-id-io") as executor:
+        results = _bounded_map(executor, process_chunk, chunks, max_pending=workers * 2)
+        with tqdm(total=len(jobs), desc=description) as progress:
+            for processed_count in results:
+                progress.update(processed_count)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", type=Path, required=True, help="Expanded model checkpoint")
+    parser.add_argument("--dataset", type=Path, required=True, help="Source dataset YAML")
+    parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
+    parser.add_argument(
+        "--keep_unrecognized_classes",
+        action="store_true",
+        help="Append classes absent from the model output space instead of dropping them",
+    )
     parser.add_argument(
         "--no-use-link",
         action="store_true",
-        help="Copy each image file instead of per-file symlinks (default: per-file symlinks to save space)",
+        help="Copy image files instead of creating per-file symbolic links",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="Number of parallel label/link I/O workers",
     )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    return args
 
+
+def main() -> None:
+    """Convert requested splits and save an aligned dataset config."""
+    args = parse_args()
     model = YOLO(args.model)
     task = getattr(model, "task", None) or "detect"
-    model_classes = [model.names[i] for i in sorted(model.names.keys())]
+    model_names = _normalize_names(model.names, source=f"model '{args.model}'")
 
-    data_cfg = YAML.load(args.dataset)
-    source_classes = [data_cfg["names"][i] for i in sorted(data_cfg["names"].keys())]
-    
-    class_id_map = {}
-    for i, cls in enumerate(source_classes):
-        if cls in model_classes:
-            class_id_map[i] = model_classes.index(cls)
+    dataset_config = YAML().load(args.dataset)
+    if "names" not in dataset_config:
+        raise KeyError(f"Dataset config has no 'names': {args.dataset}")
+    source_names = _normalize_names(
+        dataset_config["names"],
+        source=f"dataset '{args.dataset}'",
+    )
+    class_id_map, output_names = _build_class_mapping(
+        source_names=source_names,
+        model_names=model_names,
+        keep_unrecognized=args.keep_unrecognized_classes,
+    )
+
+    if args.output_dir.exists() or args.output_dir.is_symlink():
+        if args.output_dir.is_symlink() or args.output_dir.is_file():
+            args.output_dir.unlink()
         else:
-            if args.keep_unrecognized_classes:
-                # Map the classes that are not in the model output class list
-                # to the index space beyond the model output channel number
-                class_id_map[i] = len(model_classes)
-                model_classes.append(cls)
-            else:
-                LOGGER.warning(f"Class {cls} not found in model classes, skipped")
-    
-    config = {
-        'names': {i: cls for i, cls in enumerate(model_classes)}
-    } # target dataset config file
+            shutil.rmtree(args.output_dir)
+    args.output_dir.mkdir(parents=True)
 
-    if OSP.exists(args.output_dir):
-        shutil.rmtree(args.output_dir)
-
+    output_config = {"names": output_names}
     for split in args.splits:
-        if split in data_cfg:
-            source_images = OSP.join(data_cfg['path'], data_cfg[split]) if 'path' in data_cfg.keys() else \
-                        OSP.join(OSP.dirname(args.dataset), data_cfg[split])
-            source_labels = source_images.replace('images', 'labels')
+        if split not in dataset_config:
+            LOGGER.warning(f"Split '{split}' was not found in '{args.dataset}'; skipping")
+            continue
 
-            os.makedirs(OSP.join(args.output_dir, f"labels/{split}"), exist_ok=True)
-            convert_class_ids_from_dir(
-                source_labels,
-                class_id_map,
-                OSP.join(args.output_dir, f"labels/{split}"),
-                task=task,
-                pbar=tqdm(
-                    desc=f"Converting class ids for {split} split...",
-                    total=_count_label_txt_under(source_labels),
-                ),
-            )
+        image_roots, label_roots = _resolve_split_roots(
+            dataset_path=args.dataset,
+            dataset_config=dataset_config,
+            split=split,
+        )
+        label_pairs = _collect_mirrored_jobs(
+            label_roots,
+            args.output_dir / "labels" / split,
+            suffix=".txt",
+        )
+        label_jobs = [LabelJob(source, destination) for source, destination in label_pairs]
+        _run_parallel(
+            jobs=label_jobs,
+            function=lambda job: _convert_label(job, class_id_map, task),
+            workers=args.workers,
+            description=f"Converting labels for {split}",
+        )
 
-            target_images = OSP.join(args.output_dir, f"images/{split}")
-            os.makedirs(OSP.dirname(target_images), exist_ok=True)
-            mirror_image_files(
-                source_images,
-                target_images,
-                pbar=tqdm(
-                    desc=f"Mirroring images for {split} split...",
-                    total=_count_files_under(source_images),
-                ),
-                no_use_link=args.no_use_link,
-            )
-            config[split] = f"images/{split}"
-        else:
-            LOGGER.warning(f"Split {split} not found in dataset YAML file, skipped")
-    
-    config_path = OSP.join(args.output_dir, f"dataset.yaml")
-    YAML.save(data=config, file=config_path)
+        image_pairs = _collect_mirrored_jobs(
+            image_roots,
+            args.output_dir / "images" / split,
+        )
+        image_jobs = [ImageJob(source, destination) for source, destination in image_pairs]
+        _run_parallel(
+            jobs=image_jobs,
+            function=lambda job: _mirror_image(job, args.no_use_link),
+            workers=args.workers,
+            description=f"Linking images for {split}" if not args.no_use_link else f"Copying images for {split}",
+        )
+        output_config[split] = f"images/{split}"
+
+    YAML().save(args.output_dir / "dataset.yaml", output_config)
+
+
+if __name__ == "__main__":
+    main()

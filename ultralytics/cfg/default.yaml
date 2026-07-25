@@ -146,6 +146,8 @@ dist_loss_weight: 1.0
 # ewc settings
 ewc: False
 ewc_loss_weight: 1.0
+ewc_internal_scale: 100.0
+ewc_average_parameters: True
 importance_path: None
 
 # ESPReg (Eigen-value Scaled Projection Regularization) settings -----------------------------------------------
@@ -155,8 +157,13 @@ pca_cache_path: None # (str, optional)
 
 # NSGP settings ----------------------------------------------------------------------------------------------------
 nsgp: False # (bool) whether to use Null Space Gradient Projection
-nsgp_flexibility: 1.0 # (float) weight for the projected component when subtracting from original gradient
+nsgp_flexibility: 1.0 # (float) interpolation from raw gradient to exact null-space projection
 # Note: NSGP uses pca_cache_path from ESPReg settings above
+
+# RePRE settings ---------------------------------------------------------------------------------------------------
+repre: False # (bool) replay old-class regional prototypes through the classification branch
+repre_prototypes: None # (str) density-aware prototype artifact generated after the previous task
+repre_loss_weight: 1.0 # (float) contribution of classification-only regional replay
 
 # prototype replay settings
 proto_rp: False

@@ -60,6 +60,7 @@ from ultralytics.utils import (
 )
 
 from pca_on_gpu import IncrementalPCAonGPU as IncrementalPCA
+from pca_on_gpu import UncenteredPCAonGPU as UncenteredPCA
 from utils import RealTimeMemoryMonitor
 
 
@@ -91,7 +92,9 @@ def is_supported_conv_module(module):
 
 
 class PCAHooker:
-    def __init__(self, model, layers=None, modules=None, device="cuda", check=False, unfold=True):
+    def __init__(
+        self, model, layers=None, modules=None, device="cuda", check=False, unfold=True, uncentered=False
+    ):
         self.model = model
         self.modules = {}
         self.pca_operators = {}
@@ -101,6 +104,12 @@ class PCAHooker:
         self.device = device
         self.check = check
         self.unfold = unfold
+        self.uncentered = uncentered
+
+        def _build_operator(module, input_dim):
+            if self.uncentered:
+                return UncenteredPCA(n_components=input_dim, device=self.device)
+            return IncrementalPCA(n_components=input_dim)
         
         def _match(n, m, lid):
             "dfl layer is always frozen, so we don't need to calculate PCA for it"
@@ -121,7 +130,7 @@ class PCAHooker:
                             n_components = c_in//g*k[0]*k[1]
                         else:
                             n_components = c_in//g
-                        self.pca_operators[n].append(IncrementalPCA(n_components=n_components))
+                        self.pca_operators[n].append(_build_operator(m, n_components))
                     self.feature_caches[n] = []
         elif layers is not None:
             for lid in layers:
@@ -137,13 +146,15 @@ class PCAHooker:
                                 n_components = c_in//g*k[0]*k[1]
                             else:
                                 n_components = c_in//g
-                            self.pca_operators[n].append(IncrementalPCA(n_components=n_components))
+                            self.pca_operators[n].append(_build_operator(m, n_components))
                         self.feature_caches[n] = []
         else:
             raise ValueError("Either modules or layers must be provided")
 
     def _get_sample_feature_indices(self, bs, h_out, w_out):
-        # Randomly sample feature indices
+        if self.uncentered:
+            return torch.arange(bs * h_out * w_out, device=self.device)
+        # Randomly sample feature indices for the legacy PCA/ESPReg path.
         sample_feature_indices = torch.randperm(bs*h_out*w_out, device=self.device)[:100]
         return sample_feature_indices
 
@@ -175,6 +186,8 @@ class PCAHooker:
                 )
 
                 feat_in = feat_in[0]  # Module may accept multiple input features, and we only extract the first
+                if self.uncentered:
+                    feat_in = feat_in.mean(dim=0, keepdim=True)
                 if p[0] > 0 or p[1] > 0:
                     feat_in_padded = torch.nn.functional.pad(feat_in, (p[1], p[1], p[0], p[0]), mode='constant', value=0)
                 else:
@@ -217,7 +230,7 @@ class PCAHooker:
                 feat_unfold = feat_unfold.permute(1, 2, 5, 6, 0, 3, 4).contiguous()
                 # Squeeze: [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out] --> [g, c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out]
                 feat_reshaped = feat_unfold.view(g, c_in_grouped*actual_k_h*actual_k_w, bs*h_out*w_out)
-                if module.bias is not None:
+                if module.bias is not None and not self.uncentered:
                     feat_reshaped = torch.concat((feat_reshaped, torch.ones(g, 1, bs*h_out*w_out).to(feat_reshaped.device)), dim=1)
 
                 # The following code is used to check whether the unfolding representation of convolution operation
@@ -246,9 +259,14 @@ class PCAHooker:
                 # unfold true: [g, c_in//g*k*k, len(sample_feature_indices)] | unfold false: [g, c_in//g, len(sample_feature_indices)]
                 
                 feature_cache = self.feature_caches[module_name]
-                feature_cache.append(feat_sampled)
-
                 pca_operators = self.pca_operators[module_name]
+                if self.uncentered:
+                    for group_idx in range(g):
+                        pca_operators[group_idx].partial_fit(feat_sampled[group_idx].T)
+                    torch.cuda.empty_cache()
+                    return
+
+                feature_cache.append(feat_sampled)
                 # Incremental PCA requires the first batch's size is larger than n_components
                 if sum([x.shape[2] for x in feature_cache]) >= pca_operators[0].n_components:
                     feat_sampled = torch.cat(feature_cache, dim=2)
@@ -278,6 +296,9 @@ class PCAHooker:
                         LOGGER.info(f"Too few samples to fit PCA in module {n}. Use normal PCA instead.")
                         self.pca_operators[n][ig].fit(torch.cat(cache, dim=2)[ig].T)
             cache.clear()
+            for operator in self.pca_operators[n]:
+                if hasattr(operator, "finalize"):
+                    operator.finalize()
     
     def get_pca_results(self, name, ig=None):
         if ig is not None:
@@ -331,8 +352,18 @@ class PCAHooker:
 
 
 class PCAHookerWithBboxes(PCAHooker):
-    def __init__(self, model, layers, modules=None, bboxes=None, device="cuda", check=False, unfold=True):
-        super().__init__(model, layers, modules, device, check, unfold)
+    def __init__(
+        self,
+        model,
+        layers,
+        modules=None,
+        bboxes=None,
+        device="cuda",
+        check=False,
+        unfold=True,
+        uncentered=False,
+    ):
+        super().__init__(model, layers, modules, device, check, unfold, uncentered)
         self.bboxes = bboxes
         
     def set_bboxes(self, bboxes):
@@ -388,12 +419,17 @@ class PCAHookerWithBboxes(PCAHooker):
 
 
 def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda",
-           check=False, pca_cache_save_path=None, sample_num=100, unfold=True, load_hist=None):
+           check=False, pca_cache_save_path=None, sample_num=100, unfold=True, load_hist=None,
+           uncentered=False, batch_size=1):
+    if batch_size < 1:
+        raise ValueError(f"PCA batch_size must be positive, got {batch_size}")
     # Create PCA Hooker
-    if label_dir is not None:
-        pca_hooker = PCAHookerWithBboxes(model, layers, modules, None, device, check, unfold)
+    if label_dir is not None and not uncentered:
+        pca_hooker = PCAHookerWithBboxes(
+            model, layers, modules, None, device, check, unfold, uncentered
+        )
     else:
-        pca_hooker = PCAHooker(model, layers, modules, device, check, unfold)
+        pca_hooker = PCAHooker(model, layers, modules, device, check, unfold, uncentered)
     
     # Load historical PCA cache if specified
     if load_hist is not None:
@@ -439,21 +475,27 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
                         LOGGER.warning(f"Label file {_label_name} not found in {label_dir}")
         
         
-        pbar = tqdm(range(min(sample_num, len(sample_files))), desc="PCA computing", total=min(sample_num, len(sample_files)))
+        sample_count = len(sample_files) if sample_num <= 0 else min(sample_num, len(sample_files))
+        step_size = batch_size if uncentered else 1
+        sample_starts = range(0, sample_count, step_size)
+        pbar = tqdm(sample_starts, desc="PCA computing", total=len(sample_starts))
         memory_monitor.set_progress_bar(pbar)
         memory_monitor.start_monitoring()
-        for i in pbar:
-            image = cv2.imread(sample_files[i])
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            image = cv2.resize(image, (640, 640))
-            image = image.transpose(2, 0, 1) / 255.0
-            image = torch.from_numpy(image).float()
-            image = image.to(device)
+        for sample_start in pbar:
+            sample_indices = range(sample_start, min(sample_start + step_size, sample_count))
+            images = []
+            for sample_idx in sample_indices:
+                image = cv2.imread(sample_files[sample_idx])
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                image = cv2.resize(image, (640, 640))
+                image = image.transpose(2, 0, 1) / 255.0
+                images.append(torch.from_numpy(image).float())
+            image_batch = torch.stack(images).to(device)
 
-            if label_dir is not None:
+            if label_dir is not None and not uncentered:
                 bboxes = []
-                if label_files[i] is not None:
-                    with open(label_files[i], "r") as f:
+                if label_files[sample_start] is not None:
+                    with open(label_files[sample_start], "r") as f:
                         labels = f.readlines()
                         for _label in labels:
                             _label = _label.strip().split()
@@ -464,7 +506,7 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
             
             pca_hooker.register_hook()
             with torch.no_grad():
-                _ = model(image.unsqueeze(0))
+                _ = model(image_batch)
             pca_hooker.remove_handle_()
     else:
         LOGGER.warning("No sample images provided, using random images for PCA")
@@ -486,6 +528,8 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
 
 
 def main(args):
+    if args.device.isdigit():
+        args.device = f"cuda:{args.device}"
     # Test CUDA availability
     if "cuda" in args.device and not torch.cuda.is_available():
         LOGGER.warning(f"{args.device} is not available, using cpu instead")
@@ -496,7 +540,8 @@ def main(args):
 
     # Get layers
     if args.layers is None and args.modules is None:
-        layers = list(range(len(model.model)))
+        end_layer = len(model.model) - 1 if args.exclude_head else len(model.model)
+        layers = list(range(end_layer))
     else:
         layers = args.layers
 
@@ -534,9 +579,21 @@ def main(args):
         raise ValueError(f"Invalid mode: {args.mode}")
 
     # Perform PCA
-    do_pca(model, layers, modules, args.sample_dir, args.label_dir,
-           args.device, args.check, args.save_path, args.sample_num,
-           unfold, args.load_hist)
+    do_pca(
+        model,
+        layers,
+        modules,
+        args.sample_dir,
+        args.label_dir,
+        args.device,
+        args.check,
+        args.save_path,
+        args.sample_num,
+        unfold,
+        args.load_hist,
+        args.uncentered,
+        args.batch_size,
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -548,11 +605,16 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", nargs="+", type=str, default=None,
         help="Dataset YAML configuration file(s). Can specify multiple datasets.")
     parser.add_argument("--sample_num", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--layers", nargs="+", type=int, default=None,
         help="Layers to calculate PCA for, use comma to separate, conv modules within layers are analyzed.")
     parser.add_argument("--modules", nargs="+", type=str, default=None,
         help="Modules to calculate PCA for, use comma to separate, providing more detailed control over the "+
         "modules to calculate PCA.")
+    parser.add_argument("--exclude_head", action="store_true",
+        help="Exclude the final detection head; NSGP governs the feature extractor only.")
+    parser.add_argument("--uncentered", action="store_true",
+        help="Accumulate uncentered input covariance as required by NSGP.")
     parser.add_argument("--mode", type=str, choices=["unfold", "fold"], default="unfold",
         help="Mode to calculate PCA, choices: unfold (default), fold.")
     parser.add_argument("--load_hist", type=str, default=None,
