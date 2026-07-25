@@ -9,6 +9,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ultralytics.nn.modules.head import Detect
+from ultralytics.utils import LOGGER
 
 
 def _restore_prototype_patches(features: Tensor, valid_masks: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -105,12 +106,19 @@ class RegionalPrototypeReplay:
                 }
             )
         self.levels = tuple(levels)
-        if old_class_count == 0:
-            raise ValueError("RePRE artifact contains no labeled prototypes")
         self.old_class_count = old_class_count
+        self.has_prototypes = old_class_count > 0
+        if not self.has_prototypes:
+            LOGGER.warning(
+                "RePRE artifact contains no prototypes; replay loss will be zero until "
+                "a later task produces valid prototypes"
+            )
 
     def compute_loss(self) -> Tensor:
         """Return classification-only replay loss for one training iteration."""
+        if not self.has_prototypes:
+            return torch.zeros((), device=self.device)
+
         level_losses = []
         classifier_states = [module.training for module in self.detect_head.cv3]
         try:

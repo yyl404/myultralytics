@@ -143,12 +143,33 @@ filter_iou_threshold: 0.5
 distillation: False
 dist_loss_weight: 1.0
 
+# BPF (Bridge Past and Future) settings --------------------------------------------------------------------------
+bpf: False # (bool) use the BPF training path
+bpf_past: False # (bool) bridge old classes with source-model pseudo labels
+bpf_future: False # (bool) ignore high-attention/high-objectness unlabeled regions
+bpf_dwf: False # (bool) use Distillation with Future
+bpf_source_model: None # (str) previous-task model with old classes only
+bpf_interim_model: None # (str) current-task expert model with new classes only
+bpf_score_threshold: 0.75 # (float) old-class pseudo-label confidence threshold
+bpf_nms_threshold: 0.3 # (float) old-class pseudo-label NMS threshold
+bpf_iou_low: 0.4 # (float) upper bound of the full-weight pseudo-label IoU band
+bpf_iou_high: 0.7 # (float) upper bound of the reduced-weight pseudo-label IoU band
+bpf_low_weight: 1.0 # (float) classification weight below bpf_iou_low
+bpf_high_weight: 0.3 # (float) classification weight in the middle IoU band
+bpf_object_topk: 0.1 # (float) Bridge Future objectness top-k ratio
+bpf_attention_topk: 0.1 # (float) Bridge Future attention top-k ratio
+bpf_future_iou: 0.1 # (float) maximum GT IoU for a future-class candidate
+bpf_attention_power: 2.0 # (float) attention-map exponent
+bpf_proposal_topk: 128 # (int) old-model candidates considered by DwF
+bpf_proposal_samples: 64 # (int) candidates randomly sampled by DwF
+bpf_split_iou: 0.5 # (float) DwF old/new proposal split threshold
+bpf_dwf_weight: 0.15 # (float) joint DwF classification and box loss weight
+
 # ewc settings
 ewc: False
 ewc_loss_weight: 1.0
-ewc_internal_scale: 100.0
-ewc_average_parameters: True
 importance_path: None
+reference_model: None
 
 # ESPReg (Eigen-value Scaled Projection Regularization) settings -----------------------------------------------
 espreg: False # (bool) whether to use ESPReg

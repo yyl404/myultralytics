@@ -38,9 +38,16 @@ from ultralytics.utils.metrics import bbox_iou, batch_probiou
 from ultralytics.engine.espreg import (
     EWPRegLoss,
 )
-from ultralytics.engine.ewc import EWCLoss
+from ultralytics.engine.bpf import (
+    bpf_pseudo_detections,
+    compute_dwf_loss,
+    merge_bpf_pseudo_labels,
+    select_future_ignore_mask,
+)
+from ultralytics.engine.ewc import EWCLoss, load_ewc_state
 from ultralytics.engine.nsgp import NSGP
 from ultralytics.engine.repre import RegionalPrototypeReplay
+from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.nn.modules.head import Detect, OBB
 
 
@@ -52,6 +59,36 @@ def get_model_raw_output(batch, model, device):
     """
     model_pred = model(batch['img'].to(device))
     return model_pred
+
+
+def get_model_raw_output_and_features(batch, model, device):
+    """Return raw output and the Detect input features for Bridge Future."""
+    head = _get_detect_head(model)
+    captured = {}
+
+    def _capture_head_input(_module, inputs):
+        features = inputs[0]
+        if not isinstance(features, list):
+            raise TypeError(f"Detect input must be a feature list, got {type(features)}")
+        captured["features"] = list(features)
+
+    handle = head.register_forward_pre_hook(_capture_head_input)
+    try:
+        model_pred = model(batch["img"].to(device))
+    finally:
+        handle.remove()
+    if "features" not in captured:
+        raise RuntimeError("Detect input hook did not capture Bridge Future features")
+    return model_pred, captured["features"]
+
+
+def _raw_detect_levels(output):
+    """Return raw Detect levels from train- or eval-mode model output."""
+    if isinstance(output, list):
+        return output
+    if isinstance(output, tuple) and len(output) == 2 and isinstance(output[1], list):
+        return output[1]
+    raise TypeError(f"Expected raw Detect levels or (decoded, levels), got {type(output)}")
 
 
 def _get_detect_head(model):
@@ -274,22 +311,43 @@ class AntiForgetTrainer(BaseTrainer):
         self.set_model_attributes()
 
         # ============================== MODIFIED: set up base model ============================================
-        self.base_model = deepcopy(self.model).eval()
-        for p in self.base_model.parameters():
-            p.requires_grad_(False)
+        if self.args.reference_model:
+            self.base_model, _ = load_checkpoint(self.args.reference_model, device=self.device)
+            self.base_model = self.base_model.eval()
+        else:
+            self.base_model = deepcopy(self.model).eval()
+        self.base_model.requires_grad_(False)
         # ============================== END: set up base model =================================================
+
+        # ============================== MODIFIED: set up BPF ==================================================
+        if self.args.bpf:
+            if not isinstance(_get_detect_head(self.model), Detect):
+                raise TypeError("BPF currently supports axis-aligned Detect models only")
+            if self.args.bpf_past or self.args.bpf_dwf:
+                if not self.args.bpf_source_model:
+                    raise ValueError("bpf_source_model is required when bpf_past or bpf_dwf is enabled")
+                self.bpf_source_model, _ = load_checkpoint(self.args.bpf_source_model, device=self.device)
+                self.bpf_source_model = self.bpf_source_model.eval()
+                self.bpf_source_model.requires_grad_(False)
+                if not isinstance(_get_detect_head(self.bpf_source_model), Detect):
+                    raise TypeError("BPF source model must use a Detect head")
+            if self.args.bpf_dwf:
+                if not self.args.bpf_interim_model:
+                    raise ValueError("bpf_interim_model is required when bpf_dwf is enabled")
+                self.bpf_interim_model, _ = load_checkpoint(self.args.bpf_interim_model, device=self.device)
+                self.bpf_interim_model = self.bpf_interim_model.eval()
+                self.bpf_interim_model.requires_grad_(False)
+                if not isinstance(_get_detect_head(self.bpf_interim_model), Detect):
+                    raise TypeError("BPF interim model must use a Detect head")
+            if self.args.bpf_dwf and self.args.distillation:
+                raise ValueError("BPF DwF and the legacy distillation loss are mutually exclusive")
+        # ============================== END: set up BPF ========================================================
 
         # ============================== MODIFIED: set up EWC loss ============================================
         if self.args.ewc:
             self.ewc_loss_weight = self.args.ewc_loss_weight
-            self.ewc_importance = torch.load(self.args.importance_path)['running_importance']
-            self.ewc_loss = EWCLoss(
-                self.model,
-                self.base_model,
-                importance=self.ewc_importance,
-                internal_scale=self.args.ewc_internal_scale,
-                average_parameters=self.args.ewc_average_parameters,
-            )
+            ewc_state = load_ewc_state(self.args.importance_path, map_location=self.device)
+            self.ewc_loss = EWCLoss(model=self.model, state=ewc_state)
         # ============================== END: set up EWC loss =================================================
 
         # ============================== MODIFIED: set up ESPReg loss ============================================
@@ -527,13 +585,13 @@ class AntiForgetTrainer(BaseTrainer):
             # ============================== MODIFIED: register hook ===========================================
             if self.args.espreg:
                 self.espreg_loss.register_hook()
-            if self.args.ewc:
-                self.ewc_loss.register_hook()
             
-            if self.args.espreg or self.args.ewc:
+            if self.args.espreg:
                 # Perform a forward in base model to hook out the base weights
                 with torch.no_grad():
-                    _ = self.base_model(torch.randn(1, 3, 640, 640).to(self.device))
+                    _ = self.base_model(
+                        torch.randn(1, 3, self.args.imgsz, self.args.imgsz, device=self.device)
+                    )
 
             # if self.args.kd:
             #     self.kd_loss.register_hook() # Register hook for KD loss
@@ -562,7 +620,18 @@ class AntiForgetTrainer(BaseTrainer):
                     if self.args.pseudo_label or self.args.distillation:
                         with torch.no_grad():
                             base_model_pred = get_model_raw_output(batch, self.base_model, self.device)
-                    model_pred = get_model_raw_output(batch, self.model, self.device)
+                    if self.args.bpf and (self.args.bpf_past or self.args.bpf_dwf):
+                        with torch.no_grad():
+                            bpf_source_pred = get_model_raw_output(batch, self.bpf_source_model, self.device)
+                    if self.args.bpf and self.args.bpf_dwf:
+                        with torch.no_grad():
+                            bpf_interim_pred = get_model_raw_output(batch, self.bpf_interim_model, self.device)
+                    if self.args.bpf and self.args.bpf_future:
+                        model_pred, bpf_head_features = get_model_raw_output_and_features(
+                            batch, self.model, self.device
+                        )
+                    else:
+                        model_pred = get_model_raw_output(batch, self.model, self.device)
                     # ============================== END: get raw preds =======================================
 
                     # ============================== MODIFIED: generate pseudo labels ===============================
@@ -576,6 +645,37 @@ class AntiForgetTrainer(BaseTrainer):
                             base_model_pred,
                         )
                     # ============================== END: generate pseudo labels ====================================
+
+                    # ============================== MODIFIED: BPF labels and future mask ===========================
+                    if self.args.bpf and self.args.bpf_past:
+                        source_head = _get_detect_head(self.bpf_source_model)
+                        pseudo_detections = bpf_pseudo_detections(
+                            head=source_head,
+                            raw_output=_raw_detect_levels(bpf_source_pred),
+                            image_size=batch["img"].shape[-2:],
+                            score_threshold=self.args.bpf_score_threshold,
+                            nms_threshold=self.args.bpf_nms_threshold,
+                        )
+                        batch = merge_bpf_pseudo_labels(
+                            batch=batch,
+                            detections=pseudo_detections,
+                            iou_low=self.args.bpf_iou_low,
+                            iou_high=self.args.bpf_iou_high,
+                            low_weight=self.args.bpf_low_weight,
+                            high_weight=self.args.bpf_high_weight,
+                        )
+                    if self.args.bpf and self.args.bpf_future:
+                        batch["bpf_ignore_mask"] = select_future_ignore_mask(
+                            head=_get_detect_head(self.model),
+                            raw_output=_raw_detect_levels(model_pred),
+                            head_features=bpf_head_features,
+                            batch=batch,
+                            object_topk=self.args.bpf_object_topk,
+                            attention_topk=self.args.bpf_attention_topk,
+                            iou_threshold=self.args.bpf_future_iou,
+                            attention_power=self.args.bpf_attention_power,
+                        )
+                    # ============================== END: BPF labels and future mask ==============================
                     
                     # ============================== MODIFIED: get det loss ===============================
                     loss, self.loss_items = self.model(batch, preds=model_pred)
@@ -593,6 +693,25 @@ class AntiForgetTrainer(BaseTrainer):
                         self.loss += (_dist_loss * self.args.dist_loss_weight)
                         loss_items = torch.cat([loss_items, torch.tensor([_dist_loss], device=loss_items.device)])
                     # ============================== END: calculate KL distillation loss ===============================
+
+                    # ============================== MODIFIED: BPF DwF ============================================
+                    if self.args.bpf and self.args.bpf_dwf:
+                        dwf_loss = compute_dwf_loss(
+                            student_head=_get_detect_head(self.model),
+                            student_output=_raw_detect_levels(model_pred),
+                            source_head=_get_detect_head(self.bpf_source_model),
+                            source_output=_raw_detect_levels(bpf_source_pred),
+                            interim_head=_get_detect_head(self.bpf_interim_model),
+                            interim_output=_raw_detect_levels(bpf_interim_pred),
+                            batch=batch,
+                            proposal_topk=self.args.bpf_proposal_topk,
+                            proposal_samples=self.args.bpf_proposal_samples,
+                            split_iou=self.args.bpf_split_iou,
+                        )
+                        self.loss += (dwf_loss.cls + dwf_loss.box) * self.args.bpf_dwf_weight
+                        loss_items = torch.cat((loss_items, dwf_loss.cls.detach().reshape(1)))
+                        loss_items = torch.cat((loss_items, dwf_loss.box.detach().reshape(1)))
+                    # ============================== END: BPF DwF ================================================
                     
                     # ============================== MODIFIED: calculate ESPReg loss ===================================
                     if self.args.espreg:
@@ -604,8 +723,8 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== MODIFIED: calculate EWC loss ===================================
                     if self.args.ewc:
                         _ewc_loss = self.ewc_loss.get_loss()
-                        self.loss += (_ewc_loss*self.ewc_loss_weight)
-                        loss_items = torch.cat([loss_items, torch.tensor([_ewc_loss], device=loss_items.device)])
+                        self.loss += _ewc_loss * self.ewc_loss_weight
+                        loss_items = torch.cat((loss_items, _ewc_loss.detach().reshape(1)))
                     # ============================== END: calculate EWC loss ========================================
 
                     # ============================== MODIFIED: calculate distillation loss =============================

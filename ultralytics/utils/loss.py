@@ -257,9 +257,25 @@ class v8DetectionLoss:
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
         # Targets
-        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        target_weights = batch.get("bpf_weights")
+        if target_weights is None:
+            target_weights = torch.ones(
+                (batch["bboxes"].shape[0], 1), device=batch["bboxes"].device, dtype=batch["bboxes"].dtype
+            )
+        else:
+            target_weights = target_weights.reshape(-1, 1).to(
+                device=batch["bboxes"].device, dtype=batch["bboxes"].dtype
+            )
+            if target_weights.shape[0] != batch["bboxes"].shape[0]:
+                raise ValueError(
+                    f"bpf_weights must contain one value per target, got {target_weights.shape[0]} "
+                    f"for {batch['bboxes'].shape[0]} targets"
+                )
+        targets = torch.cat(
+            (batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"], target_weights), 1
+        )
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        gt_labels, gt_bboxes, gt_weights = targets.split((1, 4, 1), 2)  # cls, xyxy, per-target cls weight
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
         # Pboxes
@@ -267,7 +283,7 @@ class v8DetectionLoss:
         # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
         # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
 
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -279,9 +295,26 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
 
+        # Classification weighting follows BPF's weighted ROI CE: only positives assigned to pseudo GT are scaled.
+        cls_anchor_weights = torch.ones_like(fg_mask, dtype=dtype)
+        if fg_mask.any():
+            assigned_weights = gt_weights.squeeze(-1).gather(1, target_gt_idx.clamp_min(0))
+            cls_anchor_weights[fg_mask] = assigned_weights[fg_mask].to(dtype)
+        future_ignore_mask = batch.get("bpf_ignore_mask")
+        if future_ignore_mask is not None:
+            future_ignore_mask = future_ignore_mask.to(device=self.device, dtype=torch.bool)
+            if future_ignore_mask.shape != fg_mask.shape:
+                raise ValueError(
+                    f"bpf_ignore_mask must have shape {tuple(fg_mask.shape)}, got "
+                    f"{tuple(future_ignore_mask.shape)}"
+                )
+            cls_anchor_weights[future_ignore_mask & ~fg_mask] = 0
+
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[1] = (
+            self.bce(pred_scores, target_scores.to(dtype)).sum(dim=-1) * cls_anchor_weights
+        ).sum() / target_scores_sum
 
         # Bbox loss
         if fg_mask.sum():

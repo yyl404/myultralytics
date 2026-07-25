@@ -7,7 +7,7 @@ model_adapter_validate() {
     : "${MODEL_ID:?Set MODEL_ID for output naming and diagnostics}"
 
     case "$METHOD" in
-        naive|pseudo_label|pseudo_label+ewc|pseudo_label+espreg|pseudo_label+dist+espreg|pseudo_label+nsgp|pseudo_label+nsgp+repre)
+        naive|bpf|pseudo_label|pseudo_label+ewc|pseudo_label+espreg|pseudo_label+dist+espreg|pseudo_label+nsgp|pseudo_label+nsgp+repre)
             ;;
         *)
             echo "Unsupported Ultralytics incremental method: $METHOD" >&2
@@ -27,6 +27,17 @@ model_adapter_initialize() {
     EWC_LOSS_WEIGHT="${EWC_LOSS_WEIGHT:-100.0}"
     ESPREG_LOSS_WEIGHT="${ESPREG_LOSS_WEIGHT:-100.0}"
     DIST_LOSS_WEIGHT="${DIST_LOSS_WEIGHT:-100.0}"
+    BPF_INTERIM_EPOCHS="${BPF_INTERIM_EPOCHS:-$EPOCHS}"
+    BPF_SCORE_THRESHOLD="${BPF_SCORE_THRESHOLD:-0.75}"
+    BPF_NMS_THRESHOLD="${BPF_NMS_THRESHOLD:-0.3}"
+    BPF_IOU_LOW="${BPF_IOU_LOW:-0.4}"
+    BPF_IOU_HIGH="${BPF_IOU_HIGH:-0.7}"
+    BPF_LOW_WEIGHT="${BPF_LOW_WEIGHT:-1.0}"
+    BPF_HIGH_WEIGHT="${BPF_HIGH_WEIGHT:-0.3}"
+    BPF_OBJECT_TOPK="${BPF_OBJECT_TOPK:-0.1}"
+    BPF_ATTENTION_TOPK="${BPF_ATTENTION_TOPK:-0.1}"
+    BPF_FUTURE_IOU="${BPF_FUTURE_IOU:-0.1}"
+    BPF_DWF_WEIGHT="${BPF_DWF_WEIGHT:-0.15}"
     if ! declare -p EXTRA_TRAIN_ARGS >/dev/null 2>&1; then
         EXTRA_TRAIN_ARGS=()
     fi
@@ -68,12 +79,23 @@ model_adapter_prepare_task() {
     TRAINER_ARGS=()
     WEIGHT_ARGS=()
     FREEZE_ARGS=()
+    REFERENCE_MODEL=""
 
     if (( TASK_ID == 1 )); then
         TRAIN_MODEL="$MODEL_CONFIG"
         TRAIN_DATA="$DATASET_PATH"
         if [[ -n "${MODEL_WEIGHTS:-}" ]]; then
             WEIGHT_ARGS=(--weight "$MODEL_WEIGHTS")
+        fi
+        if [[ "$METHOD" == "bpf" ]]; then
+            TRAINER_ARGS=(
+                --trainer bpf
+                --bpf True
+                --bpf_future True
+                --bpf_object_topk "$BPF_OBJECT_TOPK"
+                --bpf_attention_topk "$BPF_ATTENTION_TOPK"
+                --bpf_future_iou "$BPF_FUTURE_IOU"
+            )
         fi
     else
         if [[ ! -f "$PREVIOUS_MODEL" ]]; then
@@ -96,6 +118,7 @@ model_adapter_prepare_task() {
             --workers "$WORKERS"
 
         TRAIN_MODEL="$expanded_model"
+        REFERENCE_MODEL="$expanded_model"
         TRAIN_DATA="${converted_data}/dataset.yaml"
         TRAINER_ARGS=(--trainer antiforget)
 
@@ -105,8 +128,7 @@ model_adapter_prepare_task() {
                 --old_importance "$PREVIOUS_IMPORTANCE" \
                 --old_model "$PREVIOUS_MODEL" \
                 --new_model "$expanded_model" \
-                --save_path "$expanded_importance" \
-                --copy_importance_init
+                --save_path "$expanded_importance"
             PREVIOUS_IMPORTANCE="$expanded_importance"
         fi
 
@@ -114,9 +136,49 @@ model_adapter_prepare_task() {
             naive)
                 TRAINER_ARGS=()
                 ;;
+            bpf)
+                bpf_source_model="$PREVIOUS_MODEL"
+                bpf_interim_model="${TASK_DIR}/interim.pt"
+                interim_weight_args=()
+                if [[ -n "${MODEL_WEIGHTS:-}" ]]; then
+                    interim_weight_args=(--weight "$MODEL_WEIGHTS")
+                fi
+                python tools/train.py \
+                    --model "$MODEL_CONFIG" \
+                    --data "$DATASET_PATH" \
+                    --save_path "$bpf_interim_model" \
+                    --epochs "$BPF_INTERIM_EPOCHS" \
+                    --batch_size "$BATCH_SIZE" \
+                    --imgsz "$IMGSZ" \
+                    --workers "$WORKERS" \
+                    --device "$DEVICE" \
+                    --project "${TASK_DIR}/interim" \
+                    "${interim_weight_args[@]}" \
+                    "${EXTRA_TRAIN_ARGS[@]}"
+                if [[ ! -f "$bpf_interim_model" ]]; then
+                    echo "BPF interim model not found after training: $bpf_interim_model" >&2
+                    exit 1
+                fi
+                TRAINER_ARGS=(
+                    --trainer bpf
+                    --bpf True
+                    --bpf_past True
+                    --bpf_dwf True
+                    --bpf_source_model "$bpf_source_model"
+                    --bpf_interim_model "$bpf_interim_model"
+                    --bpf_score_threshold "$BPF_SCORE_THRESHOLD"
+                    --bpf_nms_threshold "$BPF_NMS_THRESHOLD"
+                    --bpf_iou_low "$BPF_IOU_LOW"
+                    --bpf_iou_high "$BPF_IOU_HIGH"
+                    --bpf_low_weight "$BPF_LOW_WEIGHT"
+                    --bpf_high_weight "$BPF_HIGH_WEIGHT"
+                    --bpf_dwf_weight "$BPF_DWF_WEIGHT"
+                )
+                ;;
             pseudo_label)
                 TRAINER_ARGS+=(
                     --pseudo_label True
+                    --reference_model "$REFERENCE_MODEL"
                     --conf_threshold "$CONF_THRESHOLD"
                     --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
                 )
@@ -124,6 +186,7 @@ model_adapter_prepare_task() {
             pseudo_label+ewc)
                 TRAINER_ARGS+=(
                     --pseudo_label True
+                    --reference_model "$REFERENCE_MODEL"
                     --conf_threshold "$CONF_THRESHOLD"
                     --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
                     --ewc True
@@ -134,6 +197,7 @@ model_adapter_prepare_task() {
             pseudo_label+espreg)
                 TRAINER_ARGS+=(
                     --pseudo_label True
+                    --reference_model "$REFERENCE_MODEL"
                     --conf_threshold "$CONF_THRESHOLD"
                     --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
                     --espreg True
@@ -144,6 +208,7 @@ model_adapter_prepare_task() {
             pseudo_label+dist+espreg)
                 TRAINER_ARGS+=(
                     --pseudo_label True
+                    --reference_model "$REFERENCE_MODEL"
                     --conf_threshold "$CONF_THRESHOLD"
                     --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
                     --distillation True
@@ -156,6 +221,7 @@ model_adapter_prepare_task() {
             pseudo_label+nsgp|pseudo_label+nsgp+repre)
                 TRAINER_ARGS+=(
                     --pseudo_label True
+                    --reference_model "$REFERENCE_MODEL"
                     --conf_threshold "$CONF_THRESHOLD"
                     --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
                     --nsgp True
@@ -163,9 +229,7 @@ model_adapter_prepare_task() {
                     --pca_cache_path "$PREVIOUS_PCA"
                     --ewc True
                     --importance_path "$PREVIOUS_IMPORTANCE"
-                    --ewc_loss_weight 1000.0
-                    --ewc_internal_scale 2.0
-                    --ewc_average_parameters False
+                    --ewc_loss_weight 2000.0
                 )
                 if [[ "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
                     TRAINER_ARGS+=(
@@ -219,8 +283,20 @@ model_adapter_finalize_task() {
     if [[ "$METHOD" == "pseudo_label+ewc" || "$METHOD" == "pseudo_label+nsgp" \
         || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
         importance_args=()
+        history_args=()
+        reference_args=()
         if [[ "$METHOD" == "pseudo_label+nsgp" || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
-            importance_args=(--module_pattern "*bn*" --raw)
+            importance_args=(--scope normalization)
+        fi
+        if [[ -n "$PREVIOUS_IMPORTANCE" ]]; then
+            history_args=(--load_hist "$PREVIOUS_IMPORTANCE")
+        fi
+        if [[ -n "$REFERENCE_MODEL" ]]; then
+            reference_args=(
+                --reference_model "$REFERENCE_MODEL"
+                --conf_threshold "$CONF_THRESHOLD"
+                --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
+            )
         fi
         python tools/cal_importance.py \
             --model "$PREVIOUS_MODEL" \
@@ -229,7 +305,9 @@ model_adapter_finalize_task() {
             --batch_size "$BATCH_SIZE" \
             --workers "$WORKERS" \
             --device "$DEVICE" \
-            "${importance_args[@]}"
+            "${importance_args[@]}" \
+            "${history_args[@]}" \
+            "${reference_args[@]}"
         PREVIOUS_IMPORTANCE="${TASK_DIR}/importance.pth"
     fi
 

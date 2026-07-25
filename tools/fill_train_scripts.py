@@ -4,7 +4,7 @@ Generate missing training scripts for voc, coco, rsar.
 Target: naive, pseudo_label, pseudo_label+espreg, pseudo_label+ewc, pseudo_label+espreg+ewc,
         pseudo_label+proto_rp, pseudo_label+espreg+proto_rp, pseudo_label+ewc+proto_rp, pseudo_label+espreg+ewc+proto_rp.
 Canonical order: pseudo_label -> espreg -> ewc -> proto_rp.
-When espreg and ewc are used together, EWC uses --module_pattern "*bn" only.
+When espreg and ewc are used together, EWC uses normalization parameters only.
 """
 from pathlib import Path
 import os
@@ -417,12 +417,12 @@ echo "All tasks completed!"
 
 
 def gen_pseudo_label_ewc(cfg, use_bn_only=False):
-    """use_bn_only: when True (espreg+ewc), cal_importance with --module_pattern '*bn'."""
+    """Generate pseudo-label plus EWC scripts, optionally restricting EWC to normalization parameters."""
     w = cfg.get("weight")
     freeze = cfg.get("freeze_layers")
     fl_decl = ("\nFREEZE_LAYERS=(\n    " + "\n    ".join('"' + f + '"' for f in freeze) + "\n)\n") if freeze else ""
     fl_train = " \\\n            --freeze ${FREEZE_LAYERS[$((task_num-1))]}" if freeze else ""
-    bn_line = '            --module_pattern "*bn" \\' if use_bn_only else ""
+    bn_line = "            --scope normalization \\" if use_bn_only else ""
     weight_decl = '\nYOLOE_MODEL_WEIGHT="' + cfg.get("weight", "") + '"\n' if cfg.get("weight") else ""
     return f"""#!/bin/bash
 MODEL_CFG="{cfg['model_cfg']}"
@@ -496,8 +496,7 @@ for DATASET_PATH in "${{TASK_DATASETS[@]}}"; do
                 --old_importance $PREV_IMPORTANCE_PATH \\
                 --old_model $PREV_MODEL \\
                 --new_model $EXPANDED_MODEL \\
-                --save_path $EXPANDED_IMPORTANCE_PATH \\
-                --copy_importance_init
+                --save_path $EXPANDED_IMPORTANCE_PATH
             PREV_IMPORTANCE_PATH="$EXPANDED_IMPORTANCE_PATH"
         fi
 
@@ -513,7 +512,7 @@ for DATASET_PATH in "${{TASK_DATASETS[@]}}"; do
             --device $DEVICE \\
             --project $TASK_DIR \\{fl_train} \\
             --trainer antiforget"
-        TRAIN_CMD="$TRAIN_CMD --pseudo_label True --conf_threshold $CONF_THRESHOLD --filter_iou_threshold $FILTER_IOU_THRESHOLD"
+        TRAIN_CMD="$TRAIN_CMD --pseudo_label True --reference_model $EXPANDED_MODEL --conf_threshold $CONF_THRESHOLD --filter_iou_threshold $FILTER_IOU_THRESHOLD"
         if [ -n "$PREV_IMPORTANCE_PATH" ] && [ -f "$PREV_IMPORTANCE_PATH" ]; then
             TRAIN_CMD="$TRAIN_CMD --ewc True --importance_path $PREV_IMPORTANCE_PATH --ewc_loss_weight $EWC_LOSS_WEIGHT"
         fi
@@ -526,6 +525,10 @@ for DATASET_PATH in "${{TASK_DATASETS[@]}}"; do
             --dataset "$ID_CONVERTED_DATASET/dataset.yaml" \\
             --save_path $IMPORTANCE_PATH \\
 {bn_line}
+            --load_hist $PREV_IMPORTANCE_PATH \\
+            --reference_model $EXPANDED_MODEL \\
+            --conf_threshold $CONF_THRESHOLD \\
+            --filter_iou_threshold $FILTER_IOU_THRESHOLD \\
             --batch_size $BATCH_SIZE \\
             --workers $WORKERS \\
             --device $DEVICE
@@ -624,7 +627,7 @@ for DATASET_PATH in "${{TASK_DATASETS[@]}}"; do
             --model $TASK_DIR/best.pt \\
             --dataset $DATASET_PATH \\
             --save_path $IMPORTANCE_PATH \\
-            --module_pattern "*bn" \\
+            --scope normalization \\
             --batch_size $BATCH_SIZE \\
             --workers $WORKERS \\
             --device $DEVICE
@@ -641,8 +644,7 @@ for DATASET_PATH in "${{TASK_DATASETS[@]}}"; do
                 --old_importance $PREV_IMPORTANCE_PATH \\
                 --old_model $PREV_MODEL \\
                 --new_model $EXPANDED_MODEL \\
-                --save_path $EXPANDED_IMPORTANCE_PATH \\
-                --copy_importance_init
+                --save_path $EXPANDED_IMPORTANCE_PATH
             PREV_IMPORTANCE_PATH="$EXPANDED_IMPORTANCE_PATH"
         fi
 
@@ -658,7 +660,7 @@ for DATASET_PATH in "${{TASK_DATASETS[@]}}"; do
             --device $DEVICE \\
             --project $TASK_DIR \\{fl_train} \\
             --trainer antiforget"
-        TRAIN_CMD="$TRAIN_CMD --pseudo_label True --conf_threshold $CONF_THRESHOLD --filter_iou_threshold $FILTER_IOU_THRESHOLD"
+        TRAIN_CMD="$TRAIN_CMD --pseudo_label True --reference_model $EXPANDED_MODEL --conf_threshold $CONF_THRESHOLD --filter_iou_threshold $FILTER_IOU_THRESHOLD"
         TRAIN_CMD="$TRAIN_CMD --espreg True --pca_cache_path $PREV_PCA_CACHE --espreg_loss_weight $ESPREG_LOSS_WEIGHT"
         if [ -n "$PREV_IMPORTANCE_PATH" ] && [ -f "$PREV_IMPORTANCE_PATH" ]; then
             TRAIN_CMD="$TRAIN_CMD --ewc True --importance_path $PREV_IMPORTANCE_PATH --ewc_loss_weight $EWC_LOSS_WEIGHT"
@@ -678,7 +680,11 @@ for DATASET_PATH in "${{TASK_DATASETS[@]}}"; do
             --model $TASK_DIR/best.pt \\
             --dataset "$ID_CONVERTED_DATASET/dataset.yaml" \\
             --save_path $IMPORTANCE_PATH \\
-            --module_pattern "*bn" \\
+            --scope normalization \\
+            --load_hist $PREV_IMPORTANCE_PATH \\
+            --reference_model $EXPANDED_MODEL \\
+            --conf_threshold $CONF_THRESHOLD \\
+            --filter_iou_threshold $FILTER_IOU_THRESHOLD \\
             --batch_size $BATCH_SIZE \\
             --workers $WORKERS \\
             --device $DEVICE

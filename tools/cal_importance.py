@@ -1,387 +1,304 @@
-"""Calculate parameter importance for YOLO models using Fisher Information Matrix.
+"""Estimate and persist per-task diagonal Fisher information for EWC.
 
-This script calculates the importance of each parameter in a YOLO model based on
-the Fisher Information Matrix (diagonal approximation), which is computed as the
-square of gradients averaged over the training dataset.
-
-Usage:
-    $ python tools/cal_importance.py \
-        --model <path/to/model.pt> \
-        --dataset <path/to/dataset.yaml> \
-        --save_path <path/to/save/importance.pth> \
-        [--batch_size <batch_size>] \
-        [--workers <num_workers>] \
-        [--device <device>] \
-        [--layers <layer1> <layer2> ...] \
-        [--modules <module1> <module2> ...] \
-        [--module_pattern <pattern1> [<pattern2> ...]]
-
-Arguments:
-    --model: Path to the model checkpoint (.pt file)
-    --dataset: Path to the dataset YAML file
-    --save_path: Path to save the importance dictionary
-    --batch_size: Batch size for processing (default: 16)
-    --workers: Number of data loading workers (default: 8)
-    --device: Device to use (default: "cuda")
-    --layers: (optional) Layers to calculate importance for, space-separated.
-    --modules: (optional) Exact module names to calculate importance for, space-separated.
-    --module_pattern: (optional) Module name pattern(s) with wildcard *, e.g. "model.10.*".
-        Only one of --layers, --modules, --module_pattern may be set.
-
-Example:
-    $ python tools/cal_importance.py \
-        --model runs/task1/best.pt \
-        --dataset data/VOC_inc_10_10/task_1_cls_10/dataset.yaml \
-        --save_path runs/task1/importance.pth \
-        --batch_size 16 \
-        --device 0
-    
-    $ python tools/cal_importance.py \
-        --model runs/task1/best.pt \
-        --dataset data/VOC_inc_10_10/task_1_cls_10/dataset.yaml \
-        --save_path runs/task1/importance.pth \
-        --layers 10 11 12
-    
-    $ python tools/cal_importance.py \
-        --model runs/task1/best.pt \
-        --dataset data/VOC_inc_10_10/task_1_cls_10/dataset.yaml \
-        --save_path runs/task1/importance.pth \
-        --modules model.10.conv model.11.bn
-
-    $ python tools/cal_importance.py \
-        --model runs/task1/best.pt \
-        --dataset data/VOC_inc_10_10/task_1_cls_10/dataset.yaml \
-        --save_path runs/task1/importance.pth \
-        --module_pattern "model.10.*" "model.11.*"
+The estimator follows the object-detection procedure used by NSGP-RePRE: keep the
+trained model fixed in evaluation mode, run the complete task detection loss over
+the training loader, and average squared gradients. No clipping, tensor-wise
+normalization, AMP, or optimizer update is applied.
 """
+
+from __future__ import annotations
 
 import argparse
 import fnmatch
-import os
+from pathlib import Path
+from typing import Any
+
 import torch
+from torch import Tensor, nn
 
 from ultralytics import YOLO
+from ultralytics.engine.ewc import EWC_STATE_VERSION, load_ewc_state, validate_ewc_state
+from ultralytics.models.yolo.detect import AntiForgetDetectionTrainer, DetectionTrainer
+from ultralytics.models.yolo.obb import AntiForgetOBBTrainer, OBBTrainer
 from ultralytics.utils import LOGGER
 from ultralytics.utils.callbacks import default_callbacks
-from ultralytics.models.yolo.detect import DetectionTrainer
+from ultralytics.utils.torch_utils import unwrap_model
+
+
+def _normalization_parameter_names(model: nn.Module) -> set[str]:
+    """Return affine parameter names belonging to parameterized normalization modules."""
+    normalization_types = (
+        nn.modules.batchnorm._NormBase,
+        nn.GroupNorm,
+        nn.InstanceNorm1d,
+        nn.InstanceNorm2d,
+        nn.InstanceNorm3d,
+        nn.LayerNorm,
+    )
+    names = set()
+    for module_name, module in model.named_modules():
+        if isinstance(module, normalization_types):
+            for parameter_name, parameter in module.named_parameters(recurse=False):
+                if parameter.requires_grad:
+                    names.add(f"{module_name}.{parameter_name}" if module_name else parameter_name)
+    return names
+
+
+def _select_parameter_names(
+    model: nn.Module,
+    scope: str,
+    module_patterns: list[str] | None = None,
+) -> set[str]:
+    """Select trainable model parameters for full-model or normalization-only EWC."""
+    trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    if scope == "all":
+        selected = trainable
+    elif scope == "normalization":
+        selected = trainable & _normalization_parameter_names(model)
+    else:
+        raise ValueError(f"Unsupported EWC parameter scope: {scope}")
+
+    if module_patterns:
+        selected = {
+            name
+            for name in selected
+            if any(fnmatch.fnmatch(name.rsplit(".", 1)[0], pattern) for pattern in module_patterns)
+        }
+    if not selected:
+        raise ValueError(
+            f"No trainable parameters matched EWC scope='{scope}', module_patterns={module_patterns}"
+        )
+    return selected
 
 
 class ImportanceCalculator:
+    """Accumulate a sample-weighted average of squared task-loss gradients."""
+
     def __init__(
-        self, model, layers=None, modules=None, module_pattern=None, device="cuda", normalize=True
+        self,
+        model: nn.Module,
+        scope: str = "all",
+        module_patterns: list[str] | None = None,
+        history: dict[str, Any] | None = None,
     ):
-        """Initialize ImportanceCalculator.
-
-        Args:
-            model: Model to calculate importance for
-            layers: List of layer IDs to calculate importance for (optional)
-            modules: List of module name prefixes to calculate importance for (optional)
-            module_pattern: List of fnmatch patterns for module names, e.g. ["model.10.*"] (optional)
-            device: Device to use (default: "cuda")
-        """
-        self.model = model
-        self.modules = {}
-        self.running_importance = {}
-        self.n_batch = {}
-        if not torch.cuda.is_available():
-            device = "cpu"
-            LOGGER.warning("CUDA is not available, using CPU")
-        self.device = device
-        self.normalize = normalize
-
-        def _match(n, lid):
-            return f"model.{lid}." in n and "dfl" not in n
-
-        if module_pattern is not None:
-            for n, m in model.named_modules():
-                if "dfl" not in n and any(fnmatch.fnmatch(n, p) for p in module_pattern):
-                    self.modules[n] = m
-        elif modules is not None:
-            for n, m in model.named_modules():
-                if n in modules:
-                    self.modules[n] = m
-        elif layers is not None:
-            for lid in layers:
-                for n, m in model.named_modules():
-                    if _match(n, lid):
-                        self.modules[n] = m
-        else:
-            for n, m in model.named_modules():
-                if "dfl" not in n:
-                    self.modules[n] = m
-
-    @property
-    def names(self):
-        return list(self.running_importance.keys())
-
-    def process_gradients(self):
-        """Process gradients for all tracked modules after backward() completes.
-        This should be called after loss.backward() but before optimizer.step().
-        
-        This method applies gradient clipping to prevent NaN/Inf values before processing.
-        """
-        max_grad_norm = 35.0  # Clip gradients to prevent overflow when squared
-        
-        for module_name, mod in self.modules.items():
-            for param_name, param in mod.named_parameters(recurse=False):
-                if param.requires_grad and param.grad is not None:
-                    full_param_name = f"{module_name}.{param_name}" if module_name else param_name
-                    
-                    if self.normalize:
-                        param.grad = torch.nan_to_num(
-                            param.grad,
-                            nan=0.0,
-                            posinf=max_grad_norm,
-                            neginf=-max_grad_norm,
-                        )
-                        param.grad = torch.clamp(param.grad, min=-max_grad_norm, max=max_grad_norm)
-
-                    grad_squared = param.grad ** 2
-                    if self.normalize:
-                        grad_max_val = torch.max(grad_squared).item()
-                        importance_batch = grad_squared / (grad_max_val + 1e-12)
-                    else:
-                        importance_batch = grad_squared
-                    
-                    if full_param_name not in self.running_importance.keys():
-                        self.running_importance[full_param_name] = torch.zeros_like(
-                            importance_batch, device=param.device
-                        )
-                        self.n_batch[full_param_name] = 0
-                    
-                    n_batch = self.n_batch[full_param_name]
-                    self.running_importance[full_param_name] = n_batch / (n_batch + 1) * self.running_importance[full_param_name] + \
-                        importance_batch / (n_batch+1)
-                    self.n_batch[full_param_name] += 1
-
-    def save_importance(self, save_path):
-        """Save calculator state to file.
-        
-        Saves all state variables needed to restore the calculator:
-        - running_importance: Dictionary of parameter importance values
-        - n_batch: Dictionary of batch counts for each parameter
-        - modules: List of module names (keys of self.modules)
-        - device: Device used for calculation
-        """
-        LOGGER.info(f"Saving importance to {save_path}")
-        state = {
-            'running_importance': self.running_importance,
-            'n_batch': self.n_batch,
-            'modules': list(self.modules.keys()),
-            'device': self.device,
+        """Bind selected parameters and optional prior task history."""
+        self.model = unwrap_model(model)
+        selected_names = _select_parameter_names(
+            self.model, scope=scope, module_patterns=module_patterns
+        )
+        model_params = dict(self.model.named_parameters())
+        self.parameters = {name: model_params[name] for name in sorted(selected_names)}
+        self.importance_sum = {
+            name: torch.zeros_like(parameter, memory_format=torch.preserve_format)
+            for name, parameter in self.parameters.items()
         }
-        with open(save_path, "wb") as f:
-            torch.save(state, f)
-    
-    def load_importance(self, load_path):
-        """Load calculator state from file.
-        
-        Restores all state variables:
-        - running_importance: Dictionary of parameter importance values
-        - n_batch: Dictionary of batch counts for each parameter
-        - modules: Dictionary of modules restored from saved module names
-        - device: Device used for calculation
-        
-        Note: Requires self.model to be set before calling this method to restore modules.
-        """
-        with open(load_path, "rb") as f:
-            state = torch.load(f)
-        
-        self.running_importance = state.get('running_importance', {})
-        self.n_batch = state.get('n_batch', {})
-        self.device = state.get('device', self.device)
-        
-        module_names = state.get('modules', None)
-        if module_names is not None and self.model is not None:
-            self.modules = {}
-            for n, m in self.model.named_modules():
-                if n in module_names:
-                    self.modules[n] = m
-        
-        LOGGER.info(f"Loaded importance from {load_path}")
+        self.sample_count = 0
+        self.scope = scope
+        self.history = history
+
+        if history is not None:
+            validate_ewc_state(history)
+            history_names = set(history["importance"])
+            if history_names != selected_names:
+                raise KeyError(
+                    "Historical EWC parameters do not match the selected current parameters: "
+                    f"history_only={sorted(history_names - selected_names)}, "
+                    f"current_only={sorted(selected_names - history_names)}"
+                )
+            for name, parameter in self.parameters.items():
+                for task_idx, fisher in enumerate(history["importance"][name]):
+                    if fisher.shape != parameter.shape:
+                        raise ValueError(
+                            f"Historical EWC shape mismatch for '{name}' task {task_idx}: "
+                            f"history={tuple(fisher.shape)}, current={tuple(parameter.shape)}"
+                        )
+
+    def process_gradients(self, batch_samples: int) -> None:
+        """Add one batch's squared gradients with its sample-count weight."""
+        if batch_samples <= 0:
+            raise ValueError(f"batch_samples must be positive, got {batch_samples}")
+        for name, parameter in self.parameters.items():
+            if parameter.grad is None:
+                continue
+            gradient = parameter.grad.detach()
+            if not torch.isfinite(gradient).all():
+                raise FloatingPointError(f"Non-finite Fisher gradient for parameter '{name}'")
+            self.importance_sum[name].add_(gradient.square(), alpha=batch_samples)
+        self.sample_count += batch_samples
+
+    def build_state(self) -> dict[str, Any]:
+        """Append the current Fisher and parameter optimum to prior task history."""
+        if self.sample_count == 0:
+            raise RuntimeError("No gradients were collected while estimating EWC importance")
+
+        if self.history is None:
+            importance = {name: [] for name in self.parameters}
+            task_params = {name: [] for name in self.parameters}
+            sample_counts = []
+        else:
+            importance = {
+                name: [tensor.detach().cpu().clone() for tensor in history]
+                for name, history in self.history["importance"].items()
+            }
+            task_params = {
+                name: [tensor.detach().cpu().clone() for tensor in history]
+                for name, history in self.history["task_params"].items()
+            }
+            sample_counts = list(self.history.get("sample_counts", []))
+
+        for name, parameter in self.parameters.items():
+            fisher = (self.importance_sum[name] / self.sample_count).detach().cpu()
+            importance[name].append(fisher)
+            task_params[name].append(parameter.detach().cpu().clone())
+        sample_counts.append(self.sample_count)
+        state = {
+            "version": EWC_STATE_VERSION,
+            "importance": importance,
+            "task_params": task_params,
+            "sample_counts": sample_counts,
+            "scope": self.scope,
+        }
+        validate_ewc_state(state)
+        return state
 
 
-def calculate_importance(model, dataset, layers=None, modules=None, module_pattern=None,
-                         workers=8, device="cuda", epochs=1, batch_size=None, load_hist=None,
-                         normalize=True):
-    """Calculate parameter importance using Fisher Information Matrix approximation.
+def _disable_validation(trainer) -> None:
+    """Disable validation and final evaluation for the Fisher-only pass."""
+    trainer.args.val = False
+    trainer.validate = lambda: ({}, 0.0)
+    trainer.final_eval = lambda: None
 
-    Args:
-        model: YOLO model instance
-        dataset: Path to dataset YAML file or dataset config dict
-        layers: List of layer IDs to calculate importance for (optional)
-        modules: List of module name prefixes to calculate importance for (optional)
-        module_pattern: List of fnmatch patterns for module names, e.g. ["model.10.*"] (optional)
-            If layers, modules and module_pattern are all None, importance will be calculated
-            for all modules (excluding DFL layer which is always frozen)
-        workers: Number of data loading workers
-        device: Device to use for training
-        epochs: Number of epochs to train (default: 1)
-        batch_size: Batch size for training (optional, passed to model.train() if specified)
-        load_hist: Path to previously saved importance file to load as starting point (optional)
-    
-    Returns:
-        ImportanceCalculator: Calculator instance with calculated importance
-    """
+
+def calculate_importance(
+    model: YOLO,
+    dataset: str,
+    save_path: str,
+    workers: int = 8,
+    device: str = "cuda",
+    batch_size: int = 8,
+    scope: str = "all",
+    module_patterns: list[str] | None = None,
+    load_hist: str | None = None,
+    reference_model: str | None = None,
+    conf_threshold: float = 0.25,
+    filter_iou_threshold: float = 0.5,
+) -> dict[str, Any]:
+    """Estimate one task Fisher at fixed parameters and save the complete EWC history."""
+    history = load_ewc_state(load_hist, map_location="cpu") if load_hist else None
     calculator = None
-    
+    optimizer_step_count = 0
+
     train_kwargs = {
-        'data': dataset,
-        'epochs': epochs,
-        'device': device,
-        'workers': workers,
-        'batch': batch_size,
-        'val': False,
-        'plots': False,
-        'save': False,
-        'amp': False, # Use float32 to achieve high accuracy
-        'model': model.ckpt_path if hasattr(model, 'ckpt_path') else str(model.overrides.get('model', '')),
+        "data": dataset,
+        "epochs": 1,
+        "device": device,
+        "workers": workers,
+        "batch": batch_size,
+        "nbs": batch_size,
+        "warmup_epochs": 0.0,
+        "val": False,
+        "plots": False,
+        "save": False,
+        "amp": False,
+        "model": model.ckpt_path,
+        "ewc": False,
+        "pseudo_label": reference_model is not None,
+        "reference_model": reference_model,
+        "conf_threshold": conf_threshold,
+        "filter_iou_threshold": filter_iou_threshold,
     }
-    
-    def on_train_start_callback(trainer):
-        """Callback function executed at the start of training.
-        
-        This callback initializes the importance calculator and overrides the optimizer
-        step to collect gradient statistics for importance calculation without actually
-        updating model parameters.
-        """
+
+    def on_train_start(trainer) -> None:
+        """Initialize collection after the trainer has built and placed its model."""
         nonlocal calculator
-        
-        # Initialize importance calculator for tracking parameter importance
+        trainer.model.eval()
+        trainer._model_train = trainer.model.eval
         calculator = ImportanceCalculator(
             trainer.model,
-            layers=layers,
-            modules=modules,
-            module_pattern=module_pattern,
-            normalize=normalize,
-            device=device
+            scope=scope,
+            module_patterns=module_patterns,
+            history=history,
         )
-        
-        # Load previously calculated importance as starting point (if provided)
-        # This allows incremental importance calculation across multiple training runs
-        if load_hist is not None:
-            calculator.load_importance(load_hist)
-            LOGGER.info(f"Loaded previous importance from {load_hist} as starting point")
-        
-        # Note: Model parameters' requires_grad is managed by the trainer
-        # for param in trainer.model.parameters():
-        #     param.requires_grad = True
-        
-        LOGGER.info(f"Registered importance calculation for {len(calculator.modules)} modules")
 
-        def new_optimizer_step():
-            """Override optimizer step to collect gradients for importance calculation without updating model."""
-            trainer.scaler.unscale_(trainer.optimizer)
-            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), max_norm=10.0)
-            calculator.process_gradients()
-            # Skip optimizer.step() - only collect statistics, don't update model
-            # trainer.scaler.step(trainer.optimizer)
-            # trainer.scaler.update()
+        def collect_without_step() -> None:
+            nonlocal optimizer_step_count
+            if calculator is None:
+                raise RuntimeError("EWC importance calculator was not initialized")
+            dataset_size = len(trainer.train_loader.dataset)
+            consumed = optimizer_step_count * batch_size
+            current_batch_size = min(batch_size, dataset_size - consumed)
+            if current_batch_size <= 0:
+                raise RuntimeError(
+                    f"Invalid Fisher batch accounting: dataset_size={dataset_size}, consumed={consumed}"
+                )
+            calculator.process_gradients(batch_samples=current_batch_size)
+            optimizer_step_count += 1
             trainer.optimizer.zero_grad()
-            # if trainer.ema:
-            #     trainer.ema.update(trainer.model)
-        
-        # Override the default optimizer step with our custom version
-        trainer.optimizer_step = new_optimizer_step
-        
-    # Register the callback to be executed when training starts
+
+        trainer.optimizer_step = collect_without_step
+
     callbacks = default_callbacks.copy()
-    callbacks['on_train_start'] = callbacks['on_train_start'] + [on_train_start_callback]
-    
-    # Disable validation during and after training
-    def disable_validation(trainer):
-        # Ensure val is False
-        trainer.args.val = False
-        
-        # Override validate method to skip validation
-        original_validate = trainer.validate
-        def no_op_validate():
-            LOGGER.debug("Skipping validation for importance calculation")
-            return {}, 0.0  # Return empty metrics and zero fitness
-        trainer.validate = no_op_validate
-        
-        # Override final_eval method to skip final evaluation
-        original_final_eval = trainer.final_eval
-        def no_op_final_eval():
-            LOGGER.info("Skipping final evaluation for importance calculation")
-            pass
-        trainer.final_eval = no_op_final_eval
-    
-    callbacks['on_train_start'] = callbacks['on_train_start'] + [disable_validation]
-    
-    trainer = DetectionTrainer(overrides=train_kwargs, _callbacks=callbacks)
-    
+    callbacks["on_train_start"] = callbacks["on_train_start"] + [
+        on_train_start,
+        _disable_validation,
+    ]
+
+    task = getattr(model, "task", "detect")
+    if task == "obb":
+        trainer_class = AntiForgetOBBTrainer if reference_model else OBBTrainer
+    elif task == "detect":
+        trainer_class = AntiForgetDetectionTrainer if reference_model else DetectionTrainer
+    else:
+        raise TypeError(f"EWC importance supports detect and obb tasks, got '{task}'")
+
+    trainer = trainer_class(overrides=train_kwargs, _callbacks=callbacks)
     trainer.train()
-    
-    LOGGER.info("Importance calculation completed!")
-    return calculator
+    if calculator is None:
+        raise RuntimeError("EWC importance calculation did not start")
+
+    state = calculator.build_state()
+    output = Path(save_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(state, output)
+    LOGGER.info(
+        f"Saved EWC task {len(next(iter(state['importance'].values())))} state "
+        f"for {len(state['importance'])} parameters to {output}"
+    )
+    return state
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Calculate parameter importance for YOLO models")
-    parser.add_argument("--model", type=str, required=True, 
-                       help="Path to the model checkpoint (.pt file)")
-    parser.add_argument("--dataset", type=str, required=True,
-                       help="Path to the dataset YAML file")
-    parser.add_argument("--save_path", type=str, required=True,
-                       help="Path to save the importance dictionary")
-    parser.add_argument("--batch_size", type=int, default=8,
-                       help="Batch size for training (optional, will use model default if not specified)")
-    parser.add_argument("--workers", type=int, default=8,
-                       help="Number of data loading workers (default: 8)")
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device to use (default: cuda)")
-    parser.add_argument("--layers", nargs="+", type=int, default=None,
-                       help="Layers to calculate importance for, space-separated. "
-                            "Only one of --layers, --modules, --module_pattern may be set.")
-    parser.add_argument("--modules", nargs="+", type=str, default=None,
-                       help="Exact module names to calculate importance for, space-separated "
-                            "(e.g. 'model.10.conv' 'model.11.bn'). "
-                            "Only one of --layers, --modules, --module_pattern may be set.")
-    parser.add_argument("--module_pattern", nargs="+", type=str, default=None,
-                       help="Module name pattern(s) with wildcard *, e.g. 'model.10.*' or "
-                            "'model.1*.conv'. Only one of --layers, --modules, --module_pattern may be set.")
-    parser.add_argument("--load_hist", type=str, default=None,
-                       help="Path to previously saved importance file to load as starting point. "
-                            "If specified, importance calculation will continue from the loaded state.")
-    parser.add_argument("--raw", action="store_true",
-                       help="Accumulate raw squared gradients without clipping or per-tensor normalization.")
-    
+def main() -> None:
+    """Parse command-line arguments and estimate EWC importance."""
+    parser = argparse.ArgumentParser(description="Calculate diagonal Fisher information for EWC")
+    parser.add_argument("--model", required=True, help="Trained model checkpoint")
+    parser.add_argument("--dataset", required=True, help="Current task dataset YAML")
+    parser.add_argument("--save_path", required=True, help="Output EWC artifact")
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--scope", choices=("all", "normalization"), default="all")
+    parser.add_argument("--module_pattern", nargs="+", default=None)
+    parser.add_argument("--load_hist", default=None, help="Expanded EWC artifact from prior tasks")
+    parser.add_argument("--reference_model", default=None, help="Frozen teacher used for pseudo labels")
+    parser.add_argument("--conf_threshold", type=float, default=0.25)
+    parser.add_argument("--filter_iou_threshold", type=float, default=0.5)
     args = parser.parse_args()
 
-    provided = sum(1 for x in (args.layers, args.modules, args.module_pattern) if x is not None)
-    if provided > 1:
-        parser.error("Only one of --layers, --modules, --module_pattern may be set.")
-
-    LOGGER.info(f"Loading model from {args.model}...")
-    model = YOLO(args.model)
-    
-    importance_calculator = calculate_importance(
-        model,
+    calculate_importance(
+        YOLO(args.model),
         dataset=args.dataset,
+        save_path=args.save_path,
         batch_size=args.batch_size,
         workers=args.workers,
         device=args.device,
-        layers=args.layers,
-        modules=args.modules,
-        module_pattern=args.module_pattern,
-        normalize=not args.raw,
-        load_hist=args.load_hist
+        scope=args.scope,
+        module_patterns=args.module_pattern,
+        load_hist=args.load_hist,
+        reference_model=args.reference_model,
+        conf_threshold=args.conf_threshold,
+        filter_iou_threshold=args.filter_iou_threshold,
     )
-    
-    LOGGER.info(f"Saving importance to {args.save_path}...")
-    save_dir = os.path.dirname(os.path.abspath(args.save_path))
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-    importance_calculator.save_importance(args.save_path)
-    
-    total_params = sum(p.numel() for p in importance_calculator.running_importance.values())
-    LOGGER.info(f"Importance calculation completed!")
-    LOGGER.info(f"Total parameters with importance: {len(importance_calculator.running_importance)}")
-    LOGGER.info(f"Total parameter count: {total_params:,}")
-    LOGGER.info(f"Importance saved to: {args.save_path}")
 
 
 if __name__ == "__main__":
     main()
-

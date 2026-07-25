@@ -61,7 +61,12 @@ Examples:
 import argparse
 
 from ultralytics import YOLO
-from ultralytics.models.yolo.detect import DetectionTrainer, AntiForgetDetectionTrainer, ABRDetectionTrainer
+from ultralytics.models.yolo.detect import (
+    ABRDetectionTrainer,
+    AntiForgetDetectionTrainer,
+    BPFDetectionTrainer,
+    DetectionTrainer,
+)
 from ultralytics.models.yolo.obb import AntiForgetOBBTrainer
 
 
@@ -180,6 +185,10 @@ def main():
     task = getattr(model, "task", "detect")
     if args.trainer == "antiforget":
         trainer = AntiForgetOBBTrainer if task == "obb" else AntiForgetDetectionTrainer
+    elif args.trainer == "bpf":
+        if task != "detect":
+            raise ValueError(f"BPF trainer supports detect models only, got task={task}")
+        trainer = BPFDetectionTrainer
     elif args.trainer == "abr":
         trainer = ABRDetectionTrainer
     else:

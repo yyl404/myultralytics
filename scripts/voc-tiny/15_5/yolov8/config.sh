@@ -10,7 +10,7 @@ TASK_DATASETS=(
     "data/VOC-TINY_15+5/task_2_cls_5/dataset.yaml"
 )
 OUTPUT_PREFIX="runs/yolov8x_VOC-TINY_15+5_pretrained-from-yolov8x-cls"
-EPOCHS="${EPOCHS:-100}"
+EPOCHS="${EPOCHS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 IMGSZ="${IMGSZ:-640}"
 WORKERS="${WORKERS:-8}"

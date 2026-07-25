@@ -421,6 +421,20 @@ class AntiForgetDetectionTrainer(AntiForgetTrainer):
         del train_dataset  # free memory
         return super().auto_batch(max_num_obj)
 
+
+class BPFDetectionTrainer(AntiForgetDetectionTrainer):
+    """Detection trainer exposing BPF-specific loss names."""
+
+    def get_validator(self):
+        """Return a detection validator with BPF loss labels."""
+        validator = super().get_validator()
+        if self.args.bpf_dwf:
+            loss_names = list(self.loss_names)
+            loss_names.extend(("bpf_dwf_cls_loss", "bpf_dwf_box_loss"))
+            self.loss_names = tuple(loss_names)
+        return validator
+
+
 class ABRDetectionTrainer(AntiForgetDetectionTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         super().__init__(cfg, overrides, _callbacks)
