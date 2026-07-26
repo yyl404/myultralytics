@@ -16,6 +16,58 @@ model_adapter_validate() {
     esac
 }
 
+model_adapter_regenerate_missing_artifacts() {
+    local previous_dataset="$1"
+
+    if [[ "$METHOD" == "pseudo_label+ewc" || "$METHOD" == "pseudo_label+nsgp" \
+        || "$METHOD" == "pseudo_label+nsgp+repre" ]] \
+        && [[ ! -f "$PREVIOUS_IMPORTANCE" ]]; then
+        local -a importance_args=()
+        if [[ "$METHOD" == "pseudo_label+nsgp" || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+            importance_args=(--scope normalization)
+        fi
+        echo "Regenerating missing importance artifact: $PREVIOUS_IMPORTANCE"
+        python tools/cal_importance.py \
+            --model "$PREVIOUS_MODEL" \
+            --dataset "$previous_dataset" \
+            --save_path "$PREVIOUS_IMPORTANCE" \
+            --batch_size "$BATCH_SIZE" \
+            --workers "$WORKERS" \
+            --device "$DEVICE" \
+            "${importance_args[@]}"
+    fi
+
+    if [[ "$METHOD" == *"espreg"* || "$METHOD" == "pseudo_label+nsgp" \
+        || "$METHOD" == "pseudo_label+nsgp+repre" ]] \
+        && [[ ! -f "$PREVIOUS_PCA" ]]; then
+        local -a covariance_args=()
+        if [[ "$METHOD" == "pseudo_label+nsgp" || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+            covariance_args=(--uncentered --sample_num 0 --batch_size "$BATCH_SIZE")
+        fi
+        echo "Regenerating missing PCA artifact: $PREVIOUS_PCA"
+        python tools/pca.py \
+            --model "$PREVIOUS_MODEL" \
+            --dataset "$previous_dataset" \
+            --save_path "$PREVIOUS_PCA" \
+            --device "$DEVICE" \
+            --exclude_head \
+            "${covariance_args[@]}"
+    fi
+
+    if [[ "$METHOD" == "pseudo_label+nsgp+repre" && ! -f "$PREVIOUS_PROTOTYPES" ]]; then
+        echo "Regenerating missing RePRE prototypes: $PREVIOUS_PROTOTYPES"
+        python tools/generate_prototypes.py \
+            --model "$PREVIOUS_MODEL" \
+            --data "$previous_dataset" \
+            --output "$PREVIOUS_PROTOTYPES" \
+            --device "$DEVICE" \
+            --imgsz "$IMGSZ" \
+            --num_protos 10 \
+            --selection density \
+            --radius 0.6
+    fi
+}
+
 model_adapter_initialize() {
     EPOCHS="${EPOCHS:-100}"
     BATCH_SIZE="${BATCH_SIZE:-16}"
@@ -56,6 +108,12 @@ model_adapter_initialize() {
             echo "Previous task model not found: $PREVIOUS_MODEL" >&2
             exit 1
         fi
+        previous_dataset="${TASK_DATASETS[$((START_TASK - 2))]}"
+        if [[ ! -f "$previous_dataset" ]]; then
+            echo "Previous task dataset config not found: $previous_dataset" >&2
+            exit 1
+        fi
+        model_adapter_regenerate_missing_artifacts "$previous_dataset"
         if [[ "$METHOD" == "pseudo_label+ewc" || "$METHOD" == "pseudo_label+nsgp" \
             || "$METHOD" == "pseudo_label+nsgp+repre" ]] \
             && [[ ! -f "$PREVIOUS_IMPORTANCE" ]]; then
