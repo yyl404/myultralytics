@@ -12,6 +12,7 @@ Usage:
         [--project <project_dir>] \
         [--save_path <results.csv>] \
         [--confusion_matrix_path <confusion_matrix.csv>] \
+        [--iou_threshold <0.50:0.05:0.95>] \
         [--<additional_args> ...]
 
 Arguments:
@@ -28,6 +29,8 @@ Arguments:
         Box-F1, mAP50, mAP50-95. Default: 'results.csv'.
     --confusion_matrix_path: Path to save the confusion matrix CSV file.
         Default: 'confusion_matrix.csv'.
+    --iou_threshold: Optional AP IoU threshold to export as an additional per-class CSV column.
+        Must be on the COCO 0.50:0.05:0.95 grid. This does not change NMS IoU.
     --<additional_args>: Additional dynamic arguments can be passed to the model.val()
         method. These will be automatically parsed and passed through. Examples include
         --imgsz, --conf, --iou, --batch, etc.
@@ -52,8 +55,38 @@ Examples:
 
 import argparse
 import csv
+from typing import Optional
 
 from ultralytics import YOLO
+
+
+def _ap_iou_index(iou_threshold: float) -> tuple[int, float]:
+    """Return the index and canonical value for a COCO AP IoU threshold."""
+    index = round((iou_threshold - 0.5) / 0.05)
+    if index < 0 or index > 9:
+        raise ValueError(f"iou_threshold must be between 0.50 and 0.95, got {iou_threshold}")
+    canonical = 0.5 + index * 0.05
+    if abs(iou_threshold - canonical) > 1e-6:
+        raise ValueError(
+            f"iou_threshold must use the COCO 0.05 grid from 0.50 to 0.95, got {iou_threshold}"
+        )
+    return index, canonical
+
+
+def add_ap_iou_metric(summary: list[dict], box_metrics, iou_threshold: Optional[float]) -> Optional[str]:
+    """Add per-class AP at one optional IoU threshold and return its CSV column name."""
+    if iou_threshold is None:
+        return None
+    index, canonical = _ap_iou_index(iou_threshold)
+    all_ap = box_metrics.all_ap
+    if len(all_ap) != len(summary):
+        raise ValueError(
+            f"Per-class AP rows disagree with summary rows: {len(all_ap)} AP rows vs {len(summary)} summaries"
+        )
+    column = f"mAP{round(canonical * 100)}"
+    for row_index, item in enumerate(summary):
+        item[column] = round(float(all_ap[row_index, index]), 5)
+    return column
 
 
 def _coerce_value(raw: str):
@@ -154,6 +187,12 @@ def main():
     parser.add_argument("--project", type=str, default="runs/detect", help="Project name(where to save logs)")
     parser.add_argument("--save_path", type=str, default="results.csv", help="Path to save results")
     parser.add_argument("--confusion_matrix_path", type=str, default="confusion_matrix.csv", help="Path to save confusion matrix")
+    parser.add_argument(
+        "--iou_threshold",
+        type=float,
+        default=None,
+        help="Optional per-class AP IoU threshold to export (0.50:0.05:0.95); this does not change NMS IoU",
+    )
     args, unknown = parser.parse_known_args()
     dynamic_kwargs = parse_dynamic_named_args(unknown) # Other dynamic arguments
 
@@ -163,16 +202,20 @@ def main():
         model.load(args.weight)
     results = model.val(data=args.data, device=args.device, project=args.project, **dynamic_kwargs)
     summary = results.summary()
+    optional_ap_column = add_ap_iou_metric(summary, results.box, args.iou_threshold)
     confusion_matrix = results.confusion_matrix.summary()
     
     # Write results to CSV file
     with open(args.save_path, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['Class', 'Instances', 'Box-P', 'Box-R', 'Box-F1', 'mAP50', 'mAP50-95']
+        fieldnames = ['Class', 'Instances', 'Box-P', 'Box-R', 'Box-F1', 'mAP50']
+        if optional_ap_column and optional_ap_column != "mAP50":
+            fieldnames.append(optional_ap_column)
+        fieldnames.append('mAP50-95')
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         writer.writeheader()
         for item in summary:
-            writer.writerow({
+            row = {
                 'Class': item["Class"],
                 'Instances': item["Instances"],
                 'Box-P': item["Box-P"],
@@ -180,7 +223,10 @@ def main():
                 'Box-F1': item["Box-F1"],
                 'mAP50': item["mAP50"],
                 'mAP50-95': item["mAP50-95"]
-            })
+            }
+            if optional_ap_column and optional_ap_column != "mAP50":
+                row[optional_ap_column] = item[optional_ap_column]
+            writer.writerow(row)
     
     print(f"Results saved to {args.save_path}")
 

@@ -53,50 +53,50 @@ import os
 from ultralytics.utils import LOGGER
 
 
-def extract_map_from_csv(csv_path):
-    """
-    Extract mAP50 and mAP50-95 from evaluation CSV file.
-    Returns the average mAP across all classes.
-    """
+METRIC_ORDER = ("mAP50", "mAP75", "mAP50-95")
+
+
+def extract_metrics_from_csv(csv_path):
+    """Extract available mAP metrics, averaging per-class rows when no all row exists."""
     if not os.path.exists(csv_path):
-        return None, None
-    
-    map50_values = []
-    map50_95_values = []
-    
+        return {}
+
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
+        metric_columns = [metric for metric in METRIC_ORDER if metric in (reader.fieldnames or [])]
+        values = {metric: [] for metric in metric_columns}
         for row in reader:
-            # Skip 'all' row if exists (we'll handle it separately)
             if row.get('Class', '').lower() == 'all':
-                map50 = float(row.get('mAP50', 0))
-                map50_95 = float(row.get('mAP50-95', 0))
-                return map50, map50_95
-            
-            # Collect mAP values
-            map50_str = row.get('mAP50', '')
-            map50_95_str = row.get('mAP50-95', '')
-            
-            if map50_str and map50_95_str:
-                map50_val = float(map50_str)
-                map50_95_val = float(map50_95_str)
-                map50_values.append(map50_val)
-                map50_95_values.append(map50_95_val)
-    
-    # Calculate mean if no 'all' row found
-    if map50_values:
-        map50 = sum(map50_values) / len(map50_values)
-        map50_95 = sum(map50_95_values) / len(map50_95_values)
-        return map50, map50_95
-    else:
-        return None, None
+                return {
+                    metric: float(row[metric])
+                    for metric in metric_columns
+                    if row.get(metric, '') != ''
+                }
+            for metric in metric_columns:
+                raw_value = row.get(metric, '')
+                if raw_value != '':
+                    values[metric].append(float(raw_value))
+
+    return {
+        metric: sum(metric_values) / len(metric_values)
+        for metric, metric_values in values.items()
+        if metric_values
+    }
+
+
+def _available_metrics(results):
+    """Return metric columns present in at least one result, in stable order."""
+    present = set()
+    for result in results:
+        present.update(result)
+    return [metric for metric in METRIC_ORDER if metric in present]
 
 
 def generate_individual_table(eval_results, output_path):
     """
     Generate table for individual dataset evaluations.
     
-    eval_results: dict of {model_task: {dataset_task: (map50, map50_95)}}
+    eval_results: dict of {model_task: {dataset_task: {metric_name: value}}}
     """
     # Get all unique model tasks and dataset tasks
     model_tasks = sorted(eval_results.keys())
@@ -106,10 +106,13 @@ def generate_individual_table(eval_results, output_path):
     dataset_tasks = sorted(dataset_tasks)
     
     # Build fieldnames
+    metrics = _available_metrics(
+        metrics for model_results in eval_results.values() for metrics in model_results.values()
+    )
     fieldnames = ['Model_Task']
     for dataset_task in dataset_tasks:
-        fieldnames.append(f'Task_{dataset_task}_mAP50')
-        fieldnames.append(f'Task_{dataset_task}_mAP50-95')
+        for metric in metrics:
+            fieldnames.append(f'Task_{dataset_task}_{metric}')
     
     # Write CSV
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
@@ -120,18 +123,19 @@ def generate_individual_table(eval_results, output_path):
             row = {'Model_Task': f'Task_{model_task}'}
             for dataset_task in dataset_tasks:
                 if dataset_task in eval_results[model_task]:
-                    map50, map50_95 = eval_results[model_task][dataset_task]
-                    if map50 is not None:
-                        row[f'Task_{dataset_task}_mAP50'] = f'{map50:.4f}'
-                        row[f'Task_{dataset_task}_mAP50-95'] = f'{map50_95:.4f}'
+                    result = eval_results[model_task][dataset_task]
+                    if result:
+                        for metric in metrics:
+                            value = result.get(metric)
+                            row[f'Task_{dataset_task}_{metric}'] = f'{value:.4f}' if value is not None else 'N/A'
                     else:
                         LOGGER.warning(f"Failed to extract mAP values for Model Task {model_task} on Dataset Task {dataset_task}. CSV file may be empty or invalid.")
-                        row[f'Task_{dataset_task}_mAP50'] = 'N/A'
-                        row[f'Task_{dataset_task}_mAP50-95'] = 'N/A'
+                        for metric in metrics:
+                            row[f'Task_{dataset_task}_{metric}'] = 'N/A'
                 else:
                     LOGGER.warning(f"No evaluation results found for Model Task {model_task} on Dataset Task {dataset_task}.")
-                    row[f'Task_{dataset_task}_mAP50'] = 'N/A'
-                    row[f'Task_{dataset_task}_mAP50-95'] = 'N/A'
+                    for metric in metrics:
+                        row[f'Task_{dataset_task}_{metric}'] = 'N/A'
             writer.writerow(row)
     
     print(f"Individual dataset evaluation table saved to {output_path}")
@@ -141,29 +145,26 @@ def generate_cumulative_table(cumulative_results, output_path):
     """
     Generate table for cumulative dataset evaluations.
     
-    cumulative_results: dict of {model_task: (map50, map50_95)}
+    cumulative_results: dict of {model_task: {metric_name: value}}
     """
-    fieldnames = ['Model', 'mAP50', 'mAP50-95']
+    metrics = _available_metrics(cumulative_results.values())
+    fieldnames = ['Model', *metrics]
     
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         
         for model_task in sorted(cumulative_results.keys()):
-            map50, map50_95 = cumulative_results[model_task]
-            if map50 is not None:
-                writer.writerow({
-                    'Model': f'Model_{model_task}',
-                    'mAP50': f'{map50:.4f}',
-                    'mAP50-95': f'{map50_95:.4f}'
-                })
+            result = cumulative_results[model_task]
+            if result:
+                row = {'Model': f'Model_{model_task}'}
+                for metric in metrics:
+                    value = result.get(metric)
+                    row[metric] = f'{value:.4f}' if value is not None else 'N/A'
+                writer.writerow(row)
             else:
                 LOGGER.warning(f"Failed to extract mAP values for Model Task {model_task} on cumulative dataset. CSV file may be empty or invalid.")
-                writer.writerow({
-                    'Model': f'Model_{model_task}',
-                    'mAP50': 'N/A',
-                    'mAP50-95': 'N/A'
-                })
+                writer.writerow({'Model': f'Model_{model_task}', **{metric: 'N/A' for metric in metrics}})
     
     print(f"Cumulative dataset evaluation table saved to {output_path}")
 
@@ -195,15 +196,13 @@ def main():
         for dataset_task in range(1, args.num_tasks + 1):
             csv_path = os.path.join(args.eval_dir, 
                                    f"model_{model_task}_eval_task_{dataset_task}.csv")
-            map50, map50_95 = extract_map_from_csv(csv_path)
-            individual_results[model_task][dataset_task] = (map50, map50_95)
+            individual_results[model_task][dataset_task] = extract_metrics_from_csv(csv_path)
         
         # Check for cumulative dataset (optional for zero-shot)
         csv_path = os.path.join(args.eval_dir,
                                f"model_{model_task}_eval_cumulative.csv")
         if os.path.exists(csv_path):
-            map50, map50_95 = extract_map_from_csv(csv_path)
-            cumulative_results[model_task] = (map50, map50_95)
+            cumulative_results[model_task] = extract_metrics_from_csv(csv_path)
     else:
         # Incremental learning mode: process all model tasks
         for model_task in range(1, args.num_tasks + 1):
@@ -213,15 +212,13 @@ def main():
             for dataset_task in range(1, model_task + 1):
                 csv_path = os.path.join(args.eval_dir, 
                                        f"model_{model_task}_eval_task_{dataset_task}.csv")
-                map50, map50_95 = extract_map_from_csv(csv_path)
-                individual_results[model_task][dataset_task] = (map50, map50_95)
+                individual_results[model_task][dataset_task] = extract_metrics_from_csv(csv_path)
             
             # Evaluate on cumulative dataset
             csv_path = os.path.join(args.eval_dir,
                                    f"model_{model_task}_eval_cumulative.csv")
             if os.path.exists(csv_path):
-                map50, map50_95 = extract_map_from_csv(csv_path)
-                cumulative_results[model_task] = (map50, map50_95)
+                cumulative_results[model_task] = extract_metrics_from_csv(csv_path)
     
     # Generate tables
     individual_table_path = os.path.join(args.output_dir, "individual_datasets_eval.csv")

@@ -141,7 +141,7 @@ filter_iou_threshold: 0.5
 
 # distillation setting
 distillation: False
-dist_loss_weight: 1.0
+dist_loss_weight: 100.0
 
 # BPF (Bridge Past and Future) settings --------------------------------------------------------------------------
 bpf: False # (bool) use the BPF training path
@@ -173,7 +173,7 @@ reference_model: None
 
 # ESPReg (Eigen-value Scaled Projection Regularization) settings -----------------------------------------------
 espreg: False # (bool) whether to use ESPReg
-espreg_loss_weight: 1.0 # (float) the contribution weight of ESPReg loss in total loss
+espreg_loss_weight: 100.0 # (float) the contribution weight of ESPReg loss in total loss
 pca_cache_path: None # (str, optional)
 
 # NSGP settings ----------------------------------------------------------------------------------------------------

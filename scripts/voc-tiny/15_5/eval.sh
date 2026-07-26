@@ -22,7 +22,7 @@ NUM_TASKS=${#TASK_DATASETS[@]}
 mkdir -p "$EVAL_OUTPUT_DIR"
 
 echo "=========================================="
-echo "Incremental Learning Model Evaluation (VOC 15_5)"
+echo "Incremental Learning Model Evaluation (VOC-TINY 15+5)"
 echo "=========================================="
 echo "Output directory: $OUTPUT_DIR"
 echo "Evaluation results directory: $EVAL_OUTPUT_DIR"
@@ -72,3 +72,8 @@ done
 python tools/generate_eval_tables.py \
     --eval_dir "$EVAL_OUTPUT_DIR" --num_tasks "$NUM_TASKS" --output_dir "$EVAL_OUTPUT_DIR"
 [ $? -eq 0 ] && echo "Evaluation complete. Tables: $EVAL_OUTPUT_DIR/individual_datasets_eval.csv, $EVAL_OUTPUT_DIR/cumulative_datasets_eval.csv" || exit 1
+
+python tools/summarize_cumulative_task_map.py \
+    --evaluation_csv "$EVAL_OUTPUT_DIR/model_${NUM_TASKS}_eval_cumulative.csv" \
+    --task_data "${TASK_DATASETS[@]}" \
+    --output "$EVAL_OUTPUT_DIR/final_cumulative_task_mAP.csv"

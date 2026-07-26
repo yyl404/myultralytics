@@ -9,20 +9,20 @@ EVAL_OUTPUT_DIR="${OUTPUT_DIR}/evaluation_results"
 DEVICE=0
 
 TASK_DATASETS=(
-    "data/VOC_15+5/task_1_cls_15/dataset.yaml"
-    "data/VOC_15+5/task_2_cls_5/dataset.yaml"
+    "data/VOC_19+1/task_1_cls_19/dataset.yaml"
+    "data/VOC_19+1/task_2_cls_1/dataset.yaml"
 )
 
 CUMULATIVE_DATASETS=(
-    "data/VOC_15+5/task_1_cls_15/dataset.yaml"
-    "data/VOC_15+5/task_1-2_cls_20/dataset.yaml"
+    "data/VOC_19+1/task_1_cls_19/dataset.yaml"
+    "data/VOC_19+1/task_1-2_cls_20/dataset.yaml"
 )
 
 NUM_TASKS=${#TASK_DATASETS[@]}
 mkdir -p "$EVAL_OUTPUT_DIR"
 
 echo "=========================================="
-echo "Incremental Learning Model Evaluation (VOC 15_5)"
+echo "Incremental Learning Model Evaluation (VOC 19+1)"
 echo "=========================================="
 echo "Output directory: $OUTPUT_DIR"
 echo "Evaluation results directory: $EVAL_OUTPUT_DIR"
@@ -72,3 +72,8 @@ done
 python tools/generate_eval_tables.py \
     --eval_dir "$EVAL_OUTPUT_DIR" --num_tasks "$NUM_TASKS" --output_dir "$EVAL_OUTPUT_DIR"
 [ $? -eq 0 ] && echo "Evaluation complete. Tables: $EVAL_OUTPUT_DIR/individual_datasets_eval.csv, $EVAL_OUTPUT_DIR/cumulative_datasets_eval.csv" || exit 1
+
+python tools/summarize_cumulative_task_map.py \
+    --evaluation_csv "$EVAL_OUTPUT_DIR/model_${NUM_TASKS}_eval_cumulative.csv" \
+    --task_data "${TASK_DATASETS[@]}" \
+    --output "$EVAL_OUTPUT_DIR/final_cumulative_task_mAP.csv"
