@@ -7,7 +7,7 @@ model_adapter_validate() {
     : "${MODEL_ID:?Set MODEL_ID for output naming and diagnostics}"
 
     case "$METHOD" in
-        naive|bpf|pseudo_label|pseudo_label+ewc|pseudo_label+espreg|pseudo_label+dist+espreg|pseudo_label+nsgp|pseudo_label+nsgp+repre)
+        naive|bpf|pseudo_label|pseudo_label+ewc|pseudo_label+l2|pseudo_label+espreg|pseudo_label+dist+espreg|pseudo_label+nsgp|pseudo_label+nsgp+repre)
             ;;
         *)
             echo "Unsupported Ultralytics incremental method: $METHOD" >&2
@@ -77,8 +77,11 @@ model_adapter_initialize() {
     CONF_THRESHOLD="${CONF_THRESHOLD:-0.25}"
     FILTER_IOU_THRESHOLD="${FILTER_IOU_THRESHOLD:-0.5}"
     EWC_LOSS_WEIGHT="${EWC_LOSS_WEIGHT:-100.0}"
+    L2_LOSS_WEIGHT="${L2_LOSS_WEIGHT:-100.0}"
     ESPREG_LOSS_WEIGHT="${ESPREG_LOSS_WEIGHT:-100.0}"
     DIST_LOSS_WEIGHT="${DIST_LOSS_WEIGHT:-100.0}"
+    DIST_TOPK="${DIST_TOPK:-1}"
+    RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
     BPF_INTERIM_EPOCHS="${BPF_INTERIM_EPOCHS:-$EPOCHS}"
     BPF_SCORE_THRESHOLD="${BPF_SCORE_THRESHOLD:-0.75}"
     BPF_NMS_THRESHOLD="${BPF_NMS_THRESHOLD:-0.3}"
@@ -252,6 +255,16 @@ model_adapter_prepare_task() {
                     --ewc_loss_weight "$EWC_LOSS_WEIGHT"
                 )
                 ;;
+            pseudo_label+l2)
+                TRAINER_ARGS+=(
+                    --pseudo_label True
+                    --reference_model "$REFERENCE_MODEL"
+                    --conf_threshold "$CONF_THRESHOLD"
+                    --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
+                    --l2 True
+                    --l2_loss_weight "$L2_LOSS_WEIGHT"
+                )
+                ;;
             pseudo_label+espreg)
                 TRAINER_ARGS+=(
                     --pseudo_label True
@@ -271,6 +284,7 @@ model_adapter_prepare_task() {
                     --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
                     --distillation True
                     --dist_loss_weight "$DIST_LOSS_WEIGHT"
+                    --dist_topk "$DIST_TOPK"
                     --espreg True
                     --pca_cache_path "$PREVIOUS_PCA"
                     --espreg_loss_weight "$ESPREG_LOSS_WEIGHT"
@@ -318,6 +332,13 @@ model_adapter_train_task() {
         fi
     fi
 
+    # Resume from an in-training checkpoint (weights/last.pt or weights/epoch*.pt) when provided.
+    # The checkpoint must match this dataset/task/method; this is the user's responsibility.
+    resume_args=()
+    if [[ -n "$RESUME_CHECKPOINT" ]]; then
+        resume_args=(--resume_checkpoint "$RESUME_CHECKPOINT")
+    fi
+
     python tools/train.py \
         --model "$TRAIN_MODEL" \
         --data "$TRAIN_DATA" \
@@ -329,6 +350,7 @@ model_adapter_train_task() {
         --device "$DEVICE" \
         --project "$TASK_DIR" \
         "${optimizer_args[@]}" \
+        "${resume_args[@]}" \
         "${WEIGHT_ARGS[@]}" \
         "${FREEZE_ARGS[@]}" \
         "${TRAINER_ARGS[@]}" \

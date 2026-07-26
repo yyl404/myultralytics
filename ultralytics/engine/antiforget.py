@@ -45,6 +45,7 @@ from ultralytics.engine.bpf import (
     select_future_ignore_mask,
 )
 from ultralytics.engine.ewc import EWCLoss, load_ewc_state
+from ultralytics.engine.l2 import L2Loss
 from ultralytics.engine.nsgp import NSGP
 from ultralytics.engine.repre import RegionalPrototypeReplay
 from ultralytics.nn.tasks import load_checkpoint
@@ -266,30 +267,49 @@ def merge_pseudo_labels_with_gt(
     return batch
 
 
-def get_dist_loss(model_pred, base_model_pred, model):
+def get_dist_loss(model_pred, base_model_pred, model, dist_topk=1):
+    """KL distillation from teacher to student on the teacher's top-k class channels.
+
+    For each anchor, take the k teacher class channels (historical classes only) with the
+    highest confidence, compute a binary KL(teacher || student) on each selected channel
+    independently, weight each channel's loss by its teacher confidence, and normalize by
+    the sum of all selected teacher confidences over all anchors and channels.
+
+    Args:
+        model_pred: Student raw output (pre-NMS), passed to head._inference.
+        base_model_pred: Teacher raw cls scores, (B, 4 + nc_teacher, A).
+        model: Student detection model (used to locate the Detect head).
+        dist_topk (int): Number of teacher channels to distill per anchor; -1 means all
+            historical class channels. Must be -1 or >= 1.
+
+    Returns:
+        Weighted KL distillation loss (scalar tensor).
+    """
     eps = 1e-6
     head = _get_detect_head(model)
     nc = head.nc
     model_pred = head._inference(model_pred)
     cls_start, cls_end = 4, 4 + nc
-    student_cls = model_pred[:, cls_start:cls_end, :]
-    teacher_cls = base_model_pred[:, cls_start:cls_end, :]
+    student_cls = model_pred[:, cls_start:cls_end, :]  # (B, C, A)
+    teacher_cls = base_model_pred[:, cls_start:cls_end, :]  # (B, C_t, A), historical classes only
 
-    # Mask each anchor by teacher confidence (max class score at this position).
-    anchor_mask, max_idx = teacher_cls.max(dim=1)  # (B, A), (B, A)
-    student_at_max = torch.gather(student_cls, 1, max_idx.unsqueeze(1)).squeeze(1)  # (B, A)
+    n_teacher_ch = teacher_cls.shape[1]
+    k = n_teacher_ch if dist_topk == -1 else min(dist_topk, n_teacher_ch)
+    # Per-anchor top-k teacher channels by confidence.
+    teacher_topk, topk_idx = teacher_cls.topk(k, dim=1)  # (B, K, A), (B, K, A)
+    student_topk = torch.gather(student_cls, 1, topk_idx)  # (B, K, A)
 
-    # Binary KL(teacher || student) on the channel where teacher responds strongest:
+    # Binary KL(teacher || student) per selected channel:
     # p,q in (0,1) from sigmoid cls; complementary mass is 1-p / 1-q.
     dtype = model_pred.dtype
-    p = anchor_mask.to(torch.float32).clamp(eps, 1.0 - eps)
-    q = student_at_max.to(torch.float32).clamp(eps, 1.0 - eps)
-    teacher_bin = torch.stack((p, 1 - p), dim=1)  # (B, 2, A)
-    student_bin = torch.stack((q, 1 - q), dim=1)  # (B, 2, A)
-    kl_per_anchor = F.kl_div(student_bin.log(), teacher_bin, reduction="none").sum(dim=1).to(dtype)
+    p = teacher_topk.to(torch.float32).clamp(eps, 1.0 - eps)
+    q = student_topk.to(torch.float32).clamp(eps, 1.0 - eps)
+    teacher_bin = torch.stack((p, 1 - p), dim=2)  # (B, K, 2, A)
+    student_bin = torch.stack((q, 1 - q), dim=2)  # (B, K, 2, A)
+    kl_per_channel = F.kl_div(student_bin.log(), teacher_bin, reduction="none").sum(dim=2).to(dtype)  # (B, K, A)
 
-    # Weighted average over anchors.
-    return (kl_per_anchor * anchor_mask).sum() / anchor_mask.sum().clamp_min(eps)
+    # Weighted sum over anchors and channels, normalized by total top-k confidence.
+    return (kl_per_channel * teacher_topk).sum() / teacher_topk.sum().clamp_min(eps)
 
 
 class AntiForgetTrainer(BaseTrainer):
@@ -318,6 +338,11 @@ class AntiForgetTrainer(BaseTrainer):
             self.base_model = deepcopy(self.model).eval()
         self.base_model.requires_grad_(False)
         # ============================== END: set up base model =================================================
+
+        # ============================== MODIFIED: validate distillation settings ==============================
+        if self.args.distillation and not (self.args.dist_topk == -1 or self.args.dist_topk >= 1):
+            raise ValueError(f"dist_topk must be -1 (all historical channels) or >= 1, got {self.args.dist_topk}")
+        # ============================== END: validate distillation settings ====================================
 
         # ============================== MODIFIED: set up BPF ==================================================
         if self.args.bpf:
@@ -349,6 +374,12 @@ class AntiForgetTrainer(BaseTrainer):
             ewc_state = load_ewc_state(self.args.importance_path, map_location=self.device)
             self.ewc_loss = EWCLoss(model=self.model, state=ewc_state)
         # ============================== END: set up EWC loss =================================================
+
+        # ============================== MODIFIED: set up L2 regularization loss ==============================
+        if self.args.l2:
+            self.l2_loss_weight = self.args.l2_loss_weight
+            self.l2_loss = L2Loss(model=self.model, ref_model=self.base_model)
+        # ============================== END: set up L2 regularization loss ====================================
 
         # ============================== MODIFIED: set up ESPReg loss ============================================
         if self.args.espreg:
@@ -689,7 +720,7 @@ class AntiForgetTrainer(BaseTrainer):
 
                     # ============================== MODIFIED: calculate KLD distillation loss ==========================
                     if self.args.distillation:
-                        _dist_loss = get_dist_loss(model_pred, base_model_pred[0], self.model)
+                        _dist_loss = get_dist_loss(model_pred, base_model_pred[0], self.model, dist_topk=self.args.dist_topk)
                         self.loss += (_dist_loss * self.args.dist_loss_weight)
                         loss_items = torch.cat([loss_items, torch.tensor([_dist_loss], device=loss_items.device)])
                     # ============================== END: calculate KL distillation loss ===============================
@@ -726,6 +757,13 @@ class AntiForgetTrainer(BaseTrainer):
                         self.loss += _ewc_loss * self.ewc_loss_weight
                         loss_items = torch.cat((loss_items, _ewc_loss.detach().reshape(1)))
                     # ============================== END: calculate EWC loss ========================================
+
+                    # ============================== MODIFIED: calculate L2 regularization loss ======================
+                    if self.args.l2:
+                        _l2_loss = self.l2_loss.get_loss()
+                        self.loss += _l2_loss * self.l2_loss_weight
+                        loss_items = torch.cat((loss_items, _l2_loss.detach().reshape(1)))
+                    # ============================== END: calculate L2 regularization loss ===========================
 
                     # ============================== MODIFIED: calculate distillation loss =============================
                     # if self.args.kd:

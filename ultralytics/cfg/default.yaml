@@ -142,6 +142,7 @@ filter_iou_threshold: 0.5
 # distillation setting
 distillation: False
 dist_loss_weight: 100.0
+dist_topk: 1 # (int) number of teacher top-confidence channels to distill per anchor; -1 = all historical class channels
 
 # BPF (Bridge Past and Future) settings --------------------------------------------------------------------------
 bpf: False # (bool) use the BPF training path
@@ -167,9 +168,13 @@ bpf_dwf_weight: 0.15 # (float) joint DwF classification and box loss weight
 
 # ewc settings
 ewc: False
-ewc_loss_weight: 1.0
+ewc_loss_weight: 100.0
 importance_path: None
 reference_model: None
+
+# L2 regularization settings (naive parameter-distance penalty towards the reference model)
+l2: False # (bool) whether to use L2 regularization
+l2_loss_weight: 100.0 # (float) L2 regularization loss weight
 
 # ESPReg (Eigen-value Scaled Projection Regularization) settings -----------------------------------------------
 espreg: False # (bool) whether to use ESPReg

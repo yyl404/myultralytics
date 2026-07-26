@@ -348,6 +348,8 @@ class AntiForgetDetectionTrainer(AntiForgetTrainer):
             self.loss_names.append("espreg_loss")
         if self.args.ewc:
             self.loss_names.append("ewc_loss")
+        if self.args.l2:
+            self.loss_names.append("l2_loss")
         if self.args.kd:
             self.loss_names.append("kd_loss")
         if self.args.proto_rp:

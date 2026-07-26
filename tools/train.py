@@ -59,6 +59,7 @@ Examples:
 """
 
 import argparse
+from pathlib import Path
 
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect import (
@@ -171,13 +172,25 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument("--project", type=str, default="runs/detect", help="Project name(where to save logs)")
     parser.add_argument("--trainer", type=str, default=None, help="Trainer to use, default is None, which means use the default trainer")
+    parser.add_argument("--resume_checkpoint", type=str, default=None,
+                        help="In-training checkpoint (.pt) to resume from. Restores model weights, epoch, "
+                             "optimizer/scaler/EMA state and lr-scheduler stage. Must be an unstripped checkpoint "
+                             "saved during training (e.g. weights/last.pt or weights/epoch*.pt); the final "
+                             "best.pt/last.pt have their optimizer stripped and cannot be resumed. It is the "
+                             "user's responsibility to ensure the checkpoint matches the dataset/task/method.")
     args, unknown = parser.parse_known_args()
     dynamic_kwargs = parse_dynamic_named_args(unknown) # Other dynamic arguments
 
-    model = YOLO(args.model)
-    if args.weight is not None:
-        # This is for loading weights of heterogeneous models while preserving the architecture of the originally initialized model
-        model.load(args.weight)
+    if args.resume_checkpoint is not None:
+        if not Path(args.resume_checkpoint).is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume_checkpoint}")
+        model = YOLO(args.resume_checkpoint)
+        dynamic_kwargs["resume"] = args.resume_checkpoint
+    else:
+        model = YOLO(args.model)
+        if args.weight is not None:
+            # This is for loading weights of heterogeneous models while preserving the architecture of the originally initialized model
+            model.load(args.weight)
 
     # Select trainer by model task and user-specified trainer type.
     # When trainer is None, do not pass trainer so the model uses its task-specific default (OBBTrainer for obb, etc.).
