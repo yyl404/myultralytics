@@ -200,6 +200,22 @@ ESP-YOLO uses the **same initialization level** as NSGP-RePRE: the backbone is p
 **Limitations.**
 We will add a dedicated Limitations section in the revision.
 
+## Official Comment
+
+1. Regarding hyperparameter tuning
+
+We thank the reviewer for raising this important concern. To clarify, for all compared methods (NSGP, NSGP-RePRE, EWC, BPF), we inherited their originally reported hyperparameters without task-specific re-tuning on our YOLOv8 baseline. While we acknowledge that an exhaustive grid search could raise the performance of our compared methods, the performance gaps observed in our same-backbone comparisons are substantial: on VOC 15+5, ESP-YOLO achieves 78.8% Avg mAP versus 60.8% for NSGP-RePRE and 55.2% for EWC; on COCO 40+40, it reaches 21.5% mAP versus 20.4% for NSGP and 12.1% for BPF. These large margins suggest that the observed gains are driven by the methodological design rather than by hyperparameter tuning.
+
+2. Regarding full 12-epoch results on MS COCO
+
+Yes, we have now completed the full 12-epoch training runs on COCO 40+40 under the identical YOLOv8 backbone. The results are as follows:
+
+| Method | mAP | AP75 | AP50 |
+|---|---|---|---|
+| NSGP | 32.9 | 35.4 | 47.5 |
+| BPF |  |  |  |
+| ESP-YOLO | 42.5 | 46.4 | 58.0 |
+
 ---
 
 # Reviewer RwTa (Reviewer 3)

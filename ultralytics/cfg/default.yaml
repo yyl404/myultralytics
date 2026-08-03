@@ -164,7 +164,7 @@ bpf_attention_power: 2.0 # (float) attention-map exponent
 bpf_proposal_topk: 128 # (int) old-model candidates considered by DwF
 bpf_proposal_samples: 64 # (int) candidates randomly sampled by DwF
 bpf_split_iou: 0.5 # (float) DwF old/new proposal split threshold
-bpf_dwf_weight: 0.15 # (float) joint DwF classification and box loss weight
+bpf_dwf_weight: 0.5 # (float) joint DwF classification and box loss weight
 
 # ewc settings
 ewc: False

@@ -10,7 +10,7 @@ TASK_DATASETS=(
     "data/COCO_40+40/task_2_cls_40/dataset.yaml"
 )
 OUTPUT_PREFIX="runs/yolov8x_COCO_40+40"
-EPOCHS="${EPOCHS:-3}"
+EPOCHS="${EPOCHS:-12}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 IMGSZ="${IMGSZ:-640}"
 WORKERS="${WORKERS:-8}"
