@@ -321,7 +321,15 @@ class PCAHooker:
     def save_pca_cache(self, save_path):
         pca_cache = {}
         for n in self.names:
-            pca_cache[n] = self.get_pca_operators(n)
+            operators = self.get_pca_operators(n)
+            for ig, operator in enumerate(operators):
+                if not hasattr(operator, "components_"):
+                    raise RuntimeError(
+                        f"PCA operator for module '{n}' group {ig} was never fitted "
+                        f"(missing components_). Check that enough boxed samples" 
+                        f"were collected."
+                    )
+            pca_cache[n] = operators
 
         LOGGER.info(f"Saving PCA cache to {save_path}")
         with open(save_path, "wb") as f:
@@ -456,7 +464,7 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
         if label_dir is not None:
             label_files = []
             for _sample_file in sample_files:
-                _label_name = OSP.basename(_sample_file).split('.')[0] + '.txt'
+                _label_name = OSP.splitext(OSP.basename(_sample_file))[0] + '.txt'
                 if isinstance(label_dir, list) or isinstance(label_dir, tuple):
                     exist_label_file = False
                     for _dir_label in label_dir:

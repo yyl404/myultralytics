@@ -1337,7 +1337,7 @@ def _load_label_files(sample_files, label_dirs):
     dirs = label_dirs if isinstance(label_dirs, (list, tuple)) else [label_dirs]
     
     for sample_file in sample_files:
-        label_name = os.path.basename(sample_file).split('.')[0] + '.txt'
+        label_name = os.path.splitext(os.path.basename(sample_file))[0] + '.txt'
         found = False
         
         for label_dir in dirs:

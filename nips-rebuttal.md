@@ -103,6 +103,40 @@ We therefore respectfully ask you to verify this point and to treat the issue as
 Best regards,  
 The Authors
 
+## Official Comment
+
+1. Regarding full 12-epoch results on MS COCO
+
+We have completed the full 12-epoch training runs on COCO 40+40 using the identical YOLOv8 backbone. The results are summarized below:
+
+| Method | mAP | AP75 | AP50 |
+|---|---|---|---|
+| EWC | 36.4 | 39.8 | 51.2 |
+| NSGP | 32.9 | 35.4 | 47.5 |
+| BPF | 16.7 | 18.2 | 23.0 |
+| ESP-YOLO | 42.5 | 46.4 | 58.0 |
+
+As shown above, ESP-YOLO surpasses all compared IOD methods in terms of mAP over the union of old and new classes.
+
+2. Regarding the anomalous value in the VOC 10-2 multi-step setting
+
+We thank the reviewer for pointing out this anomalous experimental result. After re-conducting this experiment, we found that the originally reported value was likely due to a typo: the old and new mAP values appeared to be swapped. The re-conducted 3-seed experiment results for this setting are as follows:
+
+| | 1-10 | 11-20 | 1-20 |
+|---|---|---|---|
+| | 74.90 ± 2.87 | 70.21 ± 0.65 | 70.93 ± 0.33 |
+
+After correcting these results, our claim still holds: ESP-YOLO surpasses the other compared methods in the 10-2 multi-step setting on 1-10, 11-20, and 1-20.
+
+## Official Comment
+
+Dear Reviewer,
+
+Thank you for your continued comment. We have submit a further official comment that responds to the remaining concerns you raised. We would be grateful to know whether the additional results and clarifications fully address your remaining questions. If anything is still unclear, please feel free to let us know, and we will gladly provide more details.
+
+Best regards,
+The Authors
+
 ---
 
 # Reviewer vzcn (Reviewer 2)
@@ -204,7 +238,17 @@ We will add a dedicated Limitations section in the revision.
 
 1. Regarding hyperparameter tuning
 
-We thank the reviewer for raising this important concern. To clarify, for all compared methods (NSGP, NSGP-RePRE, EWC, BPF), we inherited their originally reported hyperparameters without task-specific re-tuning on our YOLOv8 baseline. While we acknowledge that an exhaustive grid search could raise the performance of our compared methods, the performance gaps observed in our same-backbone comparisons are substantial: on VOC 15+5, ESP-YOLO achieves 78.8% Avg mAP versus 60.8% for NSGP-RePRE and 55.2% for EWC; on COCO 40+40, it reaches 21.5% mAP versus 20.4% for NSGP and 12.1% for BPF. These large margins suggest that the observed gains are driven by the methodological design rather than by hyperparameter tuning.
+We thank the reviewer for raising this important concern. To clarify, for all compared methods (NSGP, NSGP-RePRE, EWC, BPF), we adopted their originally reported hyperparameters without task-specific re-tuning on our YOLOv8 baseline. While we acknowledge that an exhaustive grid search could improve the performance of the compared methods, the performance gaps observed in our same-backbone comparisons are substantial: on VOC 15+5, ESP-YOLO achieves 75.0% All mAP versus 66.6% for NSGP-RePRE/NSGP, 59.2% for EWC, and 53.2% for BPF; on COCO 40+40, it reaches 42.5% mAP versus 36.4% for EWC, 32.9% for NSGP, and 16.7% for BPF. These large margins suggest that the observed gains are driven by methodological design rather than by hyperparameter tuning.
+
+Due to the limited time window, We only conducted a sensitivity analysis with respect to the distillation weight of BPF on VOC 15+5. The sensitivity analysis for other method-specific hyperparameters will be submit in the revision. The results are as follows:
+
+|distillation weight|old|new|all|
+|---|---|---|---|
+|0.05|52.7|80.3|51.5|
+|0.15|54.6|80.1|53.2|
+|0.50|54.1|79.5|52.2|
+
+These results show that the influence of the distillation weight on the performance of BPF is negligible, which further proves that the performance gaps we observed are unlikely to be overcome through hyperparameter tuning.
 
 2. Regarding full 12-epoch results on MS COCO
 
@@ -212,9 +256,39 @@ Yes, we have now completed the full 12-epoch training runs on COCO 40+40 under t
 
 | Method | mAP | AP75 | AP50 |
 |---|---|---|---|
+| EWC | 36.4 | 39.8 | 51.2 |
 | NSGP | 32.9 | 35.4 | 47.5 |
-| BPF |  |  |  |
+| BPF | 16.7 | 18.2 | 23.0 |
 | ESP-YOLO | 42.5 | 46.4 | 58.0 |
+
+As the results indicate, ESP-YOLO surpasses all compared IOD methods in terms of mAP over the union of old and new classes.
+
+## Official Comment
+
+Dear Reviewer,
+
+Thank you for your constructive follow-up. We have posted an additional official comment that addresses the remaining concerns you kindly highlighted. We would greatly appreciate your feedback on whether these additional results and clarifications satisfactorily resolve your outstanding questions. If any aspect remains unclear, please let us know and we will promptly provide further details.
+
+Best regards,  
+The Authors
+
+
+## Official Comment
+
+Dear Reviewer,
+
+Thank you for your thoughtful follow-up and for acknowledging the clarifications we provided. We greatly appreciate your continued engagement and the constructive direction you have offered.
+
+Regarding the fairness of the same-backbone comparison, we respectfully argue that the observed performance gaps are large enough to be explained solely by under-configured baselines. While we agree that transferring methods across detector families involves architectural overhead, the margins we observe exceed what is typically recoverable through hyperparameter tuning alone.
+
+Furthermore, our limited sensitivity analysis on BPF (distillation weight sweep on VOC 15+5) shows that its performance varies only within a narrow band (51.5–53.2 All mAP). This suggests that the method is not highly sensitive to this hyperparameter, and that its underperformance on YOLOv8 is more likely rooted in method design than in suboptimal tuning.
+
+We also fully accept your observation that several claims should be scoped more honestly. In the revised manuscript, we will carefully reframe our contribution statements to ensure they accurately reflect the scope and limitations of our theoretical and empirical findings, avoiding any overstatement beyond what is rigorously supported.
+
+Thank you again for your time and consideration.
+
+Best regards,  
+The Authors
 
 ---
 
@@ -263,6 +337,23 @@ The architecture gap remains after normalization. Regarding causality: Table 5 /
 The Joint (upper) and Fine-tuning (lower) bounds reported in our paper are already obtained on the **same YOLOv8** baseline as ESP-YOLO. Relative to these YOLOv8 bounds—not the Faster R-CNN Joint—the incremental contribution is properly contextualized. The only entry that slightly exceeds the Joint upper bound is Old mAP on VOC 15+5 (+0.6), which we attribute to run-to-run variation rather than a protocol error. The same-backbone re-implementations above further show that ESP-YOLO’s advantage persists against strong IOD methods on identical YOLOv8, so the gains are not largely an artifact of the detector.
 
 For the claim that feature drift causes forgetting, we thank the reviewer for the correction and clarify that this statement rests on the widely adopted premise of feature-preserving methods (e.g., feature distillation, NSGP): since the detection heads are optimized on the historical feature distribution, drift of intermediate features shifts the inputs of the old-task heads out of distribution and propagates forward to perturb final predictions, even if the heads themselves remain intact. Our results provide indirect evidence consistent with this mechanism — ESPReg reduces measured drift from 13.12 to 6.84 (Table 5) while raising old-class mAP from 51.0% to 72.6% (Table 4) — and we will soften the causal wording and state this limitation explicitly in the revision.
+
+# AC
+
+## Official Comment
+
+Dear Area Chair,
+
+Thank you for your time and effort in overseeing the review process. We are grateful that the reviewers have provided constructive follow-ups and engaged positively with our rebuttal.
+
+Because the additional experiments requested by the reviewers required considerable time to complete, our second-round official comments were posted relatively late in the discussion window. We are concerned that the reviewers may not yet have sufficient time to review these updated results and clarifications.
+
+We would therefore greatly appreciate it if you could kindly remind the reviewers to check our latest responses. Alternatively, if the discussion period is concluding, we would be grateful if you could take into account that we have fully addressed the concerns raised when forming your recommendation.
+
+Thank you again for your understanding and support.
+
+Best regards,
+The Authors
 
 ---
 
