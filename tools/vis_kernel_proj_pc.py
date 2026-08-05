@@ -28,7 +28,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from ultralytics import YOLO
-from ultralytics.engine.ewpr import find_elbow_point
+from ultralytics.engine.espreg import find_elbow_point
 
 
 def main(args):

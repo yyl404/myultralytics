@@ -129,11 +129,6 @@ cfg: # (str, optional) path to a config.yaml that overrides defaults
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yaml]
 
-# Distillation settings --------------------------------------------------------------------------------------------------
-kd: False # (bool) whether to use knowledge distillation
-distill_layers: None # (list[str], optional)
-distiller: "mgd" # (str) distiller type, choices=[mgd, cwdf, at, atm, skd, pkd]
-
 # Pseudo label setting ---------------------------------------------------------------------------------------------
 pseudo_label: False
 conf_threshold: 0.25
@@ -190,21 +185,3 @@ nsgp_flexibility: 1.0 # (float) interpolation from raw gradient to exact null-sp
 repre: False # (bool) replay old-class regional prototypes through the classification branch
 repre_prototypes: None # (str) density-aware prototype artifact generated after the previous task
 repre_loss_weight: 1.0 # (float) contribution of classification-only regional replay
-
-# prototype replay settings
-proto_rp: False
-prototypes: None
-proto_rp_use_base_model: True
-proto_rp_loss_weight: 1.0 # (float) the contribution weight of prototype replay loss in total loss
-proto_use_neg: True
-
-tracker: botsort.yaml # (str) tracker config file: botsort.yaml or bytetrack.yaml
-
-# ABR replay settings
-abr: False
-abr_memory:
-abr_ratio: [1, 1, 2]
-abr_iou_thr: 0.05
-abr_max_mix_boxes: 2
-abr_mix_beta: 32.0
-abr_mosaic_scale: [0.4, 0.6]

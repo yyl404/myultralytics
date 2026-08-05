@@ -101,8 +101,6 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
-from .film import AttributeEncoder, FiLM
-
 __all__ = (
     "AIFI",
     "C1",
@@ -180,6 +178,4 @@ __all__ = (
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
-    "AttributeEncoder",
-    "FiLM",
 )

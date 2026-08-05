@@ -36,8 +36,13 @@ for function_name in "${required_adapter_functions[@]}"; do
 done
 
 START_TASK="${START_TASK:-1}"
+END_TASK="${END_TASK:-${#TASK_DATASETS[@]}}"
 if (( START_TASK < 1 || START_TASK > ${#TASK_DATASETS[@]} )); then
     echo "START_TASK must be between 1 and ${#TASK_DATASETS[@]}" >&2
+    exit 1
+fi
+if (( END_TASK < START_TASK || END_TASK > ${#TASK_DATASETS[@]} )); then
+    echo "END_TASK must be between START_TASK (${START_TASK}) and ${#TASK_DATASETS[@]}" >&2
     exit 1
 fi
 
@@ -46,7 +51,7 @@ model_adapter_initialize
 
 for task_index in "${!TASK_DATASETS[@]}"; do
     TASK_ID=$((task_index + 1))
-    if (( TASK_ID < START_TASK )); then
+    if (( TASK_ID < START_TASK || TASK_ID > END_TASK )); then
         continue
     fi
 

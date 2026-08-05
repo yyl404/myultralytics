@@ -100,25 +100,8 @@ class AntiForgetOBBTrainer(yolo.detect.AntiForgetDetectionTrainer):
         return model
 
     def get_validator(self):
-        self.loss_names = ["box_loss", "cls_loss", "dfl_loss"]
-        if self.args.distillation:
-            self.loss_names.append("dist_loss")
-        if self.args.espreg:
-            self.loss_names.append("espreg_loss")
-        if self.args.ewc:
-            self.loss_names.append("ewc_loss")
-        if self.args.l2:
-            self.loss_names.append("l2_loss")
-        if self.args.kd:
-            self.loss_names.append("kd_loss")
-        if self.args.proto_rp:
-            if self.args.proto_use_neg:
-                self.loss_names.extend(["cls_loss_pr", "reg_loss_pr", "cls_pr_neg"])
-            else:
-                self.loss_names.extend(["cls_loss_pr", "reg_loss_pr"])
-        if self.args.repre:
-            self.loss_names.append("repre_loss")
-        self.loss_names = tuple(self.loss_names)
+        """Return an OBBValidator with loss names extended for the enabled anti-forgetting terms."""
+        self.loss_names = self._anti_forget_loss_names()
         return yolo.obb.OBBValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

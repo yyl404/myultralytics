@@ -188,66 +188,76 @@ class PCAHooker:
                 feat_in = feat_in[0]  # Module may accept multiple input features, and we only extract the first
                 if self.uncentered:
                     feat_in = feat_in.mean(dim=0, keepdim=True)
+                bs, _, h_in_raw, w_in_raw = feat_in.shape
                 if p[0] > 0 or p[1] > 0:
                     feat_in_padded = torch.nn.functional.pad(feat_in, (p[1], p[1], p[0], p[0]), mode='constant', value=0)
                 else:
                     feat_in_padded = feat_in
-                bs, _, h_in, w_in = feat_in_padded.shape
+                _, _, h_in, w_in = feat_in_padded.shape
                 h_out, w_out = feat_out.shape[2], feat_out.shape[3]
 
                 # Group the input features
-                feat_in_padded_grouped = feat_in_padded.reshape(bs, g, c_in//g, h_in, w_in)
                 c_in_grouped = c_in//g
 
-                # Use the sliding window with the same settings as convolution kernels
-                # to unfold input features into a sequence of vectors, considering dilation
-                # For dilated convolution, we need to adjust the unfold parameters
-                if d[0] > 1 or d[1] > 1:
-                    # For dilation > 1, we need to unfold with larger window size
+                if unfold:
+                    feat_in_padded_grouped = feat_in_padded.reshape(bs, g, c_in_grouped, h_in, w_in)
+
+                    # Use the sliding window with the same settings as convolution kernels
+                    # to unfold input features into a sequence of vectors, considering dilation
+                    # For dilated convolution, we need to unfold with larger window size
                     # Effective kernel size becomes: k[0] + (k[0]-1)*(d[0]-1), k[1] + (k[1]-1)*(d[1]-1)
-                    effective_k_h = k[0] + (k[0] - 1) * (d[0] - 1)
-                    effective_k_w = k[1] + (k[1] - 1) * (d[1] - 1)
-                    
-                    # [bs, g, c_in//g, h, w] --> [bs, g, c_in//g, h_out, w, effective_k_h]
-                    feat_unfold_h = feat_in_padded_grouped.unfold(3, effective_k_h, s[0])
-                    # [bs, g, c_in//g, h_out, w, effective_k_h] --> [bs, g, c_in//g, h_out, w_out, effective_k_h, effective_k_w]
-                    feat_unfold = feat_unfold_h.unfold(4, effective_k_w, s[1])
-                    
-                    # Now subsample to get the actual dilated kernel positions
-                    # feat_unfold shape: [bs, g, c_in//g, h_out, w_out, effective_k_h, effective_k_w]
-                    # We keep only every d[0]-th and d[1]-th element in kernel dimensions
-                    feat_unfold = feat_unfold[:, :, :, :, :, ::d[0], ::d[1]]
+                    if d[0] > 1 or d[1] > 1:
+                        # For dilation > 1, we need to unfold with larger window size
+                        # Effective kernel size becomes: k[0] + (k[0]-1)*(d[0]-1), k[1] + (k[1]-1)*(d[1]-1)
+                        effective_k_h = k[0] + (k[0] - 1) * (d[0] - 1)
+                        effective_k_w = k[1] + (k[1] - 1) * (d[1] - 1)
+
+                        # [bs, g, c_in//g, h, w] --> [bs, g, c_in//g, h_out, w, effective_k_h]
+                        feat_unfold_h = feat_in_padded_grouped.unfold(3, effective_k_h, s[0])
+                        # [bs, g, c_in//g, h_out, w, effective_k_h] --> [bs, g, c_in//g, h_out, w_out, effective_k_h, effective_k_w]
+                        feat_unfold = feat_unfold_h.unfold(4, effective_k_w, s[1])
+
+                        # Now subsample to get the actual dilated kernel positions
+                        # feat_unfold shape: [bs, g, c_in//g, h_out, w_out, effective_k_h, effective_k_w]
+                        # We keep only every d[0]-th and d[1]-th element in kernel dimensions
+                        feat_unfold = feat_unfold[:, :, :, :, :, ::d[0], ::d[1]]
+                    else:
+                        # Standard convolution (dilation = 1)
+                        # [bs, g, c_in//g, h, w] --> [bs, g, c_in//g, h_out, w, k[0]]
+                        feat_unfold_h = feat_in_padded_grouped.unfold(3, k[0], s[0])
+                        # [bs, g, c_in//g, h_out, w, k[0]] --> [bs, g, c_in//g, h_out, w_out, k[0], k[1]]
+                        feat_unfold = feat_unfold_h.unfold(4, k[1], s[1])
+                    # Get actual kernel dimensions after dilation processing
+                    actual_k_h, actual_k_w = feat_unfold.shape[5], feat_unfold.shape[6]
+
+                    # Permute the dims: [bs, g, c_in//g, h_out, w_out, actual_k_h, actual_k_w] -> [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out]
+                    feat_unfold = feat_unfold.permute(1, 2, 5, 6, 0, 3, 4).contiguous()
+                    # Squeeze: [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out] --> [g, c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out]
+                    feat_reshaped = feat_unfold.view(g, c_in_grouped*actual_k_h*actual_k_w, bs*h_out*w_out)
+                    if module.bias is not None and not self.uncentered:
+                        feat_reshaped = torch.concat((feat_reshaped, torch.ones(g, 1, bs*h_out*w_out).to(feat_reshaped.device)), dim=1)
+                    pos_h, pos_w = h_out, w_out
+
+                    # The following code is used to check whether the unfolding representation of convolution operation
+                    # is equivalent with the original convolution operation
+                    if self.check:
+                        weight = module.weight.data.reshape(g, c_out//g, -1)  # [g, c_out//g, c_in//g*actual_k_h*actual_k_w]
+                        if module.bias is not None:
+                            weight = torch.concat((weight, module.bias.data.reshape(g, c_out//g, 1)), dim=2)
+                        feat_out_reshaped = weight @ feat_reshaped  # [g, c_out//g, c_in//g*actual_k_h*actual_k_w] @ [c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out] --> [g, c_out//g, bs*h_out*w_out]
+                        feat_out_reshaped = feat_out_reshaped.reshape(c_out, -1)  # [c_out, bs*h_out*w_out]
+
+                        # [c_out, bs*h_out*w_out] --> [c_out, bs, h_out, w_out] --> [bs, c_out, h_out, w_out]
+                        feat_out_reshaped_reversed = feat_out_reshaped.view(-1, bs, h_out, w_out).permute(1, 0, 2, 3).contiguous()
+
+                        LOGGER.info(f"Module {module_name}'s unfolding error: {F.mse_loss(feat_out, feat_out_reshaped_reversed)}")
                 else:
-                    # Standard convolution (dilation = 1)
-                    # [bs, g, c_in//g, h, w] --> [bs, g, c_in//g, h_out, w, k[0]]
-                    feat_unfold_h = feat_in_padded_grouped.unfold(3, k[0], s[0])
-                    # [bs, g, c_in//g, h_out, w, k[0]] --> [bs, g, c_in//g, h_out, w_out, k[0], k[1]]
-                    feat_unfold = feat_unfold_h.unfold(4, k[1], s[1])
-                # Get actual kernel dimensions after dilation processing
-                actual_k_h, actual_k_w = feat_unfold.shape[5], feat_unfold.shape[6]
-                
-                # Permute the dims: [bs, g, c_in//g, h_out, w_out, actual_k_h, actual_k_w] -> [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out]
-                feat_unfold = feat_unfold.permute(1, 2, 5, 6, 0, 3, 4).contiguous()
-                # Squeeze: [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out] --> [g, c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out]
-                feat_reshaped = feat_unfold.view(g, c_in_grouped*actual_k_h*actual_k_w, bs*h_out*w_out)
-                if module.bias is not None and not self.uncentered:
-                    feat_reshaped = torch.concat((feat_reshaped, torch.ones(g, 1, bs*h_out*w_out).to(feat_reshaped.device)), dim=1)
+                    # Fold mode: channel vectors at every input position, [g, c_in//g, bs*h_in*w_in]
+                    feat_fold = feat_in.reshape(bs, g, c_in_grouped, h_in_raw * w_in_raw)
+                    feat_reshaped = feat_fold.permute(1, 2, 0, 3).reshape(g, c_in_grouped, bs * h_in_raw * w_in_raw)
+                    pos_h, pos_w = h_in_raw, w_in_raw
 
-                # The following code is used to check whether the unfolding representation of convolution operation
-                # is equivalent with the original convolution operation
-                if self.check:
-                    weight = module.weight.data.reshape(g, c_out//g, -1)  # [g, c_out//g, c_in//g*actual_k_h*actual_k_w]
-                    if module.bias is not None:
-                        weight = torch.concat((weight, module.bias.data.reshape(g, c_out//g, 1)), dim=2)
-                    feat_out_reshaped = weight @ feat_reshaped  # [g, c_out//g, c_in//g*actual_k_h*actual_k_w] @ [c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out] --> [g, c_out//g, bs*h_out*w_out]
-                    feat_out_reshaped = feat_out_reshaped.reshape(c_out, -1)  # [c_out, bs*h_out*w_out]
-
-                    # [c_out, bs*h_out*w_out] --> [c_out, bs, h_out, w_out] --> [bs, c_out, h_out, w_out]
-                    feat_out_reshaped_reversed = feat_out_reshaped.view(-1, bs, h_out, w_out).permute(1, 0, 2, 3).contiguous()
-                    
-                    LOGGER.info(f"Module {module_name}'s unfolding error: {F.mse_loss(feat_out, feat_out_reshaped_reversed)}")
-
-                sample_feature_indices = self._get_sample_feature_indices(bs, h_out, w_out)
+                sample_feature_indices = self._get_sample_feature_indices(bs, pos_h, pos_w)
                 if sample_feature_indices.shape[0] == 0:
                     # Some batches may have no bounding boxes, so we need to return here
                     return

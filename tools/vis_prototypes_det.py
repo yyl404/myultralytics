@@ -270,7 +270,8 @@ def main():
     model.fuse()
     data = torch.load(args.prototypes, map_location='cpu')
     for i in range(len(data['prototypes'])):
-        data['prototypes'][i] = data['prototypes'][i].to(device)
+        if data['prototypes'][i] is not None:  # layers without collected prototypes stay None
+            data['prototypes'][i] = data['prototypes'][i].to(device)
     
     losses, results = run_evaluation(model, data['prototypes'], data['meta_info'], device)
     

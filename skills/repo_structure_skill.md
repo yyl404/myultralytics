@@ -19,6 +19,7 @@ Follow these layout rules when creating, moving, or referencing files in this re
 | `ultralytics/` | Code that extends or patches Ultralytics (trainers, models, blocks, etc.). |
 | `tools/` | Standalone utilities that do **not** subclass Ultralytics objects. |
 | `data/` | Datasets (real dirs or symlinks); one subdirectory per dataset. |
+| `skills/` | Skills for the Coding Agent to modify the repo code automatically |
 
 ## `scripts/` layout
 

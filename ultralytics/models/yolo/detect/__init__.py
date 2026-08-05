@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from .predict import DetectionPredictor
-from .train import ABRDetectionTrainer, AntiForgetDetectionTrainer, BPFDetectionTrainer, DetectionTrainer
+from .train import AntiForgetDetectionTrainer, BPFDetectionTrainer, DetectionTrainer
 from .val import DetectionValidator
 
 
@@ -11,5 +11,4 @@ __all__ = (
     "AntiForgetDetectionTrainer",
     "BPFDetectionTrainer",
     "DetectionValidator",
-    "ABRDetectionTrainer",
 )

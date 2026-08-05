@@ -2,7 +2,7 @@
 Visualize eigen value adjustment after log and sigmoid transformation.
 
 This script visualizes the adjustment of eigen values (variances) using the same
-transformation as in EWPR loss: log translation + sigmoid scaling. It generates plots showing:
+transformation as in ESPReg loss: log translation + sigmoid scaling. It generates plots showing:
 - Original eigen values (histogram)
 - Adjusted eigen values (curve after log + sigmoid)
 - Elbow point annotation
@@ -23,7 +23,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from ultralytics.engine.ewpr import find_elbow_point, adjust_eigen_values
+from ultralytics.engine.espreg import find_elbow_point, adjust_eigen_values
 
 
 def main(args):

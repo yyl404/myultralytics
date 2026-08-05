@@ -80,7 +80,11 @@ def summarize_task_metrics(
     task_class_names: list[list[str]],
     metrics: list[str],
 ) -> list[dict[str, object]]:
-    """Compute macro-average metrics for each task's class set."""
+    """Compute macro-average metrics for each task's class set.
+
+    Classes absent from the evaluation CSV have no instances in the evaluated split; they are
+    excluded from the macro-average with a warning, mirroring how the validator computes mAP.
+    """
     summaries = []
     seen_classes = set()
     for task_index, class_names in enumerate(task_class_names, start=1):
@@ -88,13 +92,19 @@ def summarize_task_metrics(
         duplicates = seen_classes.intersection(normalized_names)
         if duplicates:
             raise ValueError(f"Classes appear in multiple tasks: {sorted(duplicates)}")
+        present = [name for name in normalized_names if name in class_metrics]
         missing = [name for name, normalized in zip(class_names, normalized_names) if normalized not in class_metrics]
         if missing:
-            raise ValueError(f"Task {task_index} classes missing from cumulative CSV: {missing}")
+            print(
+                f"WARNING: Task {task_index} classes have no evaluation rows (no instances in the "
+                f"evaluated split) and are excluded from the average: {missing}"
+            )
+        if not present:
+            raise ValueError(f"Task {task_index} has no classes present in the cumulative CSV")
         seen_classes.update(normalized_names)
         row = {"Task": f"Task_{task_index}", "NumClasses": len(class_names)}
         for metric in metrics:
-            row[metric] = sum(class_metrics[name][metric] for name in normalized_names) / len(normalized_names)
+            row[metric] = sum(class_metrics[name][metric] for name in present) / len(present)
         summaries.append(row)
     all_row = {"Task": "All", "NumClasses": len(class_metrics)}
     for metric in metrics:

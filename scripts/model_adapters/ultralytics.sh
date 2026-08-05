@@ -27,7 +27,7 @@ model_adapter_regenerate_missing_artifacts() {
             importance_args=(--scope normalization)
         fi
         echo "Regenerating missing importance artifact: $PREVIOUS_IMPORTANCE"
-        python tools/cal_importance.py \
+        python tools/compute_importance.py \
             --model "$PREVIOUS_MODEL" \
             --dataset "$previous_dataset" \
             --save_path "$PREVIOUS_IMPORTANCE" \
@@ -378,7 +378,7 @@ model_adapter_finalize_task() {
                 --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
             )
         fi
-        python tools/cal_importance.py \
+        python tools/compute_importance.py \
             --model "$PREVIOUS_MODEL" \
             --dataset "$TRAIN_DATA" \
             --save_path "${TASK_DIR}/importance.pth" \

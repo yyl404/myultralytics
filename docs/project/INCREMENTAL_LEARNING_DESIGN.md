@@ -1,5 +1,7 @@
 # 增量学习系统设计文档
 
+> **存档说明（2026-08 重构）**：本文档描述的是早期设计（VSPReg/ProtoRP/SampleRP），其中部分机制与工具已被取代或移除：ProtoRP 由 RePRE（`ultralytics/engine/repre.py`）取代；`train_incremental.py`、`eval_incremental.py`、`incremental_utils.py`、`generate_pseudo_label.py`、`generate_replay_dataset.py`、`convert_prototype_classes.py`、`train_head_proto.py` 已删除。现行管线以 `scripts/<dataset>/<split>/<baseline>/train_*.sh` + `tools/train.py` 为准，可用方法为 naive / pseudo_label / ewc / l2 / espreg / nsgp(+repre) / distillation / bpf 及组合。文档其余内容保留作为设计历史参考。
+
 ## 概述
 
 本系统实现了一个基于 YOLO 的多任务增量学习框架，通过结合 **VSPReg (Variance-Scaled Projection Regularization)**、**ProtoRP (Prototype Replay)** 和 **SampleRP (Sample Replay)** 三种机制，有效缓解增量学习中的灾难性遗忘问题。该系统支持在多个任务序列上持续学习，每个新任务可以引入新的类别，同时保持对历史任务类别的检测能力。

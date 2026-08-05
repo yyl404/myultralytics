@@ -32,9 +32,6 @@ from ultralytics.utils.torch_utils import (
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.ops import xyxy2xywhn, xywh2xyxy
 from ultralytics.utils.metrics import bbox_iou, batch_probiou
-# from ultralytics.engine.distillation import (
-#     KDLoss,
-# )
 from ultralytics.engine.espreg import (
     EWPRegLoss,
 )
@@ -324,6 +321,24 @@ class AntiForgetTrainer(BaseTrainer):
         """
         super().__init__(cfg, overrides, _callbacks)
 
+    def _anti_forget_loss_names(self):
+        """Return training loss names extended with the enabled anti-forgetting loss terms.
+
+        The order matches the order in which the extra loss items are appended in `_do_train`.
+        """
+        loss_names = ["box_loss", "cls_loss", "dfl_loss"]
+        if self.args.distillation:
+            loss_names.append("dist_loss")
+        if self.args.espreg:
+            loss_names.append("espreg_loss")
+        if self.args.ewc:
+            loss_names.append("ewc_loss")
+        if self.args.l2:
+            loss_names.append("l2_loss")
+        if self.args.repre:
+            loss_names.append("repre_loss")
+        return tuple(loss_names)
+
     def _setup_train(self, world_size):
         """Build dataloaders and optimizer on correct rank process."""
         ckpt = self.setup_model()
@@ -365,7 +380,7 @@ class AntiForgetTrainer(BaseTrainer):
                 if not isinstance(_get_detect_head(self.bpf_interim_model), Detect):
                     raise TypeError("BPF interim model must use a Detect head")
             if self.args.bpf_dwf and self.args.distillation:
-                raise ValueError("BPF DwF and the legacy distillation loss are mutually exclusive")
+                raise ValueError("BPF DwF and the KL distillation loss are mutually exclusive")
         # ============================== END: set up BPF ========================================================
 
         # ============================== MODIFIED: set up EWC loss ============================================
@@ -434,54 +449,6 @@ class AntiForgetTrainer(BaseTrainer):
             )
         # ============================== END: set up RePRE ===============================================
 
-        # ============================== MODIFIED: set up KD loss ================================================
-        # if self.args.kd:
-        #     self.teacher_model = deepcopy(self.model).eval()
-        #     for p in self.teacher_model.parameters():
-        #         p.requires_grad_(False)
-
-        #     if self.args.distill_layers is not None:
-        #         distill_layers = self.args.distill_layers
-        #     else:
-        #         if isinstance(self.args.freeze, list):
-        #             distill_layers = [x for x in range(len(self.teacher_model.model)) if x not in self.args.freeze]
-        #         elif isinstance(self.args.freeze, int):
-        #             distill_layers = list(range(len(self.teacher_model.model))).remove(self.args.freeze)
-        #         else:
-        #             distill_layers = list(range(len(self.teacher_model.model)))
-
-        #     self.kd_loss = KDLoss(self.model, self.teacher_model, distill_layers=distill_layers,
-        #                           distiller=self.args.distiller, device=self.device)
-            
-        #     # calculate the number of extra parameters introduced by kd loss
-        #     if self.kd_loss.distill_type.lower() == "feature":
-        #         kd_params = sum(p.numel() for p in self.kd_loss.D_loss_fn.parameters())
-        #         LOGGER.info(f"{colorstr('Feature-level KD params:')} {kd_params/1e6:.2f} M")
-        #     else:
-        #         LOGGER.info(f"{colorstr('Logit-level KD enabled, no extra sub-module parameters')}")
-        # ============================== END: set up KD loss ======================================================
-
-        # ============================== MODIFIED: set up Prototype Replay loss ===================================
-        if self.args.proto_rp:
-            prototypes_dict = torch.load(self.args.prototypes)
-            self.prototypes = prototypes_dict["prototypes"] # List[torch.Tensor]
-            for lid, x in enumerate(self.prototypes):
-                # x: [num_prototypes, C*5*5+4*reg_max+nc+5*5]
-                self.prototypes[lid] = x.to(self.device)
-                self.prototypes[lid].requires_grad_(False)
-            if self.args.proto_use_neg and "prototypes_neg" in prototypes_dict:
-                self.prototypes_neg = prototypes_dict["prototypes_neg"] # List[torch.Tensor]
-                for lid, x in enumerate(self.prototypes_neg):
-                    # x: [num_prototypes, C*5*5+nc+5*5]
-                    self.prototypes_neg[lid] = x.to(self.device)
-                    self.prototypes_neg[lid].requires_grad_(False)  
-            self.proto_rp_loss_weight = self.args.proto_rp_loss_weight
-            
-            # Check if we should use base_model for distillation instead of prototype supervision
-            # proto_rp_use_base_model: if True, use base_model output as supervision; if False, use prototype's built-in supervision
-            self.proto_rp_use_base_model = self.args.proto_rp_use_base_model
-        # ============================== END: set up Prototype Relay loss =========================================
-        
         # Freeze layers
         freeze_list = (
             self.args.freeze
@@ -623,9 +590,6 @@ class AntiForgetTrainer(BaseTrainer):
                     _ = self.base_model(
                         torch.randn(1, 3, self.args.imgsz, self.args.imgsz, device=self.device)
                     )
-
-            # if self.args.kd:
-            #     self.kd_loss.register_hook() # Register hook for KD loss
             # ============================== END: register hook ================================================
             
             for i, batch in pbar:
@@ -765,33 +729,6 @@ class AntiForgetTrainer(BaseTrainer):
                         loss_items = torch.cat((loss_items, _l2_loss.detach().reshape(1)))
                     # ============================== END: calculate L2 regularization loss ===========================
 
-                    # ============================== MODIFIED: calculate distillation loss =============================
-                    # if self.args.kd:
-                    #     with torch.no_grad():
-                    #         _ = self.teacher_model(batch["img"])
-                        
-                    #     _raw_kd_loss_weight = self.kd_loss.get_kd_weight(epoch=self.epoch, total_epochs=self.epochs)
-                    #     _raw_kd_loss = self.kd_loss.get_loss() * _raw_kd_loss_weight
-                    #     scale = batch["img"].shape[0]  # scale distillation loss by batch size
-                    #     _kd_loss = _raw_kd_loss * scale
-
-                    #     self.loss += _kd_loss
-                    #     loss_items = torch.cat([loss_items, torch.tensor([_kd_loss], device=loss_items.device)])
-                    # ============================== END: calculate distillation loss ====================================
-
-                    # ============================== MODIFIED: replay prototypes =========================================
-                    if self.args.proto_rp:
-                        proto_losses = self.compute_proto_replay_loss(batch_idx=i)
-                        if len(proto_losses) == 3:
-                            cls_loss_proto, reg_loss_proto, cls_loss_neg_proto = proto_losses
-                            loss_items = torch.cat([loss_items, torch.tensor([cls_loss_proto, reg_loss_proto, cls_loss_neg_proto], device=loss_items.device)])
-                            self.loss += (cls_loss_proto + reg_loss_proto + cls_loss_neg_proto)*self.proto_rp_loss_weight
-                        else:
-                            cls_loss_proto, reg_loss_proto = proto_losses
-                            loss_items = torch.cat([loss_items, torch.tensor([cls_loss_proto, reg_loss_proto], device=loss_items.device)])
-                            self.loss += (cls_loss_proto + reg_loss_proto)*self.proto_rp_loss_weight
-                    # ============================== END: replay prototypes ==============================================
-
                     # ============================== MODIFIED: replay regional prototypes ================================
                     if self.args.repre:
                         repre_loss = self.repre.compute_loss()
@@ -845,8 +782,6 @@ class AntiForgetTrainer(BaseTrainer):
             # ============================== MODIFIED: remove hook ===========================================
             if self.args.espreg:
                 self.espreg_loss.remove_handle_()  # Remove hook for ESPReg
-            # if self.args.kd:
-            #     self.kd_loss.remove_handle_() # Remove hook for KD loss
             # ============================== END: remove hook ================================================
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
@@ -903,240 +838,6 @@ class AntiForgetTrainer(BaseTrainer):
         unset_deterministic()
         self.run_callbacks("teardown")
 
-    def restore_prototypes(self, prototypes, pad_mask):
-        """
-        Restore padded prototypes back to 5x5 feature maps and compute offsets.
-
-        Args:
-            prototypes (Tensor): Tensor of shape (N, C, 5, 5) containing prototype features.
-            pad_mask (Tensor): Tensor of shape (N, 5, 5) indicating valid (1) and padded (0) regions.
-
-        Returns:
-            Tuple[Tensor, Tensor, Tensor]: Restored prototypes (N, C, 5, 5), offset_y (N,), offset_x (N,)
-        """
-        num_prototypes = prototypes.shape[0]
-        in_channels = prototypes.shape[1]
-        restored_prototypes = torch.zeros([num_prototypes, in_channels, 5, 5], device=self.device)
-        offset_y_batch = torch.zeros([num_prototypes], device=self.device, dtype=torch.long)
-        offset_x_batch = torch.zeros([num_prototypes], device=self.device, dtype=torch.long)
-
-        for k in range(num_prototypes):
-            mask = pad_mask[k]  # [5, 5], 1=original, 0=padded
-            proto = prototypes[k]  # [in_channels, 5, 5]
-
-            # Find the valid region (original region) bounds in pad_mask
-            valid_rows = torch.where(mask.sum(dim=1) > 0)[0]
-            valid_cols = torch.where(mask.sum(dim=0) > 0)[0]
-
-            if len(valid_rows) > 0 and len(valid_cols) > 0:
-                # Get valid region bounds in pad_mask coordinates
-                mask_h_start, mask_h_end = valid_rows[0].item(), valid_rows[-1].item() + 1
-                mask_w_start, mask_w_end = valid_cols[0].item(), valid_cols[-1].item() + 1
-
-                # Extract valid region from prototype (this is the original feature map region)
-                valid_proto = proto[:, mask_h_start:mask_h_end, mask_w_start:mask_w_end]  # [in_channels, H', W']
-
-                # Calculate restore offsets
-                offset_y = (0 - mask_h_start) + (5 - mask_h_end)
-                offset_x = (0 - mask_w_start) + (5 - mask_w_end)
-                offset_y_batch[k] = offset_y
-                offset_x_batch[k] = offset_x
-
-                # Place valid region at the offset position in restored feature map
-                restored_h_start = mask_h_start + offset_y
-                restored_w_start = mask_w_start + offset_x
-                restored_h_end = mask_h_end + offset_y
-                restored_w_end = mask_w_end + offset_x
-
-                # Place the valid region at the corresponding position
-                restored_prototypes[k, :, restored_h_start:restored_h_end, restored_w_start:restored_w_end] = valid_proto
-
-        return restored_prototypes, offset_y_batch, offset_x_batch
-
-    def compute_proto_replay_loss(self, batch_idx: int):
-        """
-        Compute prototype replay classification and regression losses.
-        Returns:
-            Tuple[Tensor, Tensor] or Tuple[Tensor, Tensor, Tensor]: 
-            (cls_loss_proto, reg_loss_proto) if no negative prototypes,
-            (cls_loss_proto, reg_loss_proto, cls_loss_neg_proto) if negative prototypes exist
-        """
-        detect = self.model.model[-1]
-        detect.eval()
-        cls_loss_proto = 0.0
-        reg_loss_proto = 0.0
-        cls_loss_neg_proto = 0.0
-        reg = detect.cv2
-        cls = detect.cv3
-        reg_max = detect.reg_max
-        
-        # Check if negative prototypes exist
-        has_neg_protos = (hasattr(self, 'prototypes_neg') and 
-                         self.prototypes_neg is not None and
-                         any(x is not None and torch.numel(x) > 0 for x in self.prototypes_neg))
-
-        for lid in range(detect.nl):
-            if self.prototypes[lid] is None or torch.numel(self.prototypes[lid]) == 0:
-                continue
-
-            in_channels = cls[lid][0].conv.in_channels
-            reg_out_channels = reg[lid][-1].out_channels
-            cls_out_channels = cls[lid][-1].out_channels
-
-            pad_mask = self.prototypes[lid][:, in_channels * 5 * 5 + reg_out_channels + cls_out_channels :].reshape(-1, 5, 5)
-            prototypes = self.prototypes[lid][:, : in_channels * 5 * 5].reshape(-1, in_channels, 5, 5)
-            num_prototypes_all = prototypes.shape[0]
-
-            # Use modulo to cycle through prototypes
-            start_idx = (batch_idx * self.batch_size) % num_prototypes_all
-            end_idx = start_idx + self.batch_size
-            if end_idx <= num_prototypes_all:
-                pad_mask = pad_mask[start_idx:end_idx]
-                prototypes = prototypes[start_idx:end_idx]
-            else:
-                # Wrap around: take from start_idx to end, then from 0 to remaining
-                pad_mask = torch.cat([pad_mask[start_idx:], pad_mask[:end_idx - num_prototypes_all]], dim=0)
-                prototypes = torch.cat([prototypes[start_idx:], prototypes[:end_idx - num_prototypes_all]], dim=0)
-            num_prototypes = prototypes.shape[0]
-
-            prototypes, offset_y_batch, offset_x_batch = self.restore_prototypes(prototypes, pad_mask)
-
-            reg_out = reg[lid](prototypes)
-            cls_out = cls[lid](prototypes)
-
-            y_positions = offset_y_batch + 2  # [num_prototypes]
-            x_positions = offset_x_batch + 2  # [num_prototypes]
-
-            reg_out_list = []
-            cls_out_list = []
-            for i in range(num_prototypes):
-                reg_out_list.append(reg_out[i, :, y_positions[i], x_positions[i]])
-                cls_out_list.append(cls_out[i, :, y_positions[i], x_positions[i]])
-            reg_out = torch.stack(reg_out_list)  # (num_prototypes, out_channels)
-            cls_out = torch.stack(cls_out_list)  # (num_prototypes, out_channels)
-
-            if self.proto_rp_use_base_model:
-                with torch.no_grad():
-                    base_detect = self.base_model.model[-1]
-                    base_reg = base_detect.cv2
-                    base_cls = base_detect.cv3
-                    base_reg_out = base_reg[lid](prototypes)
-                    base_cls_out = base_cls[lid](prototypes)
-                    reg_supervision_list = []
-                    cls_supervision_list = []
-                    for i in range(num_prototypes):
-                        reg_supervision_list.append(base_reg_out[i, :, y_positions[i], x_positions[i]])
-                        cls_supervision_list.append(base_cls_out[i, :, y_positions[i], x_positions[i]])
-                    reg_supervision = torch.stack(reg_supervision_list)  # (num_prototypes, reg_out_channels)
-                    cls_supervision = torch.stack(cls_supervision_list)  # (num_prototypes, cls_out_channels)
-            else:
-                reg_supervision = self.prototypes[lid][:, in_channels * 5 * 5 : in_channels * 5 * 5 + reg_out_channels]
-                cls_supervision = self.prototypes[lid][:, in_channels * 5 * 5 + reg_out_channels : in_channels * 5 * 5 + reg_out_channels + cls_out_channels]
-                # Use the same indices as prototypes
-                start_idx = (batch_idx * self.batch_size) % num_prototypes_all
-                end_idx = start_idx + self.batch_size
-                if end_idx <= num_prototypes_all:
-                    reg_supervision = reg_supervision[start_idx:end_idx]
-                    cls_supervision = cls_supervision[start_idx:end_idx]
-                else:
-                    # Wrap around: take from start_idx to end, then from 0 to remaining
-                    reg_supervision = torch.cat([reg_supervision[start_idx:], reg_supervision[:end_idx - num_prototypes_all]], dim=0)
-                    cls_supervision = torch.cat([cls_supervision[start_idx:], cls_supervision[:end_idx - num_prototypes_all]], dim=0)
-
-            cls_loss_proto += (F.binary_cross_entropy_with_logits(cls_out, cls_supervision.sigmoid())\
-                -F.binary_cross_entropy_with_logits(cls_supervision, cls_supervision.sigmoid())) # min value of cls_loss_proto
-
-            reg_supervision_softmax = F.softmax(reg_supervision.reshape(-1, reg_max), dim=1)  # [num_prototypes*4, reg_max]
-            reg_loss_proto += F.cross_entropy(reg_out.reshape(-1, reg_max), reg_supervision_softmax)\
-                - F.cross_entropy(reg_supervision.reshape(-1, reg_max), reg_supervision_softmax)
-            
-            # Process negative prototypes
-            if hasattr(self, 'prototypes_neg') and self.prototypes_neg[lid] is not None and torch.numel(self.prototypes_neg[lid]) > 0:
-                # Negative prototype format: [feat(C*25) | cls_valid_mask(nc) | pad_mask(25)]
-                pad_mask_neg = self.prototypes_neg[lid][:, -25:].reshape(-1, 5, 5)  # Extract pad_mask from last 25 elements
-                prototypes_neg = self.prototypes_neg[lid][:, :in_channels * 5 * 5].reshape(-1, in_channels, 5, 5)  # Extract features
-                cls_valid_mask_neg = self.prototypes_neg[lid][:, in_channels * 5 * 5 : in_channels * 5 * 5 + cls_out_channels]
-                num_prototypes_neg_all = prototypes_neg.shape[0]
-                
-                # Use modulo to cycle through negative prototypes
-                start_idx_neg = (batch_idx * self.batch_size) % num_prototypes_neg_all
-                end_idx_neg = start_idx_neg + self.batch_size
-                if end_idx_neg <= num_prototypes_neg_all:
-                    pad_mask_neg = pad_mask_neg[start_idx_neg:end_idx_neg]
-                    prototypes_neg = prototypes_neg[start_idx_neg:end_idx_neg]
-                    cls_valid_mask_neg = cls_valid_mask_neg[start_idx_neg:end_idx_neg]
-                else:
-                    # Wrap around: take from start_idx to end, then from 0 to remaining
-                    pad_mask_neg = torch.cat([pad_mask_neg[start_idx_neg:], pad_mask_neg[:end_idx_neg - num_prototypes_neg_all]], dim=0)
-                    prototypes_neg = torch.cat([prototypes_neg[start_idx_neg:], prototypes_neg[:end_idx_neg - num_prototypes_neg_all]], dim=0)
-                    cls_valid_mask_neg = torch.cat([cls_valid_mask_neg[start_idx_neg:], cls_valid_mask_neg[:end_idx_neg - num_prototypes_neg_all]], dim=0)
-                num_prototypes_neg = prototypes_neg.shape[0]
-                
-                prototypes_neg, offset_y_batch_neg, offset_x_batch_neg = self.restore_prototypes(prototypes_neg, pad_mask_neg)
-                
-                # Compute classification outputs for negative prototypes (no regression needed)
-                cls_out_neg = cls[lid](prototypes_neg)
-                
-                y_positions_neg = offset_y_batch_neg + 2  # [num_prototypes_neg]
-                x_positions_neg = offset_x_batch_neg + 2  # [num_prototypes_neg]
-                
-                cls_out_list_neg = []
-                for i in range(num_prototypes_neg):
-                    cls_out_list_neg.append(cls_out_neg[i, :, y_positions_neg[i], x_positions_neg[i]])
-                cls_out_neg = torch.stack(cls_out_list_neg)  # (num_prototypes_neg, cls_out_channels)
-                
-                if self.proto_rp_use_base_model:
-                    # Use base model output as supervision (only on historical classes)
-                    with torch.no_grad():
-                        base_detect = self.base_model.model[-1]
-                        base_cls = base_detect.cv3
-                        base_cls_out_neg = base_cls[lid](prototypes_neg)
-                        base_cls_list_neg = []
-                        for i in range(num_prototypes_neg):
-                            base_cls_list_neg.append(base_cls_out_neg[i, :, y_positions_neg[i], x_positions_neg[i]])
-                        cls_supervision_neg = torch.stack(base_cls_list_neg)  # (num_prototypes_neg, cls_out_channels)
-                    
-                    # Apply cls_valid_mask to mask out expanded class channels, only consider historical classes
-                    # First sigmoid the supervision, then apply mask (consistent with positive prototypes)
-                    cls_supervision_neg_sigmoid = cls_supervision_neg.sigmoid() * cls_valid_mask_neg  # Mask the supervision
-                    cls_out_neg_masked = cls_out_neg * cls_valid_mask_neg  # Mask the output
-                    
-                    # Compute classification loss for negative prototypes (only on historical classes)
-                    cls_loss_neg = F.binary_cross_entropy_with_logits(
-                        cls_out_neg_masked,
-                        cls_supervision_neg_sigmoid,
-                        reduction='none'
-                    )  # (num_prototypes_neg, cls_out_channels)
-                else:
-                    # Use zero labels for negative samples
-                    cls_target_neg = torch.zeros_like(cls_out_neg)  # (num_prototypes_neg, cls_out_channels)
-                    
-                    # Apply cls_valid_mask to mask out expanded class channels, only consider historical classes
-                    cls_out_neg_masked = cls_out_neg * cls_valid_mask_neg  # Mask the output
-                    cls_target_neg_masked = cls_target_neg * cls_valid_mask_neg  # Mask the target (still zeros, but masked)
-                    
-                    # Compute classification loss for negative prototypes (only on historical classes)
-                    cls_loss_neg = F.binary_cross_entropy_with_logits(
-                        cls_out_neg_masked,
-                        cls_target_neg_masked,
-                        reduction='none'
-                    )  # (num_prototypes_neg, cls_out_channels)
-                
-                # Only compute loss on valid (historical) classes
-                valid_mask_sum = cls_valid_mask_neg.sum(dim=1)  # (num_prototypes_neg,)
-                # Avoid division by zero
-                valid_mask_sum = torch.clamp(valid_mask_sum, min=1.0)
-                cls_loss_neg = (cls_loss_neg * cls_valid_mask_neg).sum(dim=1) / valid_mask_sum  # (num_prototypes_neg,)
-                cls_loss_neg = cls_loss_neg.mean()  # Scalar
-                
-                # Accumulate negative prototype classification loss separately
-                cls_loss_neg_proto += cls_loss_neg
-            
-        detect.train()
-        if has_neg_protos:
-            return cls_loss_proto, reg_loss_proto, cls_loss_neg_proto
-        else:
-            return cls_loss_proto, reg_loss_proto
 
     def optimizer_step(self):
         """Perform a single step of the training optimizer with gradient clipping and EMA update.

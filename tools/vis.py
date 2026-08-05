@@ -1422,20 +1422,20 @@ def _calculate_projection_lengths(input_tensor, kernel_tensor, pca_components, u
     # Project input to PCA components: [bs*h_in*w_in, c_in] @ [c_in, n_components] = [bs*h_in*w_in, n_components]
     # Standard case: PCA on input channels
     input_proj = torch.matmul(input_reshaped, pca_components.T)  # [bs*h_in*w_in, n_components]
-    # Calculate projection lengths (L2 norm across samples)
-    input_proj_lengths = torch.norm(input_proj, p=2, dim=1)  # [bs*h_in*w_in]
+    # Calculate projection lengths (L2 norm across samples, one length per component)
+    input_proj_lengths = torch.norm(input_proj, p=2, dim=0)  # [n_components]
     
     # Project kernel to PCA components
     if unfold:
         # kernel_tensor: [c_out, c_in*k[0]*k[1]]
         # pca_components: [n_components, c_in*k[0]*k[1]]
         kernel_proj = torch.matmul(kernel_tensor, pca_components.T)  # [c_out, n_components]
-        kernel_proj_lengths = torch.norm(kernel_proj, p=2, dim=1)  # [c_out*k[0]*k[1]]
+        kernel_proj_lengths = torch.norm(kernel_proj, p=2, dim=0)  # [n_components]
     else:
         # kernel_tensor: [c_out*k[0]*k[1], c_in]
         # pca_components: [n_components, c_in]
         kernel_proj = torch.matmul(kernel_tensor, pca_components.T)  # [c_out*k[0]*k[1], n_components]
-        kernel_proj_lengths = torch.norm(kernel_proj, p=2, dim=1)  # [c_out*k[0]*k[1]]
+        kernel_proj_lengths = torch.norm(kernel_proj, p=2, dim=0)  # [n_components]
     
     return input_proj_lengths, kernel_proj_lengths
 

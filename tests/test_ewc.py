@@ -6,7 +6,7 @@ import unittest
 import torch
 from torch import nn
 
-from tools.cal_importance import ImportanceCalculator
+from tools.compute_importance import ImportanceCalculator
 from tools.expand_importance import expand_ewc_state
 from ultralytics.engine.ewc import EWC_STATE_VERSION, EWCLoss, validate_ewc_state
 

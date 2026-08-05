@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
-from ultralytics.engine.antiforget import AntiForgetTrainer
+from ultralytics.engine.anti_forget import AntiForgetTrainer
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
@@ -228,161 +228,23 @@ class DetectionTrainer(BaseTrainer):
         return super().auto_batch(max_num_obj)
 
 
-class AntiForgetDetectionTrainer(AntiForgetTrainer):
+class AntiForgetDetectionTrainer(AntiForgetTrainer, DetectionTrainer):
+    """Detection trainer with anti-forgetting support for class-incremental learning.
 
-    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
-        """Initialize a DetectionTrainer object for training YOLO object detection models.
-
-        Args:
-            cfg (dict, optional): Default configuration dictionary containing training parameters.
-            overrides (dict, optional): Dictionary of parameter overrides for the default configuration.
-            _callbacks (list, optional): List of callback functions to be executed during training.
-        """
-        super().__init__(cfg, overrides, _callbacks)
-
-    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
-        """Build YOLO Dataset for training or validation.
-
-        Args:
-            img_path (str): Path to the folder containing images.
-            mode (str): 'train' mode or 'val' mode, users are able to customize different augmentations for each mode.
-            batch (int, optional): Size of batches, this is for 'rect' mode.
-
-        Returns:
-            (Dataset): YOLO dataset object configured for the specified mode.
-        """
-        gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
-
-    def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
-        """Construct and return dataloader for the specified mode.
-
-        Args:
-            dataset_path (str): Path to the dataset.
-            batch_size (int): Number of images per batch.
-            rank (int): Process rank for distributed training.
-            mode (str): 'train' for training dataloader, 'val' for validation dataloader.
-
-        Returns:
-            (DataLoader): PyTorch dataloader object.
-        """
-        assert mode in {"train", "val"}, f"Mode must be 'train' or 'val', not {mode}."
-        with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-            dataset = self.build_dataset(dataset_path, mode, batch_size)
-        shuffle = mode == "train"
-        if getattr(dataset, "rect", False) and shuffle:
-            LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
-            shuffle = False
-        return build_dataloader(
-            dataset,
-            batch=batch_size,
-            workers=self.args.workers if mode == "train" else self.args.workers * 2,
-            shuffle=shuffle,
-            rank=rank,
-            drop_last=self.args.compile and mode == "train",
-        )
-
-    def preprocess_batch(self, batch: dict) -> dict:
-        """Preprocess a batch of images by scaling and converting to float.
-
-        Args:
-            batch (dict): Dictionary containing batch data with 'img' tensor.
-
-        Returns:
-            (dict): Preprocessed batch with normalized images.
-        """
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
-        batch["img"] = batch["img"].float() / 255
-        if self.args.multi_scale:
-            imgs = batch["img"]
-            sz = (
-                random.randrange(int(self.args.imgsz * 0.5), int(self.args.imgsz * 1.5 + self.stride))
-                // self.stride
-                * self.stride
-            )  # size
-            sf = sz / max(imgs.shape[2:])  # scale factor
-            if sf != 1:
-                ns = [
-                    math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]
-                ]  # new shape (stretched to gs-multiple)
-                imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
-            batch["img"] = imgs
-        return batch
-
-    def set_model_attributes(self):
-        """Set model attributes based on dataset information."""
-        # Nl = de_parallel(self.model).model[-1].nl  # number of detection layers (to scale hyps)
-        # self.args.box *= 3 / nl  # scale to layers
-        # self.args.cls *= self.data["nc"] / 80 * 3 / nl  # scale to classes and layers
-        # self.args.cls *= (self.args.imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
-        self.model.nc = self.data["nc"]  # attach number of classes to model
-        self.model.names = self.data["names"]  # attach class names to model
-        self.model.args = self.args  # attach hyperparameters to model
-        # TODO: self.model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
-
-    def get_model(self, cfg: str | None = None, weights: str | None = None, verbose: bool = True):
-        """Return a YOLO detection model.
-
-        Args:
-            cfg (str, optional): Path to model configuration file.
-            weights (str, optional): Path to model weights.
-            verbose (bool): Whether to display model information.
-
-        Returns:
-            (DetectionModel): YOLO detection model.
-        """
-        model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
-        if weights:
-            model.load(weights)
-        return model
+    Combines AntiForgetTrainer's anti-forgetting training loop (_setup_train/_do_train/optimizer_step)
+    with DetectionTrainer's detection-specific dataset/model handling via cooperative multiple
+    inheritance, so the detection behavior is inherited rather than duplicated.
+    """
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
-        self.loss_names = ["box_loss", "cls_loss", "dfl_loss"]
-        
-        if self.args.distillation:
-            self.loss_names.append("dist_loss")
-        if self.args.espreg:
-            self.loss_names.append("espreg_loss")
-        if self.args.ewc:
-            self.loss_names.append("ewc_loss")
-        if self.args.l2:
-            self.loss_names.append("l2_loss")
-        if self.args.kd:
-            self.loss_names.append("kd_loss")
-        if self.args.proto_rp:
-            if self.args.proto_use_neg:
-                self.loss_names.extend(["cls_loss_pr", "reg_loss_pr", "cls_pr_neg"])
-            else:
-                self.loss_names.extend(["cls_loss_pr", "reg_loss_pr"])
-        if self.args.repre:
-            self.loss_names.append("repre_loss")
-        self.loss_names = tuple(self.loss_names)
+        self.loss_names = self._anti_forget_loss_names()
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
 
-    def label_loss_items(self, loss_items: list[float] | None = None, prefix: str = "train"):
-        """Return a loss dict with labeled training loss items tensor.
-
-        Args:
-            loss_items (list[float], optional): List of loss values.
-            prefix (str): Prefix for keys in the returned dictionary.
-
-        Returns:
-            (dict | list): Dictionary of labeled loss items if loss_items is provided, otherwise list of keys.
-        """
-        keys = [f"{prefix}/{x}" for x in self.loss_names]
-        if loss_items is not None:
-            loss_items = [round(float(x), 5) for x in loss_items]  # convert tensors to 5 decimal place floats
-            return dict(zip(keys, loss_items))
-        else:
-            return keys
-
     def progress_string(self):
-        """Return a formatted string of training progress with epoch, GPU memory, loss, instances and size."""
+        """Return a formatted progress string; wider columns than DetectionTrainer for the extra IL loss names."""
         return ("\n" + "%13s" * (4 + len(self.loss_names))) % (
             "Epoch",
             "GPU_mem",
@@ -390,38 +252,6 @@ class AntiForgetDetectionTrainer(AntiForgetTrainer):
             "Instances",
             "Size",
         )
-
-    def plot_training_samples(self, batch: dict[str, Any], ni: int) -> None:
-        """Plot training samples with their annotations.
-
-        Args:
-            batch (dict[str, Any]): Dictionary containing batch data.
-            ni (int): Number of iterations.
-        """
-        plot_images(
-            labels=batch,
-            paths=batch["im_file"],
-            fname=self.save_dir / f"train_batch{ni}.jpg",
-            on_plot=self.on_plot,
-        )
-
-    def plot_training_labels(self):
-        """Create a labeled training plot of the YOLO model."""
-        boxes = np.concatenate([lb["bboxes"] for lb in self.train_loader.dataset.labels], 0)
-        cls = np.concatenate([lb["cls"] for lb in self.train_loader.dataset.labels], 0)
-        plot_labels(boxes, cls.squeeze(), names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
-
-    def auto_batch(self):
-        """Get optimal batch size by calculating memory occupation of model.
-
-        Returns:
-            (int): Optimal batch size.
-        """
-        with override_configs(self.args, overrides={"cache": False}) as self.args:
-            train_dataset = self.build_dataset(self.data["train"], mode="train", batch=16)
-        max_num_obj = max(len(label["cls"]) for label in train_dataset.labels) * 4  # 4 for mosaic augmentation
-        del train_dataset  # free memory
-        return super().auto_batch(max_num_obj)
 
 
 class BPFDetectionTrainer(AntiForgetDetectionTrainer):
@@ -435,28 +265,3 @@ class BPFDetectionTrainer(AntiForgetDetectionTrainer):
             loss_names.extend(("bpf_dwf_cls_loss", "bpf_dwf_box_loss"))
             self.loss_names = tuple(loss_names)
         return validator
-
-
-class ABRDetectionTrainer(AntiForgetDetectionTrainer):
-    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
-        super().__init__(cfg, overrides, _callbacks)
-        self.abr_replay = None
-
-    def preprocess_batch(self, batch: dict) -> dict:
-        batch = super().preprocess_batch(batch)
-
-        if getattr(self.args, "abr", False):
-            if self.abr_replay is None:
-                from ultralytics.engine.abr import ABRReplay
-                self.abr_replay = ABRReplay(
-                    memory_json=self.args.abr_memory,
-                    ratio=tuple(self.args.abr_ratio),
-                    iou_thr=float(self.args.abr_iou_thr),
-                    max_mix_boxes=int(self.args.abr_max_mix_boxes),
-                    mix_beta=float(self.args.abr_mix_beta),
-                    mosaic_scale=tuple(self.args.abr_mosaic_scale),
-                    seed=int(getattr(self.args, "seed", 0)),
-                )
-            batch = self.abr_replay(batch)
-
-        return batch

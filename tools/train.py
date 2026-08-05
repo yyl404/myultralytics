@@ -31,6 +31,7 @@ Arguments:
     --trainer: Type of trainer to use. Options:
         - None or not specified: Use default DetectionTrainer
         - 'antiforget': Use AntiForgetDetectionTrainer for incremental learning
+        - 'bpf': Use BPFDetectionTrainer for BPF incremental learning
         Default: None.
     --<additional_args>: Additional dynamic arguments can be passed to the model.train()
         method. These will be automatically parsed and passed through. Examples include
@@ -62,12 +63,7 @@ import argparse
 from pathlib import Path
 
 from ultralytics import YOLO
-from ultralytics.models.yolo.detect import (
-    ABRDetectionTrainer,
-    AntiForgetDetectionTrainer,
-    BPFDetectionTrainer,
-    DetectionTrainer,
-)
+from ultralytics.models.yolo.detect import AntiForgetDetectionTrainer, BPFDetectionTrainer
 from ultralytics.models.yolo.obb import AntiForgetOBBTrainer
 
 
@@ -202,8 +198,6 @@ def main():
         if task != "detect":
             raise ValueError(f"BPF trainer supports detect models only, got task={task}")
         trainer = BPFDetectionTrainer
-    elif args.trainer == "abr":
-        trainer = ABRDetectionTrainer
     else:
         trainer = None  # use model's default (OBBTrainer for obb, DetectionTrainer for detect, etc.)
     model.train(data=args.data, epochs=args.epochs, batch=args.batch_size, workers=args.workers,
