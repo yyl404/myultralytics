@@ -1,26 +1,26 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Functions for estimating the best YOLO batch size to use a fraction of the available CUDA memory in PyTorch."""
+"""Functions for estimating the best YOLO batch size to use a fraction of the available GPU memory in PyTorch."""
 
-import os
+from __future__ import annotations
+
 from copy import deepcopy
-from typing import Union
 
 import numpy as np
 import torch
 
 from ultralytics.utils import DEFAULT_CFG, LOGGER, colorstr
-from ultralytics.utils.torch_utils import autocast, profile_ops
+from ultralytics.utils.torch_utils import autocast, get_torch_device_backend, profile_ops
 
 
 def check_train_batch_size(
     model: torch.nn.Module,
     imgsz: int = 640,
     amp: bool = True,
-    batch: Union[int, float] = -1,
+    batch: float = -1,
     max_num_obj: int = 1,
+    dataset_size: int = 0,
 ) -> int:
-    """
-    Compute optimal YOLO training batch size using the autobatch() function.
+    """Compute optimal YOLO training batch size using the autobatch() function.
 
     Args:
         model (torch.nn.Module): YOLO model to check batch size for.
@@ -28,6 +28,7 @@ def check_train_batch_size(
         amp (bool, optional): Use automatic mixed precision if True.
         batch (int | float, optional): Fraction of GPU memory to use. If -1, use default.
         max_num_obj (int, optional): The maximum number of objects from dataset.
+        dataset_size (int, optional): Total number of training images. If > 0, batch size will not exceed this value.
 
     Returns:
         (int): Optimal batch size computed using the autobatch() function.
@@ -36,9 +37,13 @@ def check_train_batch_size(
         If 0.0 < batch < 1.0, it's used as the fraction of GPU memory to use.
         Otherwise, a default fraction of 0.6 is used.
     """
-    with autocast(enabled=amp):
+    with autocast(enabled=amp, device=next(model.parameters()).device.type):
         return autobatch(
-            deepcopy(model).train(), imgsz, fraction=batch if 0.0 < batch < 1.0 else 0.6, max_num_obj=max_num_obj
+            deepcopy(model).train(),
+            imgsz,
+            fraction=batch if 0.0 < batch < 1.0 else 0.6,
+            max_num_obj=max_num_obj,
+            dataset_size=dataset_size,
         )
 
 
@@ -48,9 +53,9 @@ def autobatch(
     fraction: float = 0.60,
     batch_size: int = DEFAULT_CFG.batch,
     max_num_obj: int = 1,
+    dataset_size: int = 0,
 ) -> int:
-    """
-    Automatically estimate the best YOLO batch size to use a fraction of the available CUDA memory.
+    """Automatically estimate the best YOLO batch size to use a fraction of the available GPU memory.
 
     Args:
         model (torch.nn.Module): YOLO model to compute batch size for.
@@ -58,35 +63,40 @@ def autobatch(
         fraction (float, optional): The fraction of available CUDA memory to use.
         batch_size (int, optional): The default batch size to use if an error is detected.
         max_num_obj (int, optional): The maximum number of objects from dataset.
+        dataset_size (int, optional): Total number of training images. If > 0, batch size will not exceed this value.
 
     Returns:
         (int): The optimal batch size.
     """
     # Check device
     prefix = colorstr("AutoBatch: ")
-    LOGGER.info(f"{prefix}Computing optimal batch size for imgsz={imgsz} at {fraction * 100}% CUDA memory utilization.")
+    LOGGER.info(f"{prefix}Computing optimal batch size for imgsz={imgsz} at {fraction * 100}% GPU memory utilization.")
     device = next(model.parameters()).device  # get model device
     if device.type in {"cpu", "mps"}:
-        LOGGER.warning(f"{prefix}intended for CUDA devices, using default batch-size {batch_size}")
+        LOGGER.warning(f"{prefix}intended for GPU devices, using default batch-size {batch_size}")
         return batch_size
-    if torch.backends.cudnn.benchmark:
+    if device.type == "cuda" and torch.backends.cudnn.benchmark:
         LOGGER.warning(f"{prefix}Requires torch.backends.cudnn.benchmark=False, using default batch-size {batch_size}")
         return batch_size
 
-    # Inspect CUDA memory
+    # Inspect GPU memory
+    accelerator = get_torch_device_backend(device)
     gb = 1 << 30  # bytes to GiB (1024 ** 3)
-    d = f"CUDA:{os.getenv('CUDA_VISIBLE_DEVICES', '0').strip()[0]}"  # 'CUDA:0'
-    properties = torch.cuda.get_device_properties(device)  # device properties
+    d = f"{device.type.upper()}:{device.index}"
+    properties = accelerator.get_device_properties(device)  # device properties
     t = properties.total_memory / gb  # GiB total
-    r = torch.cuda.memory_reserved(device) / gb  # GiB reserved
-    a = torch.cuda.memory_allocated(device) / gb  # GiB allocated
+    r = accelerator.memory_reserved(device) / gb  # GiB reserved
+    a = accelerator.memory_allocated(device) / gb  # GiB allocated
     f = t - (r + a)  # GiB free
     LOGGER.info(f"{prefix}{d} ({properties.name}) {t:.2f}G total, {r:.2f}G reserved, {a:.2f}G allocated, {f:.2f}G free")
 
     # Profile batch sizes
     batch_sizes = [1, 2, 4, 8, 16] if t < 16 else [1, 2, 4, 8, 16, 32, 64]
+    if dataset_size > 0:
+        batch_sizes = [b for b in batch_sizes if b <= dataset_size]
+    ch = model.yaml.get("channels", 3)
     try:
-        img = [torch.empty(b, 3, imgsz, imgsz) for b in batch_sizes]
+        img = [torch.empty(b, ch, imgsz, imgsz) for b in batch_sizes]
         results = profile_ops(img, model, n=1, device=device, max_num_obj=max_num_obj)
 
         # Fit a solution
@@ -99,7 +109,7 @@ def autobatch(
             and (i == 0 or not results[i - 1] or y[2] > results[i - 1][2])  # first item or increasing memory
         ]
         fit_x, fit_y = zip(*xy) if xy else ([], [])
-        p = np.polyfit(fit_x, fit_y, deg=1)  # first-degree polynomial fit in log space
+        p = np.polyfit(fit_x, fit_y, deg=1)  # first-degree (linear) polynomial fit
         b = int((round(f * fraction) - p[1]) / p[0])  # y intercept (optimal batch size)
         if None in results:  # some sizes failed
             i = results.index(None)  # first fail index
@@ -108,6 +118,8 @@ def autobatch(
         if b < 1 or b > 1024:  # b outside of safe range
             LOGGER.warning(f"{prefix}batch={b} outside safe range, using default batch-size {batch_size}.")
             b = batch_size
+        if dataset_size > 0:
+            b = min(b, dataset_size)
 
         fraction = (np.polyval(p, b) + r + a) / t  # predicted fraction
         LOGGER.info(f"{prefix}Using batch-size {b} for {d} {t * fraction:.2f}G/{t:.2f}G ({fraction * 100:.0f}%) ✅")
@@ -116,4 +128,4 @@ def autobatch(
         LOGGER.warning(f"{prefix}error detected: {e},  using default batch-size {batch_size}.")
         return batch_size
     finally:
-        torch.cuda.empty_cache()
+        accelerator.empty_cache()
