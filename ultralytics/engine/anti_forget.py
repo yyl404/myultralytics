@@ -81,12 +81,12 @@ def get_model_raw_output_and_features(batch, model, device):
 
 
 def _raw_detect_levels(output):
-    """Return raw Detect levels from train- or eval-mode model output."""
-    if isinstance(output, list):
+    """Return the raw Detect prediction dict from train- or eval-mode model output."""
+    if isinstance(output, dict):
         return output
-    if isinstance(output, tuple) and len(output) == 2 and isinstance(output[1], list):
+    if isinstance(output, tuple) and len(output) == 2 and isinstance(output[1], dict):
         return output[1]
-    raise TypeError(f"Expected raw Detect levels or (decoded, levels), got {type(output)}")
+    raise TypeError(f"Expected Detect prediction dict or (decoded, dict), got {type(output)}")
 
 
 def _get_detect_head(model):
@@ -537,8 +537,9 @@ class AntiForgetTrainer(BaseTrainer):
 
     def _do_train(self, world_size=1):
         """Train the model with the specified world size."""
+        world_size = getattr(self, "world_size", None) or world_size
         if world_size > 1:
-            self._setup_ddp(world_size)
+            self._setup_ddp()
         self._setup_train(world_size)
 
         nb = len(self.train_loader)  # number of batches
@@ -675,9 +676,9 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== MODIFIED: get det loss ===============================
                     loss, self.loss_items = self.model(batch, preds=model_pred)
                     # ============================== END: get det loss ====================================
-                    
+
                     # ============================== MODIFIED: make a copy of loss items ===============================
-                    loss_items = deepcopy(self.loss_items)
+                    loss_items = dict(self.loss_items)  # criterion returns a dict of detached per-term scalars
                     # ============================== END: make a copy of loss items ====================================
                     
                     self.loss = loss.sum()
@@ -686,7 +687,7 @@ class AntiForgetTrainer(BaseTrainer):
                     if self.args.distillation:
                         _dist_loss = get_dist_loss(model_pred, base_model_pred[0], self.model, dist_topk=self.args.dist_topk)
                         self.loss += (_dist_loss * self.args.dist_loss_weight)
-                        loss_items = torch.cat([loss_items, torch.tensor([_dist_loss], device=loss_items.device)])
+                        loss_items["dist_loss"] = _dist_loss.detach()
                     # ============================== END: calculate KL distillation loss ===============================
 
                     # ============================== MODIFIED: BPF DwF ============================================
@@ -704,42 +705,44 @@ class AntiForgetTrainer(BaseTrainer):
                             split_iou=self.args.bpf_split_iou,
                         )
                         self.loss += (dwf_loss.cls + dwf_loss.box) * self.args.bpf_dwf_weight
-                        loss_items = torch.cat((loss_items, dwf_loss.cls.detach().reshape(1)))
-                        loss_items = torch.cat((loss_items, dwf_loss.box.detach().reshape(1)))
+                        loss_items["bpf_dwf_cls_loss"] = dwf_loss.cls.detach()
+                        loss_items["bpf_dwf_box_loss"] = dwf_loss.box.detach()
                     # ============================== END: BPF DwF ================================================
-                    
+
                     # ============================== MODIFIED: calculate ESPReg loss ===================================
                     if self.args.espreg:
                         _espreg_loss = self.espreg_loss.get_loss()
                         self.loss += (_espreg_loss * self.espreg_loss_weight)
-                        loss_items = torch.cat([loss_items, torch.tensor([_espreg_loss], device=loss_items.device)])
+                        loss_items["espreg_loss"] = _espreg_loss.detach()
                     # ============================== END: calculate ESPReg loss ========================================
 
                     # ============================== MODIFIED: calculate EWC loss ===================================
                     if self.args.ewc:
                         _ewc_loss = self.ewc_loss.get_loss()
                         self.loss += _ewc_loss * self.ewc_loss_weight
-                        loss_items = torch.cat((loss_items, _ewc_loss.detach().reshape(1)))
+                        loss_items["ewc_loss"] = _ewc_loss.detach()
                     # ============================== END: calculate EWC loss ========================================
 
                     # ============================== MODIFIED: calculate L2 regularization loss ======================
                     if self.args.l2:
                         _l2_loss = self.l2_loss.get_loss()
                         self.loss += _l2_loss * self.l2_loss_weight
-                        loss_items = torch.cat((loss_items, _l2_loss.detach().reshape(1)))
+                        loss_items["l2_loss"] = _l2_loss.detach()
                     # ============================== END: calculate L2 regularization loss ===========================
 
                     # ============================== MODIFIED: replay regional prototypes ================================
                     if self.args.repre:
                         repre_loss = self.repre.compute_loss()
                         self.loss += repre_loss * self.repre_loss_weight
-                        loss_items = torch.cat((loss_items, repre_loss.detach().reshape(1)))
+                        loss_items["repre_loss"] = repre_loss.detach()
                     # ============================== END: replay regional prototypes ====================================
 
                     if RANK != -1:
                         self.loss *= world_size                   
                     self.tloss = (
-                        (self.tloss * i + loss_items) / (i + 1) if self.tloss is not None else loss_items
+                        loss_items
+                        if self.tloss is None
+                        else {k: (self.tloss[k] * i + v) / (i + 1) for k, v in loss_items.items()}
                     )
 
                 # Backward
@@ -762,13 +765,13 @@ class AntiForgetTrainer(BaseTrainer):
 
                 # Log
                 if RANK in {-1, 0}:
-                    loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+                    loss_length = len(self.tloss)
                     pbar.set_description(
                         ("%13s" * 2 + "%13.4g" * (2 + loss_length))
                         % (
                             f"{epoch + 1}/{self.epochs}",
                             f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
+                            *self.tloss.values(),  # losses
                             batch["cls"].shape[0],  # batch size, i.e. 8
                             batch["img"].shape[-1],  # imgsz, i.e 640
                         )

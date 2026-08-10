@@ -22,17 +22,45 @@ class BPFLoss:
     box: torch.Tensor
 
 
-def _validate_detect_output(head: Detect, raw_output: list[torch.Tensor], name: str) -> None:
-    """Validate a raw Detect output list."""
+def normalize_head_output(head: Detect, raw_output, name: str = "output") -> dict[str, torch.Tensor]:
+    """Return the Detect head's raw prediction dict from a train- or eval-mode model output.
+
+    Train mode returns the dict directly; eval mode returns a (decoded, preds) tuple. For end2end
+    heads the one-to-many branch is used.
+    """
     if not isinstance(head, Detect):
         raise TypeError(f"BPF supports Detect heads only, got {type(head)} for {name}")
-    if not isinstance(raw_output, list) or len(raw_output) != head.nl:
-        raise TypeError(f"{name} must contain {head.nl} raw feature levels, got {type(raw_output)}")
-    for level, output in enumerate(raw_output):
-        if output.ndim != 4 or output.shape[1] != head.no:
-            raise ValueError(
-                f"{name}[{level}] must have shape (B, {head.no}, H, W), got {tuple(output.shape)}"
-            )
+    preds = raw_output[1] if isinstance(raw_output, tuple) else raw_output
+    if not isinstance(preds, dict):
+        raise TypeError(f"{name} must be a Detect prediction dict or (decoded, dict) tuple, got {type(preds)}")
+    if head.end2end:
+        preds = preds["one2many"]
+    if not {"boxes", "scores", "feats"} <= preds.keys():
+        raise ValueError(f"{name} prediction dict must contain 'boxes', 'scores' and 'feats' keys")
+    return preds
+
+
+def level_tensors_from_preds(head: Detect, preds: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+    """Rebuild per-level (B, no, H, W) head outputs from the concatenated prediction dict.
+
+    The head flattens each level row-major before concatenation, so slicing the anchor axis and
+    reshaping back to (H, W) is the exact inverse.
+    """
+    levels = []
+    offset = 0
+    batch_size = preds["boxes"].shape[0]
+    for feature in preds["feats"]:
+        height, width = feature.shape[-2:]
+        num_locations = height * width
+        boxes = preds["boxes"][:, :, offset : offset + num_locations].reshape(
+            batch_size, head.reg_max * 4, height, width
+        )
+        scores = preds["scores"][:, :, offset : offset + num_locations].reshape(
+            batch_size, head.nc, height, width
+        )
+        levels.append(torch.cat((boxes, scores), dim=1))
+        offset += num_locations
+    return levels
 
 
 def bpf_attention_map(feature: torch.Tensor, power: float = 2.0) -> torch.Tensor:
@@ -126,14 +154,14 @@ def merge_bpf_pseudo_labels(
 
 def bpf_pseudo_detections(
     head: Detect,
-    raw_output: list[torch.Tensor],
+    raw_output,
     image_size: tuple[int, int],
     score_threshold: float = 0.75,
     nms_threshold: float = 0.3,
 ) -> list[torch.Tensor]:
     """Decode old-model outputs into normalized (xywh, confidence, class) pseudo labels."""
-    _validate_detect_output(head, raw_output, "source output")
-    decoded = head._inference(raw_output)
+    preds = normalize_head_output(head, raw_output, "source output")
+    decoded = head._inference(preds)
     predictions = non_max_suppression(
         decoded,
         conf_thres=score_threshold,
@@ -154,7 +182,7 @@ def bpf_pseudo_detections(
 
 def select_future_ignore_mask(
     head: Detect,
-    raw_output: list[torch.Tensor],
+    raw_output,
     head_features: list[torch.Tensor],
     batch: dict[str, torch.Tensor],
     object_topk: float = 0.1,
@@ -163,14 +191,15 @@ def select_future_ignore_mask(
     attention_power: float = 2.0,
 ) -> torch.Tensor:
     """Select high-objectness/high-attention unlabeled locations as future-class ignores."""
-    _validate_detect_output(head, raw_output, "student output")
+    preds = normalize_head_output(head, raw_output, "student output")
+    raw_levels = level_tensors_from_preds(head, preds)
     if len(head_features) != head.nl:
         raise ValueError(f"Expected {head.nl} Detect input features, got {len(head_features)}")
     if not 0 < object_topk <= 1 or not 0 < attention_topk <= 1:
         raise ValueError(f"Top-k ratios must be in (0, 1], got {object_topk}, {attention_topk}")
 
-    batch_size = raw_output[0].shape[0]
-    decoded_boxes = head._inference(raw_output)[:, :4, :].permute(0, 2, 1).contiguous()
+    batch_size = preds["scores"].shape[0]
+    decoded_boxes = head._inference(preds)[:, :4, :].permute(0, 2, 1).contiguous()
     decoded_boxes = xywh2xyxy(decoded_boxes)
     level_masks = []
     anchor_offset = 0
@@ -179,7 +208,7 @@ def select_future_ignore_mask(
     image_height, image_width = batch["img"].shape[-2:]
     scale = gt_boxes.new_tensor((image_width, image_height, image_width, image_height))
 
-    for level, (feature, prediction) in enumerate(zip(head_features, raw_output)):
+    for level, (feature, prediction) in enumerate(zip(head_features, raw_levels)):
         if feature.shape[0] != batch_size or feature.shape[-2:] != prediction.shape[-2:]:
             raise ValueError(
                 f"Feature/output shape mismatch at level {level}: {tuple(feature.shape)} vs {tuple(prediction.shape)}"
@@ -210,12 +239,10 @@ def select_future_ignore_mask(
     return torch.cat(level_masks, dim=1)
 
 
-def _categorical_probabilities(head: Detect, raw_output: list[torch.Tensor]) -> torch.Tensor:
+def _categorical_probabilities(head: Detect, raw_output) -> torch.Tensor:
     """Return categorical [background, classes] probabilities with shape (B, A, C+1)."""
-    _validate_detect_output(head, raw_output, "DwF output")
-    logits = torch.cat(
-        [level[:, head.reg_max * 4 :, :, :].flatten(2) for level in raw_output], dim=2
-    ).permute(0, 2, 1)
+    preds = normalize_head_output(head, raw_output, "DwF output")
+    logits = preds["scores"].permute(0, 2, 1)  # (B, A, C) raw cls logits, anchors in level order
     background = torch.zeros((*logits.shape[:2], 1), device=logits.device, dtype=logits.dtype)
     return torch.cat((background, logits), dim=-1).float().softmax(dim=-1)
 
@@ -245,19 +272,19 @@ def build_dwf_targets(
     return torch.where(old_region_mask.unsqueeze(-1), old_target, new_target)
 
 
-def _decoded_boxes(head: Detect, raw_output: list[torch.Tensor]) -> torch.Tensor:
+def _decoded_boxes(head: Detect, raw_output) -> torch.Tensor:
     """Return decoded xyxy boxes with shape (B, A, 4)."""
-    _validate_detect_output(head, raw_output, "box output")
-    return xywh2xyxy(head._inference(raw_output)[:, :4, :].permute(0, 2, 1).contiguous())
+    preds = normalize_head_output(head, raw_output, "box output")
+    return xywh2xyxy(head._inference(preds)[:, :4, :].permute(0, 2, 1).contiguous())
 
 
 def compute_dwf_loss(
     student_head: Detect,
-    student_output: list[torch.Tensor],
+    student_output,
     source_head: Detect,
-    source_output: list[torch.Tensor],
+    source_output,
     interim_head: Detect,
-    interim_output: list[torch.Tensor],
+    interim_output,
     batch: dict[str, torch.Tensor],
     proposal_topk: int = 128,
     proposal_samples: int = 64,

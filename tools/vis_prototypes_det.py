@@ -86,9 +86,10 @@ def run_evaluation(model, prototypes, meta_info, device, max_protos=torch.inf):
     class_names = model.names
     detect = model.model.model[-1]
     
-    # Identify channels dynamically
-    in_channels = [m[0].conv.in_channels if hasattr(m[0], 'conv') else m[0].in_channels 
-                   for m in detect.cv3]
+    # Identify channels dynamically (first Conv/DWConv of each cv3 block;
+    # new non-legacy heads nest Sequential(DWConv, Conv) inside cv3[i][0])
+    in_channels = [next(m.conv.in_channels for m in seq.modules() if hasattr(m, 'conv'))
+                   for seq in detect.cv3]
     
     results = []
     losses = {'cls': 0.0, 'reg': 0.0, 'count': 0, 'correct_both': 0, 'correct_loc': 0, 'correct_cls': 0}
@@ -123,8 +124,11 @@ def run_evaluation(model, prototypes, meta_info, device, max_protos=torch.inf):
                 place_patch(inputs[l_idx][0], feats[i].to(device), masks[i].to(device), y, x)
                 
                 # 2. Forward
-                # Detect returns [decoded, raw_list]
-                decoded, raw_list = detect(inputs)
+                # Eval-mode Detect forward returns (decoded, preds_dict); the per-scale
+                # raw maps (cat of box and cls head outputs) are recomputed directly.
+                decoded, _ = detect(inputs)
+                raw_list = [torch.cat([detect.cv2[k](inputs[k]), detect.cv3[k](inputs[k])], dim=1)
+                            for k in range(len(inputs))]
                 
                 # 3. Extract Predictions at (y,x)
                 pred_reg_map = raw_list[l_idx][:, :reg_out]

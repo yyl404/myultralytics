@@ -40,7 +40,7 @@ def non_max_suppression(
         classes (list[int], optional): List of class indices to consider. If None, all classes are considered.
         agnostic (bool): Whether to perform class-agnostic NMS.
         multi_label (bool): Whether each box can have multiple labels.
-        labels (list[list[Union[int, float, torch.Tensor]]]): A priori labels for each image.
+        labels (list[torch.Tensor]): A priori labels for each image.
         max_det (int): Maximum number of detections to keep per image.
         nc (int): Number of classes. Indices after this are considered masks.
         max_time_img (float): Maximum time in seconds for processing one image.
@@ -51,23 +51,28 @@ def non_max_suppression(
         return_idxs (bool): Whether to return the indices of kept detections.
 
     Returns:
-        output (list[torch.Tensor]): List of detections per image with shape (num_boxes, 6 + num_masks) containing (x1,
-            y1, x2, y2, confidence, class, mask1, mask2, ...).
-        keepi (list[torch.Tensor]): Indices of kept detections if return_idxs=True.
+        (list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor]]): List of detections per image with shape
+            (num_boxes, 6 + num_masks) containing (x1, y1, x2, y2, confidence, class, mask1, mask2, ...). If
+            return_idxs=True, returns a tuple of (output, keepi) where keepi contains indices of kept detections.
     """
     # Checks
     assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
     assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"
-    if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
+    if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation mode, output = (inference_out, loss_out)
         prediction = prediction[0]  # select only inference output
     if classes is not None:
         classes = torch.tensor(classes, device=prediction.device)
 
     if prediction.shape[-1] == 6 or end2end:  # end-to-end model (BNC, i.e. 1,300,6)
-        output = [pred[pred[:, 4] > conf_thres][:max_det] for pred in prediction]
-        if classes is not None:
-            output = [pred[(pred[:, 5:6] == classes).any(1)] for pred in output]
-        return output
+        output, keepi = [], []
+        for pred in prediction:
+            mask = pred[:, 4] > conf_thres
+            if classes is not None:
+                mask &= (pred[:, 5:6] == classes).any(1)
+            idx = mask.nonzero(as_tuple=False).view(-1)[:max_det]
+            output.append(pred[idx])
+            keepi.append(idx)
+        return (output, keepi) if return_idxs else output
 
     bs = prediction.shape[0]  # batch size (BCN, i.e. 1,84,6300)
     nc = nc or (prediction.shape[1] - 4)  # number of classes
@@ -88,6 +93,7 @@ def non_max_suppression(
     t = time.time()
     output = [torch.zeros((0, 6 + extra), device=prediction.device)] * bs
     keepi = [torch.zeros((0, 1), device=prediction.device)] * bs  # to store the kept idxs
+    use_torchvision = prediction.device.type not in {"npu", "xpu"} and "torchvision" in sys.modules
     for xi, (x, xk) in enumerate(zip(prediction, xinds)):  # image index, (preds, preds indices)
         # Apply constraints
         # x[((x[:, 2:4] < min_wh) | (x[:, 2:4] > max_wh)).any(1), 4] = 0  # width-height
@@ -147,8 +153,8 @@ def non_max_suppression(
             i = TorchNMS.fast_nms(boxes, scores, iou_thres, iou_func=batch_probiou)
         else:
             boxes = x[:, :4] + c  # boxes (offset by class)
-            # Speed strategy: torchvision for val or already loaded (faster), TorchNMS for predict (lower latency)
-            if "torchvision" in sys.modules:
+            # Use torchvision if already imported and supported; its NMS has no NPU/XPU kernels.
+            if use_torchvision:
                 import torchvision  # scope as slow import
 
                 i = torchvision.ops.nms(boxes, scores, iou_thres)
@@ -170,9 +176,10 @@ class TorchNMS:
     """Ultralytics custom NMS implementation optimized for YOLO.
 
     This class provides static methods for performing non-maximum suppression (NMS) operations on bounding boxes,
-    including both standard NMS and batched NMS for multi-class scenarios.
+    including standard NMS, fast NMS, and batched NMS for multi-class scenarios.
 
     Methods:
+        fast_nms: Fast-NMS using upper triangular matrix operations.
         nms: Optimized NMS with early termination that matches torchvision behavior exactly.
         batched_nms: Batched NMS for class-aware suppression.
 
@@ -209,7 +216,7 @@ class TorchNMS:
             Apply NMS to a set of boxes
             >>> boxes = torch.tensor([[0, 0, 10, 10], [5, 5, 15, 15]])
             >>> scores = torch.tensor([0.9, 0.8])
-            >>> keep = TorchNMS.nms(boxes, scores, 0.5)
+            >>> keep = TorchNMS.fast_nms(boxes, scores, 0.5)
         """
         if boxes.numel() == 0 and exit_early:
             return torch.empty((0,), dtype=torch.int64, device=boxes.device)

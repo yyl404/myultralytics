@@ -54,6 +54,7 @@ import torch
 import torch.nn.functional as F
 
 from ultralytics import YOLO
+from ultralytics.engine.bpf import level_tensors_from_preds, normalize_head_output
 from ultralytics.utils import LOGGER, TQDM, YAML
 from ultralytics.utils.plotting import Annotator, colors
 from ultralytics.utils.metrics import bbox_iou, batch_probiou
@@ -62,14 +63,20 @@ from ultralytics.nn.modules.head import Detect, OBB
 
 def _unpack_head_output(detect, captured_outputs):
     """Unpack hook output for Detect or OBB head.
-    Returns (decoded_preds, raw_preds) for Detect; (decoded_preds_full, raw_preds) for OBB.
-    OBB decoded_preds_full is (B, 4+nc+1, num_anchors) so bbox (first 4) and angle (last 1) can be used for rotated IoU.
+    Returns (decoded_preds, raw_levels) where raw_levels is the per-level (B, no, H, W) head
+    output list (regression channels first, then classification channels, angle excluded for OBB).
+    Detect decoded_preds: (B, 4+nc, sum(HW)); OBB: (B, 4+nc+1, sum(HW)) with angle in last channel.
     """
+    decoded, preds = captured_outputs[0], captured_outputs[1]
+    if isinstance(preds, dict):
+        # Current head format: eval output is (decoded, {"boxes", "scores", "feats"}); rebuild the
+        # per-level outputs from the concatenated prediction channels.
+        preds = normalize_head_output(detect, (decoded, preds))
+        return decoded, level_tensors_from_preds(detect, preds)
     if isinstance(detect, OBB):
         decoded_cat, (raw_preds, _) = captured_outputs  # decoded_cat (B, 4+nc+ne, sum(HW))
         return decoded_cat, raw_preds
-    decoded, raw_preds = captured_outputs[0], captured_outputs[1]
-    return decoded, raw_preds
+    return decoded, preds
 
 
 def run_kmeans(features, k, max_iters=100):
@@ -446,7 +453,14 @@ def visualize_results(prototypes, meta_info, detect, vis_dir, class_names, imgsz
             retrieved_pred_maps = [torch.zeros([1, reg_dim+nc, H, W], device=device) for H, W in HWs]
             y_idx, x_idx = meta["yx"]
             retrieved_pred_maps[layer_idx][0, :, y_idx, x_idx] = reg_cls.to(device)
-            retrieved_decoded_bboxes = detect._inference(retrieved_pred_maps)
+            # New Detect._inference expects the head's prediction dict: concatenated box/score
+            # channels plus per-level features (used only for anchor shapes here).
+            retrieved_preds = {
+                "boxes": torch.cat([m[:, :reg_dim].flatten(2) for m in retrieved_pred_maps], dim=2),
+                "scores": torch.cat([m[:, reg_dim:].flatten(2) for m in retrieved_pred_maps], dim=2),
+                "feats": [torch.zeros([1, 1, H, W], device=device) for H, W in HWs],
+            }
+            retrieved_decoded_bboxes = detect._inference(retrieved_preds)
             retrieval_idx = sum([H*W for H, W in HWs[:layer_idx]]) + y_idx * HWs[layer_idx][1] + x_idx
             bbox = retrieved_decoded_bboxes[0,:4,retrieval_idx]
 
