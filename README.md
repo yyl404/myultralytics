@@ -72,6 +72,7 @@ OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`
 
 - `yolov8x-cls.pt`：ImageNet 分类预训练权重，`yolov8` baseline 的检测初始化
 - `yoloe-v8l-seg.pt`：YOLOE 分割预训练权重，`yoloe-v8` baseline 的初始化
+- `yolo26x.pt`：COCO 检测预训练权重，`yolo26` baseline（yolo26x）的初始化
 
 ---
 
@@ -86,6 +87,8 @@ bash scripts/<dataset>/<split>/<baseline>/train_<method>.sh
 ```
 
 `<method>` 取值（9 个）：`naive`、`pseudo_label`、`pseudo_label+ewc`、`pseudo_label+l2`、`pseudo_label+espreg`、`pseudo_label+dist+espreg`、`pseudo_label+nsgp`、`pseudo_label+nsgp+repre`、`bpf`。
+
+注：`yolo26` baseline（end2end 检测头）当前仅提供 `pseudo_label+dist+espreg` 启动脚本。
 
 示例：
 

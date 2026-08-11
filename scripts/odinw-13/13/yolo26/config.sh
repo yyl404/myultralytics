@@ -1,0 +1,28 @@
+#!/bin/bash
+
+MODEL_ADAPTER="scripts/model_adapters/ultralytics.sh"
+MODEL_ID="yolo26x"
+MODEL_CONFIG="yolo26x.yaml"
+MODEL_WEIGHTS="yolo26x.pt"
+DATASET_FAMILY="odinw"
+TASK_DATASETS=(
+    "data/OdinW-13-yolo/AerialMaritimeDrone/data.yaml"
+    "data/OdinW-13-yolo/Aquarium/data.yaml"
+    "data/OdinW-13-yolo/CottontailRabbits/data.yaml"
+    "data/OdinW-13-yolo/EgoHands/data.yaml"
+    "data/OdinW-13-yolo/NorthAmericaMushrooms/data.yaml"
+    "data/OdinW-13-yolo/Packages/data.yaml"
+    "data/OdinW-13-yolo/PascalVOC/data.yaml"
+    "data/OdinW-13-yolo/Raccoon/data.yaml"
+    "data/OdinW-13-yolo/ShellfishOpenImages/data.yaml"
+    "data/OdinW-13-yolo/VehiclesOpenImages/data.yaml"
+    "data/OdinW-13-yolo/pistols/data.yaml"
+    "data/OdinW-13-yolo/pothole/data.yaml"
+    "data/OdinW-13-yolo/thermalDogsAndPeople/data.yaml"
+)
+OUTPUT_PREFIX="runs/yolo26x_OdinW-13-yolo_pretrained-from-yolo26x"
+EPOCHS="${EPOCHS:-100}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+IMGSZ="${IMGSZ:-640}"
+WORKERS="${WORKERS:-8}"
+DEVICE="${DEVICE:-0}"

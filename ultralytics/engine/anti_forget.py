@@ -264,7 +264,31 @@ def merge_pseudo_labels_with_gt(
     return batch
 
 
-def get_dist_loss(model_pred, base_model_pred, model, dist_topk=1):
+def _decode_detect_output(head, raw_output):
+    """Decode a Detect head output to the (B, 4 + nc, num_anchors) prediction layout.
+
+    Accepts train-mode prediction dicts and eval-mode (decoded, preds) tuples, with or
+    without an end2end {"one2many", "one2one"} split. End2end outputs are decoded from
+    the one2many branch; the one2one branch is detached from the backbone during training.
+
+    Args:
+        head: The Detect head that produced the output (its own anchors/strides are used).
+        raw_output: Train-mode dict, end2end train-mode dict, or eval-mode (decoded, preds) tuple.
+
+    Returns:
+        Decoded predictions, (B, 4 + nc, num_anchors), with sigmoid-activated cls channels.
+    """
+    if isinstance(raw_output, tuple):  # eval mode: (decoded, preds)
+        decoded, preds = raw_output
+        if not (isinstance(preds, dict) and "one2many" in preds):
+            return decoded  # already (B, 4 + nc, A)
+        raw_output = preds["one2many"]
+    elif isinstance(raw_output, dict) and "one2many" in raw_output:  # end2end train mode
+        raw_output = raw_output["one2many"]
+    return head._inference(raw_output)
+
+
+def get_dist_loss(model_pred, base_model_pred, model, base_model, dist_topk=1):
     """KL distillation from teacher to student on the teacher's top-k class channels.
 
     For each anchor, take the k teacher class channels (historical classes only) with the
@@ -273,9 +297,10 @@ def get_dist_loss(model_pred, base_model_pred, model, dist_topk=1):
     the sum of all selected teacher confidences over all anchors and channels.
 
     Args:
-        model_pred: Student raw output (pre-NMS), passed to head._inference.
-        base_model_pred: Teacher raw cls scores, (B, 4 + nc_teacher, A).
-        model: Student detection model (used to locate the Detect head).
+        model_pred: Student raw output (pre-NMS), train-mode dict or end2end train-mode dict.
+        base_model_pred: Teacher raw output, eval-mode (decoded, preds) tuple.
+        model: Student detection model (used to locate the student Detect head).
+        base_model: Teacher detection model (used to locate the teacher Detect head).
         dist_topk (int): Number of teacher channels to distill per anchor; -1 means all
             historical class channels. Must be -1 or >= 1.
 
@@ -283,9 +308,11 @@ def get_dist_loss(model_pred, base_model_pred, model, dist_topk=1):
         Weighted KL distillation loss (scalar tensor).
     """
     eps = 1e-6
-    head = _get_detect_head(model)
-    nc = head.nc
-    model_pred = head._inference(model_pred)
+    student_head = _get_detect_head(model)
+    teacher_head = _get_detect_head(base_model)
+    nc = student_head.nc
+    model_pred = _decode_detect_output(student_head, model_pred)  # (B, 4 + nc, A)
+    base_model_pred = _decode_detect_output(teacher_head, base_model_pred)  # (B, 4 + nc_teacher, A)
     cls_start, cls_end = 4, 4 + nc
     student_cls = model_pred[:, cls_start:cls_end, :]  # (B, C, A)
     teacher_cls = base_model_pred[:, cls_start:cls_end, :]  # (B, C_t, A), historical classes only
@@ -325,8 +352,11 @@ class AntiForgetTrainer(BaseTrainer):
         """Return training loss names extended with the enabled anti-forgetting loss terms.
 
         The order matches the order in which the extra loss items are appended in `_do_train`.
+        The third criterion term is dfl_loss when reg_max > 1, l1_loss otherwise (e.g. yolo26).
         """
-        loss_names = ["box_loss", "cls_loss", "dfl_loss"]
+        model_to_use = self.model.module if hasattr(self.model, "module") else self.model
+        use_dfl = _get_detect_head(model_to_use).reg_max > 1
+        loss_names = ["box_loss", "cls_loss", "dfl_loss" if use_dfl else "l1_loss"]
         if self.args.distillation:
             loss_names.append("dist_loss")
         if self.args.espreg:
@@ -685,7 +715,7 @@ class AntiForgetTrainer(BaseTrainer):
 
                     # ============================== MODIFIED: calculate KLD distillation loss ==========================
                     if self.args.distillation:
-                        _dist_loss = get_dist_loss(model_pred, base_model_pred[0], self.model, dist_topk=self.args.dist_topk)
+                        _dist_loss = get_dist_loss(model_pred, base_model_pred, self.model, self.base_model, dist_topk=self.args.dist_topk)
                         self.loss += (_dist_loss * self.args.dist_loss_weight)
                         loss_items["dist_loss"] = _dist_loss.detach()
                     # ============================== END: calculate KL distillation loss ===============================
@@ -786,6 +816,12 @@ class AntiForgetTrainer(BaseTrainer):
             if self.args.espreg:
                 self.espreg_loss.remove_handle_()  # Remove hook for ESPReg
             # ============================== END: remove hook ================================================
+
+            # ============================== MODIFIED: update criterion (e.g. E2ELoss o2m gain decay) ==========
+            model_to_use = self.model.module if hasattr(self.model, "module") else self.model
+            if hasattr(model_to_use.criterion, "update"):
+                model_to_use.criterion.update()
+            # ============================== END: update criterion ===========================================
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
