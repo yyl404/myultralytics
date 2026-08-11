@@ -75,6 +75,16 @@ class IncrementalPCAonGPU():
         self.var_ = None  # Will be initialized properly in partial_fit based on data dimensions
         self.n_samples_seen_ = 0
 
+    def to(self, device):
+        """Move all tensor state to the given device and update self.device."""
+        self.device = torch.device(device)
+        for attr in ("mean_", "var_", "components_", "singular_values_",
+                     "explained_variance_", "explained_variance_ratio_"):
+            value = getattr(self, attr, None)
+            if isinstance(value, torch.Tensor):
+                setattr(self, attr, value.to(self.device))
+        return self
+
     def _validate_data(self, X, dtype=torch.float32, copy=True):
         """
         Validates and converts the input data `X` to the appropriate tensor format.
@@ -295,6 +305,15 @@ class UncenteredPCAonGPU:
         self.n_samples_seen_ = 0
         self.components_ = None
         self.explained_variance_ = None
+
+    def to(self, device):
+        """Move all tensor state to the given device and update self.device."""
+        self.device = torch.device(device)
+        for attr in ("gram_matrix", "components_", "explained_variance_"):
+            value = getattr(self, attr, None)
+            if isinstance(value, torch.Tensor):
+                setattr(self, attr, value.to(self.device))
+        return self
 
     def _validate_data(self, x):
         if not isinstance(x, torch.Tensor):

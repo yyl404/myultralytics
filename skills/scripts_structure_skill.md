@@ -145,7 +145,7 @@ EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 IMGSZ="${IMGSZ:-640}"
 WORKERS="${WORKERS:-8}"
-DEVICE="${DEVICE:-0}"
+DEVICE="${DEVICE:-0}"                  # training device; may be a multi-GPU list, e.g. "0,1"
 ```
 
 TIL example (`TASK_DATASETS` = lex-ordered OdinW-13 domains):
@@ -166,6 +166,7 @@ Rules:
 - Paths must be repo-relative; never absolute.
 - `OUTPUT_PREFIX` should encode model, dataset (and split when applicable), and init scheme; `train_*.sh` appends `_${METHOD}`.
 - Override knobs via env defaults (`"${EPOCHS:-100}"`) so callers can change them without editing the file.
+- `DEVICE` is passed to training (`tools/train.py`) and may name multiple GPUs (comma-separated, e.g. `0,1`) for DDP. Artifact tools (`compute_importance.py`, `pca.py`, `generate_prototypes.py`) always run single-device on `TOOL_DEVICE`, which the adapter derives as the first entry of `DEVICE` (overridable via env).
 - Optional: `TASK_FREEZE_LAYERS`, `EXTRA_TRAIN_ARGS`, method-specific weights (`EWC_LOSS_WEIGHT`, …) if needed beyond adapter defaults.
 
 ### `train_<method>.sh`

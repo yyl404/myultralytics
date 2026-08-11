@@ -329,6 +329,11 @@ class PCAHooker:
         self.pca_operators[name][ig] = pca_operator
 
     def save_pca_cache(self, save_path):
+        """Save PCA operators in a device-agnostic (CPU-serialized) form.
+
+        Tensor attributes are moved to CPU before dumping so that the artifact
+        can be loaded on any device, regardless of the device used to compute it.
+        """
         pca_cache = {}
         for n in self.names:
             operators = self.get_pca_operators(n)
@@ -339,7 +344,7 @@ class PCAHooker:
                         f"(missing components_). Check that enough boxed samples" 
                         f"were collected."
                     )
-            pca_cache[n] = operators
+            pca_cache[n] = [operator.to("cpu") for operator in operators]
 
         LOGGER.info(f"Saving PCA cache to {save_path}")
         with open(save_path, "wb") as f:
@@ -347,7 +352,11 @@ class PCAHooker:
     
     def load_pca_cache(self, load_path):
         """Load PCA cache and use it as initial state.
-        
+
+        Operators are moved to this hooker's device after loading, so caches
+        serialized on a different device (including CPU-serialized caches)
+        can be used seamlessly.
+
         Args:
             load_path: Path to PCA cache file
         """
@@ -364,7 +373,7 @@ class PCAHooker:
                     )
                     continue
                 for ig in range(min(len(self.pca_operators[n]), len(pca_cache[n]))):
-                    self.set_pca_operator(n, ig, pca_cache[n][ig])
+                    self.set_pca_operator(n, ig, pca_cache[n][ig].to(self.device))
         
         LOGGER.info(f"Loaded PCA cache from {load_path}")
 

@@ -110,6 +110,9 @@ def main(args):
                     variances = torch.from_numpy(variances).float()
                 
                 kernel_update_ig = kernel_updates[name][ig]
+                # PCA caches are serialized on CPU; move to the kernel update's device
+                components = components.to(kernel_update_ig.device)
+                variances = variances.to(kernel_update_ig.device)
                 proj_norm = kernel_update_ig @ components.T
                 proj_magnitudes = torch.abs(proj_norm)
                 proj_mean = torch.mean(proj_magnitudes, dim=0)

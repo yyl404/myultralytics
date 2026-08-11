@@ -7,7 +7,7 @@ model_adapter_validate() {
     : "${MODEL_ID:?Set MODEL_ID for output naming and diagnostics}"
 
     case "$METHOD" in
-        naive|bpf|pseudo_label|pseudo_label+ewc|pseudo_label+l2|pseudo_label+espreg|pseudo_label+dist+espreg|pseudo_label+nsgp|pseudo_label+nsgp+repre)
+        naive|bpf|dist|espreg|dist+espreg|pseudo_label|pseudo_label+ewc|pseudo_label+l2|pseudo_label+espreg|pseudo_label+dist+espreg|pseudo_label+nsgp|pseudo_label+nsgp+repre)
             ;;
         *)
             echo "Unsupported Ultralytics incremental method: $METHOD" >&2
@@ -33,7 +33,7 @@ model_adapter_regenerate_missing_artifacts() {
             --save_path "$PREVIOUS_IMPORTANCE" \
             --batch_size "$BATCH_SIZE" \
             --workers "$WORKERS" \
-            --device "$DEVICE" \
+            --device "$TOOL_DEVICE" \
             "${importance_args[@]}"
     fi
 
@@ -49,7 +49,7 @@ model_adapter_regenerate_missing_artifacts() {
             --model "$PREVIOUS_MODEL" \
             --dataset "$previous_dataset" \
             --save_path "$PREVIOUS_PCA" \
-            --device "$DEVICE" \
+            --device "$TOOL_DEVICE" \
             --exclude_head \
             "${covariance_args[@]}"
     fi
@@ -60,7 +60,7 @@ model_adapter_regenerate_missing_artifacts() {
             --model "$PREVIOUS_MODEL" \
             --data "$previous_dataset" \
             --output "$PREVIOUS_PROTOTYPES" \
-            --device "$DEVICE" \
+            --device "$TOOL_DEVICE" \
             --imgsz "$IMGSZ" \
             --num_protos 10 \
             --selection density \
@@ -74,6 +74,9 @@ model_adapter_initialize() {
     IMGSZ="${IMGSZ:-640}"
     WORKERS="${WORKERS:-8}"
     DEVICE="${DEVICE:-0}"
+    # Artifact tools (importance / PCA / prototypes) run single-device; DEVICE may be a
+    # multi-GPU list for training (e.g. "0,1"), so tools use its first entry by default.
+    TOOL_DEVICE="${TOOL_DEVICE:-${DEVICE%%,*}}"
     CONF_THRESHOLD="${CONF_THRESHOLD:-0.25}"
     FILTER_IOU_THRESHOLD="${FILTER_IOU_THRESHOLD:-0.5}"
     EWC_LOSS_WEIGHT="${EWC_LOSS_WEIGHT:-100.0}"
@@ -384,7 +387,7 @@ model_adapter_finalize_task() {
             --save_path "${TASK_DIR}/importance.pth" \
             --batch_size "$BATCH_SIZE" \
             --workers "$WORKERS" \
-            --device "$DEVICE" \
+            --device "$TOOL_DEVICE" \
             "${importance_args[@]}" \
             "${history_args[@]}" \
             "${reference_args[@]}"
@@ -405,7 +408,7 @@ model_adapter_finalize_task() {
             --model "$PREVIOUS_MODEL" \
             --dataset "$DATASET_PATH" \
             --save_path "${TASK_DIR}/pca_cache.pkl" \
-            --device "$DEVICE" \
+            --device "$TOOL_DEVICE" \
             --exclude_head \
             "${covariance_args[@]}" \
             "${history_args[@]}"
@@ -421,7 +424,7 @@ model_adapter_finalize_task() {
             --model "$PREVIOUS_MODEL" \
             --data "$DATASET_PATH" \
             --output "${TASK_DIR}/repre_prototypes.pt" \
-            --device "$DEVICE" \
+            --device "$TOOL_DEVICE" \
             --imgsz "$IMGSZ" \
             --num_protos 10 \
             --selection density \

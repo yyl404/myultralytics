@@ -91,6 +91,7 @@ def _raw_detect_levels(output):
 
 def _get_detect_head(model):
     """Return the detection head module (Detect or OBB)."""
+    model = model.module if hasattr(model, "module") else model  # unwrap DDP before attribute access
     head = model.model[-1]
     if isinstance(head, (Detect, OBB)):
         return head
@@ -515,7 +516,9 @@ class AntiForgetTrainer(BaseTrainer):
             torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4 else torch.cuda.amp.GradScaler(enabled=self.amp)
         )
         if world_size > 1:
-            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
+            self.model = nn.parallel.DistributedDataParallel(
+                self.model, device_ids=[self.device.index], broadcast_buffers=False, find_unused_parameters=True
+            )
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
