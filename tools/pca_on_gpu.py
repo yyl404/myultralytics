@@ -85,6 +85,29 @@ class IncrementalPCAonGPU():
                 setattr(self, attr, value.to(self.device))
         return self
 
+    def state_dict(self):
+        """Return a CPU-serializable snapshot of the operator state.
+
+        Tensor attributes are detached and moved to CPU so the snapshot can be
+        loaded on any device. The device itself is not serialized: a restored
+        operator keeps the device it was constructed with.
+        """
+        state = {}
+        for key, value in self.__dict__.items():
+            if key == "device":
+                continue
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu()
+            state[key] = value
+        return state
+
+    def load_state_dict(self, state):
+        """Restore a snapshot produced by state_dict(), moving tensors to this operator's device."""
+        for key, value in state.items():
+            setattr(self, key, value)
+        self.to(self.device)
+        return self
+
     def _validate_data(self, X, dtype=torch.float32, copy=True):
         """
         Validates and converts the input data `X` to the appropriate tensor format.
@@ -313,6 +336,29 @@ class UncenteredPCAonGPU:
             value = getattr(self, attr, None)
             if isinstance(value, torch.Tensor):
                 setattr(self, attr, value.to(self.device))
+        return self
+
+    def state_dict(self):
+        """Return a CPU-serializable snapshot of the operator state.
+
+        Tensor attributes are detached and moved to CPU so the snapshot can be
+        loaded on any device. The device itself is not serialized: a restored
+        operator keeps the device it was constructed with.
+        """
+        state = {}
+        for key, value in self.__dict__.items():
+            if key == "device":
+                continue
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu()
+            state[key] = value
+        return state
+
+    def load_state_dict(self, state):
+        """Restore a snapshot produced by state_dict(), moving tensors to this operator's device."""
+        for key, value in state.items():
+            setattr(self, key, value)
+        self.to(self.device)
         return self
 
     def _validate_data(self, x):

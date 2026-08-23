@@ -20,7 +20,7 @@ TASK_DATASETS=(
     "data/OdinW-13-yolo/pothole/data.yaml"
     "data/OdinW-13-yolo/thermalDogsAndPeople/data.yaml"
 )
-OUTPUT_PREFIX="runs/yolov8l_OdinW-13-yolo_pretrained-from-yoloe-v8l-seg"
+OUTPUT_PREFIX="runs/${MODEL_ID}_OdinW-13-yolo_pretrained-from-${MODEL_WEIGHTS%.pt}"
 EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 IMGSZ="${IMGSZ:-640}"

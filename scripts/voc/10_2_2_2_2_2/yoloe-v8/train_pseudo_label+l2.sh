@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-source "scripts/voc/10_2_2_2_2_2/yoloe-v8/config.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 METHOD="pseudo_label+l2"
 L2_LOSS_WEIGHT="${L2_LOSS_WEIGHT:-100.0}"
 OUTPUT_DIR="${OUTPUT_PREFIX}_${METHOD}"

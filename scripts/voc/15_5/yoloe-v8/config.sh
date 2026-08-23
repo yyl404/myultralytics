@@ -9,7 +9,7 @@ TASK_DATASETS=(
     "data/VOC_15+5/task_1_cls_15/dataset.yaml"
     "data/VOC_15+5/task_2_cls_5/dataset.yaml"
 )
-OUTPUT_PREFIX="runs/yolov8l_VOC_15+5_pretrained-from-yoloe-v8l-seg"
+OUTPUT_PREFIX="runs/${MODEL_ID}_VOC_15+5_pretrained-from-${MODEL_WEIGHTS%.pt}"
 EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 IMGSZ="${IMGSZ:-640}"

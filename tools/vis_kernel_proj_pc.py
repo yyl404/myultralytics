@@ -101,8 +101,15 @@ def main(args):
                 if total_visualizations > 0:
                     progress = (visualization_count / total_visualizations) * 100
                     print(f"[{visualization_count}/{total_visualizations} ({progress:.1f}%)] Processing {name}, group {ig}...", end='\r')
-                components = pca_cache[name][ig].components_
-                variances = pca_cache[name][ig].explained_variance_
+                entry = pca_cache[name][ig]
+                if not isinstance(entry, dict) or "state" not in entry:
+                    raise TypeError(
+                        f"PCA cache entry for module '{name}' group {ig} has an unexpected format "
+                        f"(expected a dict with a 'state' key, got {type(entry)}). "
+                        f"Regenerate the cache with tools/pca.py."
+                    )
+                components = entry["state"]["components_"]
+                variances = entry["state"]["explained_variance_"]
                 
                 if not isinstance(components, torch.Tensor):
                     components = torch.from_numpy(components).float()

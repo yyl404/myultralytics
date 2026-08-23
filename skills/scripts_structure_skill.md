@@ -140,7 +140,7 @@ TASK_DATASETS=(
     "data/VOC_15+5/task_1_cls_15/dataset.yaml"
     "data/VOC_15+5/task_2_cls_5/dataset.yaml"
 )
-OUTPUT_PREFIX="runs/yolov8x_VOC_15+5_pretrained-from-yolov8x-cls"
+OUTPUT_PREFIX="runs/${MODEL_ID}_VOC_15+5_pretrained-from-${MODEL_WEIGHTS%.pt}"
 EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 IMGSZ="${IMGSZ:-640}"
@@ -158,13 +158,13 @@ TASK_DATASETS=(
     # ... remaining tasks in LC_ALL=C lexicographic order ...
     "data/OdinW-13-yolo/thermalDogsAndPeople/data.yaml"
 )
-OUTPUT_PREFIX="runs/yolov8x_OdinW-13-yolo_pretrained-from-yolov8x-cls"
+OUTPUT_PREFIX="runs/${MODEL_ID}_OdinW-13-yolo_pretrained-from-${MODEL_WEIGHTS%.pt}"
 ```
 
 Rules:
 - `TASK_DATASETS` order = task order (`task-1`, `task-2`, …).
 - Paths must be repo-relative; never absolute.
-- `OUTPUT_PREFIX` should encode model, dataset (and split when applicable), and init scheme; `train_*.sh` appends `_${METHOD}`.
+- `OUTPUT_PREFIX` should encode model, dataset (and split when applicable), and init scheme; `train_*.sh` appends `_${METHOD}`. Fill the model-name fields by referencing `${MODEL_ID}` and `${MODEL_WEIGHTS%.pt}` instead of repeating literals.
 - Override knobs via env defaults (`"${EPOCHS:-100}"`) so callers can change them without editing the file.
 - `DEVICE` is passed to training (`tools/train.py`) and may name multiple GPUs (comma-separated, e.g. `0,1`) for DDP. Artifact tools (`compute_importance.py`, `pca.py`, `generate_prototypes.py`) always run single-device on `TOOL_DEVICE`, which the adapter derives as the first entry of `DEVICE` (overridable via env).
 - Optional: `TASK_FREEZE_LAYERS`, `EXTRA_TRAIN_ARGS`, method-specific weights (`EWC_LOSS_WEIGHT`, …) if needed beyond adapter defaults.
@@ -178,28 +178,40 @@ Keep every method script to this shape; do not inline training logic.
 
 set -euo pipefail
 
-source "scripts/<dataset>/<split>/<baseline>/config.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 METHOD="<method>"
 OUTPUT_DIR="${OUTPUT_PREFIX}_${METHOD}"
 
 source scripts/run_incremental.sh
 ```
 
-`<method>` must match the adapter’s supported set **and** the filename after `train_`.
+`config.sh` is sourced relative to the script's own directory so a whole
+`<dataset>/<split>/<baseline>/` group can be moved or copied without editing
+paths. `scripts/run_incremental.sh` stays repo-relative: always launch from
+the repo root.
 
-Supported Ultralytics methods today:
+`<method>` is a `+`-joined list of method components and must match the
+filename after `train_`. The adapter does **not** restrict combinations:
+components are matched as whole tokens, an unimplemented component fails when
+the method is resolved, and an incompatible combination fails at the point
+where its inputs/artifacts are used.
 
-| `METHOD` / filename suffix | Notes |
-|----------------------------|--------|
-| `naive` | Fine-tune only |
-| `bpf` | BPF trainer |
+Implemented Ultralytics method components today:
+
+| Component | Effect |
+|-----------|--------|
+| `naive` | No extra flags (plain fine-tune) |
+| `bpf` | BPF trainer (exclusive trainer branch) |
 | `pseudo_label` | Pseudo-label baseline |
-| `pseudo_label+ewc` | + EWC |
-| `pseudo_label+l2` | + L2 |
-| `pseudo_label+espreg` | + EspReg |
-| `pseudo_label+dist+espreg` | + distillation + EspReg |
-| `pseudo_label+nsgp` | + NSGP |
-| `pseudo_label+nsgp+repre` | + NSGP + RePRE |
+| `ewc` | + EWC (importance artifact) |
+| `l2` | + L2 |
+| `dist` | + distillation |
+| `espreg` | + EspReg (PCA artifact) |
+| `nsgp` | + NSGP (implies EWC + PCA artifacts) |
+| `repre` | + RePRE (prototypes artifact) |
+
+Existing method scripts compose these, e.g. `train_pseudo_label+ewc.sh` →
+`METHOD="pseudo_label+ewc"`.
 
 ### `create_<dataset>_<split>.sh`
 
@@ -311,5 +323,5 @@ The same loop serves CIL and TIL: only `TASK_DATASETS` contents and eval differ.
 ## Checklist: adding a new method
 
 1. Implement training/artifact behavior in `tools/` / `ultralytics/` (not under `scripts/`).
-2. Extend the adapter’s `METHOD` case list and prepare/finalize branches.
+2. Extend the adapter’s component handling (`method_has` branches in prepare/finalize, plus `model_adapter_check_method_components` for the new token); do not add combination-level legality checks.
 3. Add `train_<method>.sh` under each split/baseline that should expose it (`METHOD` string = filename suffix).

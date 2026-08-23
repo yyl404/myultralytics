@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-source "scripts/voc/10_10/yolov8/config.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 METHOD="pseudo_label"
 OUTPUT_DIR="${OUTPUT_PREFIX}_${METHOD}"
 

@@ -1,29 +1,56 @@
 #!/bin/bash
 
 # Ultralytics model-family adapter for scripts/run_incremental.sh.
+#
+# METHOD is a '+'-joined list of method components (e.g. "pseudo_label+ewc").
+# Components are matched as whole tokens, so any combination is allowed. There
+# is no up-front legality check: an unimplemented component fails when the
+# method is resolved in model_adapter_prepare_task, and an incompatible one
+# fails at the point where its inputs/artifacts are used.
+
+method_has() {
+    # Check whether METHOD contains an exact '+'-separated component.
+    [[ "+${METHOD}+" == *"+$1+"* ]]
+}
+
+method_needs_importance() {
+    method_has ewc || method_has nsgp
+}
+
+method_needs_pca() {
+    method_has espreg || method_has nsgp
+}
+
+method_needs_prototypes() {
+    method_has repre
+}
 
 model_adapter_validate() {
     : "${MODEL_CONFIG:?Set MODEL_CONFIG for the Ultralytics adapter}"
     : "${MODEL_ID:?Set MODEL_ID for output naming and diagnostics}"
+}
 
-    case "$METHOD" in
-        naive|bpf|dist|espreg|dist+espreg|pseudo_label|pseudo_label+ewc|pseudo_label+l2|pseudo_label+espreg|pseudo_label+dist+espreg|pseudo_label+nsgp|pseudo_label+nsgp+repre)
-            ;;
-        *)
-            echo "Unsupported Ultralytics incremental method: $METHOD" >&2
-            exit 1
-            ;;
-    esac
+model_adapter_check_method_components() {
+    # Fail on components with no implementation; combinations are not restricted.
+    local component
+    for component in ${METHOD//+/ }; do
+        case "$component" in
+            naive|bpf|pseudo_label|ewc|l2|dist|espreg|nsgp|repre)
+                ;;
+            *)
+                echo "Unimplemented Ultralytics method component: '$component' (METHOD='$METHOD')" >&2
+                exit 1
+                ;;
+        esac
+    done
 }
 
 model_adapter_regenerate_missing_artifacts() {
     local previous_dataset="$1"
 
-    if [[ "$METHOD" == "pseudo_label+ewc" || "$METHOD" == "pseudo_label+nsgp" \
-        || "$METHOD" == "pseudo_label+nsgp+repre" ]] \
-        && [[ ! -f "$PREVIOUS_IMPORTANCE" ]]; then
+    if method_needs_importance && [[ ! -f "$PREVIOUS_IMPORTANCE" ]]; then
         local -a importance_args=()
-        if [[ "$METHOD" == "pseudo_label+nsgp" || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+        if method_has nsgp; then
             importance_args=(--scope normalization)
         fi
         echo "Regenerating missing importance artifact: $PREVIOUS_IMPORTANCE"
@@ -37,11 +64,9 @@ model_adapter_regenerate_missing_artifacts() {
             "${importance_args[@]}"
     fi
 
-    if [[ "$METHOD" == *"espreg"* || "$METHOD" == "pseudo_label+nsgp" \
-        || "$METHOD" == "pseudo_label+nsgp+repre" ]] \
-        && [[ ! -f "$PREVIOUS_PCA" ]]; then
+    if method_needs_pca && [[ ! -f "$PREVIOUS_PCA" ]]; then
         local -a covariance_args=()
-        if [[ "$METHOD" == "pseudo_label+nsgp" || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+        if method_has nsgp; then
             covariance_args=(--uncentered --sample_num 0 --batch_size "$BATCH_SIZE")
         fi
         echo "Regenerating missing PCA artifact: $PREVIOUS_PCA"
@@ -54,7 +79,7 @@ model_adapter_regenerate_missing_artifacts() {
             "${covariance_args[@]}"
     fi
 
-    if [[ "$METHOD" == "pseudo_label+nsgp+repre" && ! -f "$PREVIOUS_PROTOTYPES" ]]; then
+    if method_needs_prototypes && [[ ! -f "$PREVIOUS_PROTOTYPES" ]]; then
         echo "Regenerating missing RePRE prototypes: $PREVIOUS_PROTOTYPES"
         python tools/generate_prototypes.py \
             --model "$PREVIOUS_MODEL" \
@@ -120,19 +145,15 @@ model_adapter_initialize() {
             exit 1
         fi
         model_adapter_regenerate_missing_artifacts "$previous_dataset"
-        if [[ "$METHOD" == "pseudo_label+ewc" || "$METHOD" == "pseudo_label+nsgp" \
-            || "$METHOD" == "pseudo_label+nsgp+repre" ]] \
-            && [[ ! -f "$PREVIOUS_IMPORTANCE" ]]; then
+        if method_needs_importance && [[ ! -f "$PREVIOUS_IMPORTANCE" ]]; then
             echo "Previous task importance artifact not found: $PREVIOUS_IMPORTANCE" >&2
             exit 1
         fi
-        if [[ "$METHOD" == *"espreg"* || "$METHOD" == "pseudo_label+nsgp" \
-            || "$METHOD" == "pseudo_label+nsgp+repre" ]] \
-            && [[ ! -f "$PREVIOUS_PCA" ]]; then
+        if method_needs_pca && [[ ! -f "$PREVIOUS_PCA" ]]; then
             echo "Previous task PCA artifact not found: $PREVIOUS_PCA" >&2
             exit 1
         fi
-        if [[ "$METHOD" == "pseudo_label+nsgp+repre" && ! -f "$PREVIOUS_PROTOTYPES" ]]; then
+        if method_needs_prototypes && [[ ! -f "$PREVIOUS_PROTOTYPES" ]]; then
             echo "Previous task RePRE artifact not found: $PREVIOUS_PROTOTYPES" >&2
             exit 1
         fi
@@ -140,6 +161,8 @@ model_adapter_initialize() {
 }
 
 model_adapter_prepare_task() {
+    model_adapter_check_method_components
+
     TRAINER_ARGS=()
     WEIGHT_ARGS=()
     FREEZE_ARGS=()
@@ -151,7 +174,7 @@ model_adapter_prepare_task() {
         if [[ -n "${MODEL_WEIGHTS:-}" ]]; then
             WEIGHT_ARGS=(--weight "$MODEL_WEIGHTS")
         fi
-        if [[ "$METHOD" == "bpf" ]]; then
+        if method_has bpf; then
             TRAINER_ARGS=(
                 --trainer bpf
                 --bpf True
@@ -186,7 +209,7 @@ model_adapter_prepare_task() {
         TRAIN_DATA="${converted_data}/dataset.yaml"
         TRAINER_ARGS=(--trainer antiforget)
 
-        if [[ "$METHOD" == "pseudo_label+ewc" ]]; then
+        if method_has ewc && ! method_has nsgp; then
             expanded_importance="${TASK_DIR}/task-$((TASK_ID - 1))-importance-expanded.pth"
             python tools/expand_importance.py \
                 --old_importance "$PREVIOUS_IMPORTANCE" \
@@ -196,125 +219,104 @@ model_adapter_prepare_task() {
             PREVIOUS_IMPORTANCE="$expanded_importance"
         fi
 
-        case "$METHOD" in
-            naive)
-                TRAINER_ARGS=()
-                ;;
-            bpf)
-                bpf_source_model="$PREVIOUS_MODEL"
-                bpf_interim_model="${TASK_DIR}/interim.pt"
-                interim_weight_args=()
-                if [[ -n "${MODEL_WEIGHTS:-}" ]]; then
-                    interim_weight_args=(--weight "$MODEL_WEIGHTS")
-                fi
-                python tools/train.py \
-                    --model "$MODEL_CONFIG" \
-                    --data "$DATASET_PATH" \
-                    --save_path "$bpf_interim_model" \
-                    --epochs "$BPF_INTERIM_EPOCHS" \
-                    --batch_size "$BATCH_SIZE" \
-                    --imgsz "$IMGSZ" \
-                    --workers "$WORKERS" \
-                    --device "$DEVICE" \
-                    --project "${TASK_DIR}/interim" \
-                    "${interim_weight_args[@]}" \
-                    "${EXTRA_TRAIN_ARGS[@]}"
-                if [[ ! -f "$bpf_interim_model" ]]; then
-                    echo "BPF interim model not found after training: $bpf_interim_model" >&2
-                    exit 1
-                fi
-                TRAINER_ARGS=(
-                    --trainer bpf
-                    --bpf True
-                    --bpf_past True
-                    --bpf_dwf True
-                    --bpf_source_model "$bpf_source_model"
-                    --bpf_interim_model "$bpf_interim_model"
-                    --bpf_score_threshold "$BPF_SCORE_THRESHOLD"
-                    --bpf_nms_threshold "$BPF_NMS_THRESHOLD"
-                    --bpf_iou_low "$BPF_IOU_LOW"
-                    --bpf_iou_high "$BPF_IOU_HIGH"
-                    --bpf_low_weight "$BPF_LOW_WEIGHT"
-                    --bpf_high_weight "$BPF_HIGH_WEIGHT"
-                    --bpf_dwf_weight "$BPF_DWF_WEIGHT"
-                )
-                ;;
-            pseudo_label)
-                TRAINER_ARGS+=(
-                    --pseudo_label True
-                    --reference_model "$REFERENCE_MODEL"
-                    --conf_threshold "$CONF_THRESHOLD"
-                    --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
-                )
-                ;;
-            pseudo_label+ewc)
-                TRAINER_ARGS+=(
-                    --pseudo_label True
-                    --reference_model "$REFERENCE_MODEL"
-                    --conf_threshold "$CONF_THRESHOLD"
-                    --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
-                    --ewc True
-                    --importance_path "$PREVIOUS_IMPORTANCE"
-                    --ewc_loss_weight "$EWC_LOSS_WEIGHT"
-                )
-                ;;
-            pseudo_label+l2)
-                TRAINER_ARGS+=(
-                    --pseudo_label True
-                    --reference_model "$REFERENCE_MODEL"
-                    --conf_threshold "$CONF_THRESHOLD"
-                    --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
-                    --l2 True
-                    --l2_loss_weight "$L2_LOSS_WEIGHT"
-                )
-                ;;
-            pseudo_label+espreg)
-                TRAINER_ARGS+=(
-                    --pseudo_label True
-                    --reference_model "$REFERENCE_MODEL"
-                    --conf_threshold "$CONF_THRESHOLD"
-                    --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
-                    --espreg True
-                    --pca_cache_path "$PREVIOUS_PCA"
-                    --espreg_loss_weight "$ESPREG_LOSS_WEIGHT"
-                )
-                ;;
-            pseudo_label+dist+espreg)
-                TRAINER_ARGS+=(
-                    --pseudo_label True
-                    --reference_model "$REFERENCE_MODEL"
-                    --conf_threshold "$CONF_THRESHOLD"
-                    --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
-                    --distillation True
-                    --dist_loss_weight "$DIST_LOSS_WEIGHT"
-                    --dist_topk "$DIST_TOPK"
-                    --espreg True
-                    --pca_cache_path "$PREVIOUS_PCA"
-                    --espreg_loss_weight "$ESPREG_LOSS_WEIGHT"
-                )
-                ;;
-            pseudo_label+nsgp|pseudo_label+nsgp+repre)
-                TRAINER_ARGS+=(
-                    --pseudo_label True
-                    --reference_model "$REFERENCE_MODEL"
-                    --conf_threshold "$CONF_THRESHOLD"
-                    --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
-                    --nsgp True
-                    --nsgp_flexibility 1.0
-                    --pca_cache_path "$PREVIOUS_PCA"
-                    --ewc True
-                    --importance_path "$PREVIOUS_IMPORTANCE"
-                    --ewc_loss_weight 2000.0
-                )
-                if [[ "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
-                    TRAINER_ARGS+=(
-                        --repre True
-                        --repre_prototypes "$PREVIOUS_PROTOTYPES"
-                        --repre_loss_weight 1.0
-                    )
-                fi
-                ;;
-        esac
+        if method_has bpf; then
+            bpf_source_model="$PREVIOUS_MODEL"
+            bpf_interim_model="${TASK_DIR}/interim.pt"
+            interim_weight_args=()
+            if [[ -n "${MODEL_WEIGHTS:-}" ]]; then
+                interim_weight_args=(--weight "$MODEL_WEIGHTS")
+            fi
+            python tools/train.py \
+                --model "$MODEL_CONFIG" \
+                --data "$DATASET_PATH" \
+                --save_path "$bpf_interim_model" \
+                --epochs "$BPF_INTERIM_EPOCHS" \
+                --batch_size "$BATCH_SIZE" \
+                --imgsz "$IMGSZ" \
+                --workers "$WORKERS" \
+                --device "$DEVICE" \
+                --project "${TASK_DIR}/interim" \
+                "${interim_weight_args[@]}" \
+                "${EXTRA_TRAIN_ARGS[@]}"
+            if [[ ! -f "$bpf_interim_model" ]]; then
+                echo "BPF interim model not found after training: $bpf_interim_model" >&2
+                exit 1
+            fi
+            TRAINER_ARGS=(
+                --trainer bpf
+                --bpf True
+                --bpf_past True
+                --bpf_dwf True
+                --bpf_source_model "$bpf_source_model"
+                --bpf_interim_model "$bpf_interim_model"
+                --bpf_score_threshold "$BPF_SCORE_THRESHOLD"
+                --bpf_nms_threshold "$BPF_NMS_THRESHOLD"
+                --bpf_iou_low "$BPF_IOU_LOW"
+                --bpf_iou_high "$BPF_IOU_HIGH"
+                --bpf_low_weight "$BPF_LOW_WEIGHT"
+                --bpf_high_weight "$BPF_HIGH_WEIGHT"
+                --bpf_dwf_weight "$BPF_DWF_WEIGHT"
+            )
+        fi
+
+        if method_has pseudo_label; then
+            TRAINER_ARGS+=(
+                --pseudo_label True
+                --reference_model "$REFERENCE_MODEL"
+                --conf_threshold "$CONF_THRESHOLD"
+                --filter_iou_threshold "$FILTER_IOU_THRESHOLD"
+            )
+        fi
+
+        if method_has ewc && ! method_has nsgp; then
+            TRAINER_ARGS+=(
+                --ewc True
+                --importance_path "$PREVIOUS_IMPORTANCE"
+                --ewc_loss_weight "$EWC_LOSS_WEIGHT"
+            )
+        fi
+
+        if method_has l2; then
+            TRAINER_ARGS+=(
+                --l2 True
+                --l2_loss_weight "$L2_LOSS_WEIGHT"
+            )
+        fi
+
+        if method_has dist; then
+            TRAINER_ARGS+=(
+                --distillation True
+                --dist_loss_weight "$DIST_LOSS_WEIGHT"
+                --dist_topk "$DIST_TOPK"
+            )
+        fi
+
+        if method_has espreg; then
+            TRAINER_ARGS+=(
+                --espreg True
+                --pca_cache_path "$PREVIOUS_PCA"
+                --espreg_loss_weight "$ESPREG_LOSS_WEIGHT"
+            )
+        fi
+
+        if method_has nsgp; then
+            TRAINER_ARGS+=(
+                --nsgp True
+                --nsgp_flexibility 1.0
+                --pca_cache_path "$PREVIOUS_PCA"
+                --ewc True
+                --importance_path "$PREVIOUS_IMPORTANCE"
+                --ewc_loss_weight 2000.0
+            )
+        fi
+
+        if method_has repre; then
+            TRAINER_ARGS+=(
+                --repre True
+                --repre_prototypes "$PREVIOUS_PROTOTYPES"
+                --repre_loss_weight 1.0
+            )
+        fi
     fi
 
     if declare -p TASK_FREEZE_LAYERS >/dev/null 2>&1; then
@@ -327,7 +329,7 @@ model_adapter_prepare_task() {
 
 model_adapter_train_task() {
     optimizer_args=()
-    if [[ "$METHOD" == "pseudo_label+nsgp" || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+    if method_has nsgp; then
         if [[ "${DATASET_FAMILY:-}" == "coco" ]]; then
             optimizer_args=(--optimizer AdamW --lr0 0.00005 --weight_decay 0.01)
         else
@@ -363,12 +365,11 @@ model_adapter_train_task() {
 }
 
 model_adapter_finalize_task() {
-    if [[ "$METHOD" == "pseudo_label+ewc" || "$METHOD" == "pseudo_label+nsgp" \
-        || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+    if method_needs_importance; then
         importance_args=()
         history_args=()
         reference_args=()
-        if [[ "$METHOD" == "pseudo_label+nsgp" || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+        if method_has nsgp; then
             importance_args=(--scope normalization)
         fi
         if [[ -n "$PREVIOUS_IMPORTANCE" ]]; then
@@ -394,14 +395,13 @@ model_adapter_finalize_task() {
         PREVIOUS_IMPORTANCE="${TASK_DIR}/importance.pth"
     fi
 
-    if [[ "$METHOD" == *"espreg"* || "$METHOD" == "pseudo_label+nsgp" \
-        || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+    if method_needs_pca; then
         history_args=()
         covariance_args=()
         if [[ -n "$PREVIOUS_PCA" ]]; then
             history_args=(--load_hist "$PREVIOUS_PCA")
         fi
-        if [[ "$METHOD" == "pseudo_label+nsgp" || "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+        if method_has nsgp; then
             covariance_args=(--uncentered --sample_num 0 --batch_size "$BATCH_SIZE")
         fi
         python tools/pca.py \
@@ -415,7 +415,7 @@ model_adapter_finalize_task() {
         PREVIOUS_PCA="${TASK_DIR}/pca_cache.pkl"
     fi
 
-    if [[ "$METHOD" == "pseudo_label+nsgp+repre" ]]; then
+    if method_needs_prototypes; then
         history_args=()
         if [[ -n "$PREVIOUS_PROTOTYPES" ]]; then
             history_args=(--load_hist "$PREVIOUS_PROTOTYPES")

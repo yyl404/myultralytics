@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-source "scripts/voc-tiny/15_5/yolo26/config.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 METHOD="pseudo_label+dist+espreg"
 DIST_LOSS_WEIGHT="${DIST_LOSS_WEIGHT:-100.0}"
 DIST_TOPK="${DIST_TOPK:-1}"

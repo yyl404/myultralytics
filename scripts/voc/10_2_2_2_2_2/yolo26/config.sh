@@ -13,7 +13,7 @@ TASK_DATASETS=(
     "data/VOC_10+2+2+2+2+2/task_5_cls_2/dataset.yaml"
     "data/VOC_10+2+2+2+2+2/task_6_cls_2/dataset.yaml"
 )
-OUTPUT_PREFIX="runs/yolo26x_VOC_10+2+2+2+2+2_pretrained-from-yolo26x"
+OUTPUT_PREFIX="runs/${MODEL_ID}_VOC_10+2+2+2+2+2_pretrained-from-${MODEL_WEIGHTS%.pt}"
 EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 IMGSZ="${IMGSZ:-640}"

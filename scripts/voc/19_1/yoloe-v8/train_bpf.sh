@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-source "scripts/voc/19_1/yoloe-v8/config.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 METHOD="bpf"
 OUTPUT_DIR="${OUTPUT_PREFIX}_${METHOD}"
 

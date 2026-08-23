@@ -113,6 +113,37 @@ def _get_nsgp_backbone_names(model, module_names):
     return backbone_names
 
 
+def _extract_pca_spectra(pca_cache):
+    """Collect per-group PCA components and explained variances from a loaded PCA cache.
+
+    Cache entries are plain dicts serialized by tools/pca.py
+    ({"class": ..., "state": ...}), so loading never requires the PCA operator
+    classes to be importable in this process (DDP workers run outside tools/).
+
+    Args:
+        pca_cache (dict): module name -> list of serialized per-group operator entries.
+
+    Returns:
+        tuple[dict, dict]: module name -> (groups, n_components) components tensor,
+            and module name -> (groups, n_components) explained-variance tensor.
+    """
+    components, eigen_values = {}, {}
+    for name, entries in pca_cache.items():
+        group_components, group_eigen_values = [], []
+        for ig, entry in enumerate(entries):
+            if not isinstance(entry, dict) or "state" not in entry:
+                raise TypeError(
+                    f"PCA cache entry for module '{name}' group {ig} has an unexpected format "
+                    f"(expected a dict with a 'state' key, got {type(entry)}). "
+                    f"Regenerate the cache with tools/pca.py."
+                )
+            group_components.append(entry["state"]["components_"])
+            group_eigen_values.append(entry["state"]["explained_variance_"])
+        components[name] = torch.stack(group_components)
+        eigen_values[name] = torch.stack(group_eigen_values)
+    return components, eigen_values
+
+
 def _head_raw_output_to_list(head, raw_output, img_h, img_w, conf_threshold):
     """Convert head raw output to list of detections per image for merging.
     Detect: list of (num_boxes, 6) [xywhn, conf, cls].
@@ -430,34 +461,20 @@ class AntiForgetTrainer(BaseTrainer):
         # ============================== MODIFIED: set up ESPReg loss ============================================
         if self.args.espreg:
             self.espreg_loss_weight = self.args.espreg_loss_weight
-            components, eigen_values = {}, {}
             self.pca_cache = joblib.load(self.args.pca_cache_path)
-            for name in self.pca_cache.keys():
-                _components = []
-                _eigen_values = []
-                for ig in range(len(self.pca_cache[name])):
-                    _components.append(self.pca_cache[name][ig].components_)
-                    _eigen_values.append(self.pca_cache[name][ig].explained_variance_)
-                components[name], eigen_values[name] = torch.stack(_components), torch.stack(_eigen_values)
+            components, eigen_values = _extract_pca_spectra(self.pca_cache)
             self.espreg_loss = EWPRegLoss(self.model, self.base_model, module_names=self.pca_cache.keys(),
                                          components=components, eigen_values=eigen_values)
         # ============================== END: set up ESPReg loss =================================================
 
         # ============================== MODIFIED: set up NSGP ============================================
         if self.args.nsgp:
-            components, eigen_values = {}, {}
             # Reuse pca_cache if already loaded for ESPReg, otherwise load it
             if hasattr(self, 'pca_cache'):
                 pca_cache_nsgp = self.pca_cache
             else:
                 pca_cache_nsgp = joblib.load(self.args.pca_cache_path)
-            for name in pca_cache_nsgp.keys():
-                _components = []
-                _eigen_values = []
-                for ig in range(len(pca_cache_nsgp[name])):
-                    _components.append(pca_cache_nsgp[name][ig].components_)
-                    _eigen_values.append(pca_cache_nsgp[name][ig].explained_variance_)
-                components[name], eigen_values[name] = torch.stack(_components), torch.stack(_eigen_values)
+            components, eigen_values = _extract_pca_spectra(pca_cache_nsgp)
             self.nsgp_flexibility = getattr(self.args, 'nsgp_flexibility', 1.0)
             module_names = tuple(pca_cache_nsgp)
             self.nsgp_operator = NSGP(
@@ -534,20 +551,24 @@ class AntiForgetTrainer(BaseTrainer):
         self.train_loader = self.get_dataloader(
             self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
         )
+        # ============================== MODIFIED: DDP-safe validation setup (all ranks) ==================
+        # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
+        self.test_loader = self.get_dataloader(
+            self.data.get("val") or self.data.get("test"),
+            batch_size=batch_size if self.args.task == "obb" else batch_size * 2,
+            rank=LOCAL_RANK,
+            mode="val",
+        )
+        # validate() broadcasts EMA buffers and the validator gathers stats across ranks,
+        # so every rank needs its own validator, val shard, and EMA copy (mirrors BaseTrainer).
+        self.validator = self.get_validator()
+        self.ema = ModelEMA(self.model)
         if RANK in {-1, 0}:
-            # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
-            self.test_loader = self.get_dataloader(
-                self.data.get("val") or self.data.get("test"),
-                batch_size=batch_size if self.args.task == "obb" else batch_size * 2,
-                rank=-1,
-                mode="val",
-            )
-            self.validator = self.get_validator()
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
-            self.ema = ModelEMA(self.model)
             if self.args.plots:
                 self.plot_training_labels()
+        # ============================== END: DDP-safe validation setup ===================================
 
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
@@ -829,13 +850,18 @@ class AntiForgetTrainer(BaseTrainer):
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
-                final_epoch = epoch + 1 >= self.epochs
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
-                # Validation
-                if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
-                    self._clear_memory(threshold=0.5)  # prevent VRAM spike
-                    self.metrics, self.fitness = self.validate()
+            # ============================== MODIFIED: validate on all ranks ==============================
+            # validate() and the validator run cross-rank collectives (EMA buffer broadcast,
+            # stats gather, loss reduce), so every DDP rank must enter (mirrors BaseTrainer).
+            final_epoch = epoch + 1 >= self.epochs
+            if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
+                self._clear_memory(threshold=0.5)  # prevent VRAM spike
+                self.metrics, self.fitness = self.validate()
+            # ============================== END: validate on all ranks ==================================
+
+            if RANK in {-1, 0}:
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
@@ -868,11 +894,15 @@ class AntiForgetTrainer(BaseTrainer):
                 break  # must break all DDP ranks
             epoch += 1
 
+        # ============================== MODIFIED: final eval on all ranks ================================
+        # final_eval() runs the validator, which uses cross-rank collectives under DDP
+        # (mirrors BaseTrainer: all ranks enter, only rank 0 logs/plots).
+        seconds = time.time() - self.train_time_start
+        LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
+        # Do final val with best.pt
+        self.final_eval()
+        # ============================== END: final eval on all ranks =====================================
         if RANK in {-1, 0}:
-            # Do final val with best.pt
-            seconds = time.time() - self.train_time_start
-            LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
-            self.final_eval()
             if self.args.plots:
                 self.plot_metrics()
             self.run_callbacks("on_train_end")

@@ -324,15 +324,15 @@ class PCAHooker:
 
     def get_pca_operators(self, name):
         return self.pca_operators[name]
-    
-    def set_pca_operator(self, name, ig, pca_operator):
-        self.pca_operators[name][ig] = pca_operator
 
     def save_pca_cache(self, save_path):
-        """Save PCA operators in a device-agnostic (CPU-serialized) form.
+        """Save PCA operators as plain attribute dicts (CPU-serialized).
 
-        Tensor attributes are moved to CPU before dumping so that the artifact
-        can be loaded on any device, regardless of the device used to compute it.
+        Each entry is {"class": <operator class name>, "state": <state_dict()>}
+        instead of the operator object itself, so loading the artifact never
+        requires the operator's defining module to be importable (e.g. in DDP
+        worker processes launched outside this directory). Tensors are stored
+        on CPU, so the artifact loads on any device.
         """
         pca_cache = {}
         for n in self.names:
@@ -344,7 +344,10 @@ class PCAHooker:
                         f"(missing components_). Check that enough boxed samples" 
                         f"were collected."
                     )
-            pca_cache[n] = [operator.to("cpu") for operator in operators]
+            pca_cache[n] = [
+                {"class": type(operator).__name__, "state": operator.state_dict()}
+                for operator in operators
+            ]
 
         LOGGER.info(f"Saving PCA cache to {save_path}")
         with open(save_path, "wb") as f:
@@ -353,9 +356,10 @@ class PCAHooker:
     def load_pca_cache(self, load_path):
         """Load PCA cache and use it as initial state.
 
-        Operators are moved to this hooker's device after loading, so caches
-        serialized on a different device (including CPU-serialized caches)
-        can be used seamlessly.
+        Cache entries are restored into the operators already built by this
+        hooker (matched by class name), and tensors are moved to this hooker's
+        device, so caches serialized on a different device (including
+        CPU-serialized caches) can be used seamlessly.
 
         Args:
             load_path: Path to PCA cache file
@@ -373,7 +377,21 @@ class PCAHooker:
                     )
                     continue
                 for ig in range(min(len(self.pca_operators[n]), len(pca_cache[n]))):
-                    self.set_pca_operator(n, ig, pca_cache[n][ig].to(self.device))
+                    entry = pca_cache[n][ig]
+                    operator = self.pca_operators[n][ig]
+                    if not isinstance(entry, dict) or "class" not in entry or "state" not in entry:
+                        raise TypeError(
+                            f"PCA cache entry for module '{n}' group {ig} has an unexpected format "
+                            f"(expected a dict with 'class' and 'state' keys, got {type(entry)}). "
+                            f"Regenerate the cache with tools/pca.py."
+                        )
+                    if entry["class"] != type(operator).__name__:
+                        raise TypeError(
+                            f"PCA cache entry for module '{n}' group {ig} holds a "
+                            f"{entry['class']} state, but this run built a "
+                            f"{type(operator).__name__} operator."
+                        )
+                    operator.load_state_dict(entry["state"])
         
         LOGGER.info(f"Loaded PCA cache from {load_path}")
 
@@ -523,10 +541,18 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
                 bboxes = []
                 if label_files[sample_start] is not None:
                     with open(label_files[sample_start], "r") as f:
-                        labels = f.readlines()
-                        for _label in labels:
-                            _label = _label.strip().split()
-                            x, y, w, h = float(_label[1]), float(_label[2]), float(_label[3]), float(_label[4])
+                        for line_number, raw_line in enumerate(f, start=1):
+                            fields = raw_line.split()
+                            if not fields:
+                                continue
+                            try:
+                                x, y, w, h = (float(fields[i]) for i in range(1, 5))
+                            except (IndexError, ValueError):
+                                LOGGER.warning(
+                                    f"Skipping malformed label line {line_number} "
+                                    f"in {label_files[sample_start]}: {raw_line.strip()!r}"
+                                )
+                                continue
                             x_min, y_min, x_max, y_max = x - w/2, y - h/2, x + w/2, y + h/2
                             bboxes.append([x_min, y_min, x_max, y_max])
                 pca_hooker.set_bboxes([bboxes])

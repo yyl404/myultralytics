@@ -34,7 +34,14 @@ def main(args):
     for name in pca_cache.keys():
         _eigen_values = []
         for ig in range(len(pca_cache[name])):
-            eigen_val = pca_cache[name][ig].explained_variance_
+            entry = pca_cache[name][ig]
+            if not isinstance(entry, dict) or "state" not in entry:
+                raise TypeError(
+                    f"PCA cache entry for module '{name}' group {ig} has an unexpected format "
+                    f"(expected a dict with a 'state' key, got {type(entry)}). "
+                    f"Regenerate the cache with tools/pca.py."
+                )
+            eigen_val = entry["state"]["explained_variance_"]
             if not isinstance(eigen_val, torch.Tensor):
                 eigen_val = torch.from_numpy(eigen_val).float()
             _eigen_values.append(eigen_val)

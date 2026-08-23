@@ -107,6 +107,7 @@ import os
 import random
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from tqdm import tqdm
 import cv2
 import joblib
@@ -1950,6 +1951,27 @@ def _parse_module_filter(module_filter_str):
     return module_filter_str
 
 
+def _load_pca_cache(load_path):
+    """Load a PCA cache, exposing each serialized operator state as an attribute namespace.
+
+    Cache entries are plain dicts serialized by tools/pca.py
+    ({"class": ..., "state": ...}); wrapping each state dict in a namespace keeps
+    the analysis code's attribute access unchanged without requiring the PCA
+    operator classes to be importable in this process.
+    """
+    pca_cache = joblib.load(load_path)
+    for name, entries in pca_cache.items():
+        for ig, entry in enumerate(entries):
+            if not isinstance(entry, dict) or "state" not in entry:
+                raise TypeError(
+                    f"PCA cache entry for module '{name}' group {ig} has an unexpected format "
+                    f"(expected a dict with a 'state' key, got {type(entry)}). "
+                    f"Regenerate the cache with tools/pca.py."
+                )
+            entries[ig] = SimpleNamespace(**entry["state"])
+    return pca_cache
+
+
 def main(args):
     """Main function.
     
@@ -1969,7 +1991,7 @@ def main(args):
     
     # Load PCA cache
     print(f"Loading PCA cache from: {args.pca_cache_path}")
-    pca_cache = joblib.load(args.pca_cache_path)
+    pca_cache = _load_pca_cache(args.pca_cache_path)
     print(f"Successfully loaded PCA cache with {len(pca_cache)} modules")
     
     if len(pca_cache) == 0:

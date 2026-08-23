@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-source "scripts/odinw-13/13/yolov8/config.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 METHOD="bpf"
 OUTPUT_DIR="${OUTPUT_PREFIX}_${METHOD}"
 
