@@ -194,3 +194,8 @@ nsgp_flexibility: 1.0 # (float) interpolation from raw gradient to exact null-sp
 repre: False # (bool) replay old-class regional prototypes through the classification branch
 repre_prototypes: None # (str) density-aware prototype artifact generated after the previous task
 repre_loss_weight: 1.0 # (float) contribution of classification-only regional replay
+
+# Replay (experience replay) settings ------------------------------------------------------------------------------
+replay: False # (bool) replay old-task samples with their ground truth alongside current-task training
+replay_data: None # (str, optional) replay dataset YAML accumulated from the previous tasks
+replay_loss_weight: 1.0 # (float) contribution weight of the replay detection loss

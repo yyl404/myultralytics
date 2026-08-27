@@ -209,6 +209,7 @@ Implemented Ultralytics method components today:
 | `espreg` | + EspReg (PCA artifact) |
 | `nsgp` | + NSGP (implies EWC + PCA artifacts) |
 | `repre` | + RePRE (prototypes artifact) |
+| `replay` | + experience replay (cumulative replay dataset artifact, `REPLAY_SAMPLE_NUM`/`REPLAY_STRATEGY`/`REPLAY_LOSS_WEIGHT`) |
 
 Existing method scripts compose these, e.g. `train_pseudo_label+ewc.sh` →
 `METHOD="pseudo_label+ewc"`.

@@ -25,6 +25,10 @@ method_needs_prototypes() {
     method_has repre
 }
 
+method_needs_replay() {
+    method_has replay
+}
+
 model_adapter_validate() {
     : "${MODEL_CONFIG:?Set MODEL_CONFIG for the Ultralytics adapter}"
     : "${MODEL_ID:?Set MODEL_ID for output naming and diagnostics}"
@@ -35,7 +39,7 @@ model_adapter_check_method_components() {
     local component
     for component in ${METHOD//+/ }; do
         case "$component" in
-            naive|bpf|pseudo_label|ewc|l2|dist|espreg|nsgp|repre)
+            naive|bpf|pseudo_label|ewc|l2|dist|espreg|nsgp|repre|replay)
                 ;;
             *)
                 echo "Unimplemented Ultralytics method component: '$component' (METHOD='$METHOD')" >&2
@@ -121,6 +125,10 @@ model_adapter_initialize() {
     BPF_ATTENTION_TOPK="${BPF_ATTENTION_TOPK:-0.1}"
     BPF_FUTURE_IOU="${BPF_FUTURE_IOU:-0.1}"
     BPF_DWF_WEIGHT="${BPF_DWF_WEIGHT:-0.15}"
+    REPLAY_SAMPLE_NUM="${REPLAY_SAMPLE_NUM:-100}"
+    REPLAY_STRATEGY="${REPLAY_STRATEGY:-random}"
+    REPLAY_LOSS_WEIGHT="${REPLAY_LOSS_WEIGHT:-1.0}"
+    REPLAY_SEED="${REPLAY_SEED:-0}"
     if ! declare -p EXTRA_TRAIN_ARGS >/dev/null 2>&1; then
         EXTRA_TRAIN_ARGS=()
     fi
@@ -129,12 +137,14 @@ model_adapter_initialize() {
     PREVIOUS_PCA=""
     PREVIOUS_PROTOTYPES=""
     PREVIOUS_IMPORTANCE=""
+    PREVIOUS_REPLAY=""
     if (( START_TASK > 1 )); then
         previous_task_dir="${OUTPUT_DIR}/task-$((START_TASK - 1))"
         PREVIOUS_MODEL="${previous_task_dir}/best.pt"
         PREVIOUS_PCA="${previous_task_dir}/pca_cache.pkl"
         PREVIOUS_PROTOTYPES="${previous_task_dir}/repre_prototypes.pt"
         PREVIOUS_IMPORTANCE="${previous_task_dir}/importance.pth"
+        PREVIOUS_REPLAY="${previous_task_dir}/replay_dataset"
         if [[ ! -f "$PREVIOUS_MODEL" ]]; then
             echo "Previous task model not found: $PREVIOUS_MODEL" >&2
             exit 1
@@ -155,6 +165,12 @@ model_adapter_initialize() {
         fi
         if method_needs_prototypes && [[ ! -f "$PREVIOUS_PROTOTYPES" ]]; then
             echo "Previous task RePRE artifact not found: $PREVIOUS_PROTOTYPES" >&2
+            exit 1
+        fi
+        # Replay data is cumulative, so it cannot be regenerated for a single task; require the
+        # previous task's replay dataset (which embeds its own history) to exist.
+        if method_needs_replay && [[ ! -f "$PREVIOUS_REPLAY/dataset.yaml" ]]; then
+            echo "Previous task replay dataset not found: $PREVIOUS_REPLAY" >&2
             exit 1
         fi
     fi
@@ -317,6 +333,18 @@ model_adapter_prepare_task() {
                 --repre_loss_weight 1.0
             )
         fi
+
+        if method_has replay; then
+            if [[ ! -f "$PREVIOUS_REPLAY/dataset.yaml" ]]; then
+                echo "Previous task replay dataset not found: $PREVIOUS_REPLAY" >&2
+                exit 1
+            fi
+            TRAINER_ARGS+=(
+                --replay True
+                --replay_data "$PREVIOUS_REPLAY/dataset.yaml"
+                --replay_loss_weight "$REPLAY_LOSS_WEIGHT"
+            )
+        fi
     fi
 
     if declare -p TASK_FREEZE_LAYERS >/dev/null 2>&1; then
@@ -431,5 +459,22 @@ model_adapter_finalize_task() {
             --radius 0.6 \
             "${history_args[@]}"
         PREVIOUS_PROTOTYPES="${TASK_DIR}/repre_prototypes.pt"
+    fi
+
+    if method_needs_replay; then
+        history_args=()
+        if [[ -n "$PREVIOUS_REPLAY" ]]; then
+            history_args=(--load_hist "$PREVIOUS_REPLAY")
+        fi
+        # TRAIN_DATA labels are already in the model's global class-id space (task-1 local IDs are
+        # the global IDs; later tasks use the id-converted dataset), so replay labels stay valid.
+        python tools/select_replay_samples.py \
+            --dataset "$TRAIN_DATA" \
+            --output_dir "${TASK_DIR}/replay_dataset" \
+            --num "$REPLAY_SAMPLE_NUM" \
+            --strategy "$REPLAY_STRATEGY" \
+            --seed "$REPLAY_SEED" \
+            "${history_args[@]}"
+        PREVIOUS_REPLAY="${TASK_DIR}/replay_dataset"
     fi
 }

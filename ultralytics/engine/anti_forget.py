@@ -1,6 +1,7 @@
 import numpy as np
 import warnings
 from copy import deepcopy
+from pathlib import Path
 import math
 import time
 import joblib
@@ -17,6 +18,7 @@ from ultralytics.utils import (
     LOGGER,
     RANK,
     TQDM,
+    YAML,
     callbacks,
     colorstr,
 )
@@ -368,6 +370,16 @@ def get_dist_loss(model_pred, base_model_pred, model, base_model, dist_topk=1):
     return (kl_per_channel * teacher_topk).sum() / teacher_topk.sum().clamp_min(eps)
 
 
+def _cycle_batches(loader):
+    """Yield batches from a dataloader indefinitely, re-entering it after each full pass.
+
+    YOLO loaders are InfiniteDataLoader whose ``__iter__`` yields exactly ``len(loader)``
+    batches per pass over a persistent worker pool, so re-entering is cheap.
+    """
+    while True:
+        yield from loader
+
+
 class AntiForgetTrainer(BaseTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         """
@@ -399,6 +411,8 @@ class AntiForgetTrainer(BaseTrainer):
             loss_names.append("l2_loss")
         if self.args.repre:
             loss_names.append("repre_loss")
+        if self.args.replay:
+            loss_names.append("replay_loss")
         return tuple(loss_names)
 
     def _setup_train(self, world_size):
@@ -551,6 +565,27 @@ class AntiForgetTrainer(BaseTrainer):
         self.train_loader = self.get_dataloader(
             self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
         )
+        # ============================== MODIFIED: set up replay dataloader =====================================
+        if self.args.replay:
+            if not isinstance(_get_detect_head(self.model), Detect):
+                # OBB loss skips the box head on zero-FG batches, which breaks the multi-forward
+                # DDP path (see v8DetectionLoss); only the Detect criterion keeps the graph intact.
+                raise TypeError("Replay currently supports axis-aligned Detect models only")
+            if not self.args.replay_data:
+                raise ValueError("replay_data is required when replay is enabled")
+            replay_config = YAML.load(self.args.replay_data)
+            replay_train = replay_config.get("train")
+            if not isinstance(replay_train, str):
+                raise KeyError(f"Replay dataset config has no 'train' split: {self.args.replay_data}")
+            replay_train_path = Path(replay_train)
+            if not replay_train_path.is_absolute():
+                replay_train_path = Path(self.args.replay_data).parent / replay_train_path
+            if not replay_train_path.is_dir():
+                raise FileNotFoundError(f"Replay image directory does not exist: {replay_train_path}")
+            self.replay_loader = self.get_dataloader(
+                str(replay_train_path), batch_size=batch_size, rank=LOCAL_RANK, mode="train"
+            )
+        # ============================== END: set up replay dataloader ==========================================
         # ============================== MODIFIED: DDP-safe validation setup (all ranks) ==================
         # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
         self.test_loader = self.get_dataloader(
@@ -624,6 +659,10 @@ class AntiForgetTrainer(BaseTrainer):
             self._model_train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
+                # ============================== MODIFIED: shuffle replay sampler per epoch ====================
+                if self.args.replay:
+                    self.replay_loader.sampler.set_epoch(epoch)
+                # ============================== END: shuffle replay sampler per epoch =========================
             pbar = enumerate(self.train_loader)
             # Update dataloader attributes (optional)
             if epoch == (self.epochs - self.args.close_mosaic):
@@ -634,6 +673,11 @@ class AntiForgetTrainer(BaseTrainer):
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+
+            # ============================== MODIFIED: replay iterator ==========================================
+            # Replay set is usually smaller than the train set, so it is cycled indefinitely.
+            replay_iter = _cycle_batches(self.replay_loader) if self.args.replay else None
+            # ============================== END: replay iterator ===============================================
 
             # ============================== MODIFIED: register hook ===========================================
             if self.args.espreg:
@@ -790,6 +834,17 @@ class AntiForgetTrainer(BaseTrainer):
                         self.loss += repre_loss * self.repre_loss_weight
                         loss_items["repre_loss"] = repre_loss.detach()
                     # ============================== END: replay regional prototypes ====================================
+
+                    # ============================== MODIFIED: calculate replay loss ====================================
+                    if self.args.replay:
+                        # Replay samples carry old-class GT only, so the plain detection loss on a
+                        # replay batch supervises exactly the historical classes.
+                        replay_batch = self.preprocess_batch(next(replay_iter))
+                        replay_loss_vec, _ = self.model(replay_batch)  # (box, cls, dfl|l1) * batch size
+                        _replay_loss = replay_loss_vec.sum()
+                        self.loss += _replay_loss * self.args.replay_loss_weight
+                        loss_items["replay_loss"] = _replay_loss.detach()
+                    # ============================== END: calculate replay loss =========================================
 
                     if RANK != -1:
                         self.loss *= world_size                   

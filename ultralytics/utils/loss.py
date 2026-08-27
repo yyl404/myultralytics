@@ -484,6 +484,13 @@ class v8DetectionLoss:
                 imgsz,
                 stride_tensor,
             )
+        else:
+            # Zero-FG batches (e.g. replay batches that lost all boxes to augmentation) must keep the
+            # box head in the autograd graph: DDP marks parameters absent from one forward's loss graph
+            # as ready, and a sibling forward in the same iteration that does use them then fails with
+            # "Expected to mark a variable ready only once".
+            zero = pred_bboxes.sum() * 0.0  # graph-preserving zero (pred_bboxes decodes pred_distri)
+            loss[0], loss[2] = zero, zero
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
