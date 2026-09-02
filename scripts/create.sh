@@ -12,8 +12,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-# shellcheck source=lib/experiment.sh
-source scripts/lib/experiment.sh
+# shellcheck source=libexec/experiment.sh
+source scripts/libexec/experiment.sh
 
 usage() {
     cat <<'EOF'

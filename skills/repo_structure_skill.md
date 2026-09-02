@@ -27,13 +27,14 @@ One entry point per action. Do **not** add per-dataset / per-model / per-method 
 
 ```text
 scripts/
-├── train.sh                       # dataset × model × method
+├── train.sh                       # dataset × model × method, or --tasks yaml sequence
 ├── eval.sh
 ├── create.sh                      # CIL splits only
 ├── feature_drift.sh
+├── detect.sh                      # per-task inference dumps
 ├── analyze.sh
 ├── run_incremental.sh
-├── lib/experiment.sh              # dataset / model resolution
+├── libexec/experiment.sh          # dataset / model resolution
 └── model_adapters/ultralytics.sh
 ```
 
@@ -48,7 +49,7 @@ bash scripts/create.sh voc 15_5
 Rules:
 - Put **all** launch / scheduling scripts under `scripts/`.
 - Do **not** put implementation code under `scripts/`.
-- Register a new dataset or model family in `scripts/lib/experiment.sh`, not as a new directory tree.
+- Register a new dataset or model family in `scripts/libexec/experiment.sh`, not as a new directory tree.
 - Keep eval model-agnostic: `scripts/eval.sh` takes a run directory.
 
 ## Code placement

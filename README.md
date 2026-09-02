@@ -69,7 +69,17 @@ bash scripts/create.sh coco 70_10
 
 OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`（13 个子域目录，各含 `data.yaml`）放入 `data/` 即可。任务顺序为子域名的词典序。
 
-### 2.3 预训练权重
+### 2.3 任意增量 yaml 序列
+
+不注册数据集家族，也可以直接用三串 yaml 序列驱动实验（`data-split` 两级划分只是生成这些序列的一种方式）：
+
+- `--tasks`：增量训练数据集序列（每任务一个 yaml，必需）；
+- `--eval-tasks`：单任务评估数据集序列（可选，默认与训练序列相同）；
+- `--cumulative`：累积任务评估数据集序列（可选，每任务一个；不提供则不做累积评估）。
+
+三串序列长度都必须等于任务数。`train.sh` / `eval.sh` / `detect.sh` / `feature_drift.sh` 均接受 `--tasks`。训练时会把解析后的序列写入 `<output>/task_yamls.txt`、`eval_yamls.txt`、`cumulative_yamls.txt` 与 `experiment.meta`，之后 `eval.sh runs/<run>` 无需任何参数即可恢复。
+
+### 2.4 预训练权重
 
 将以下权重文件放在**仓库根目录**（训练脚本按相对路径引用）：
 
@@ -89,7 +99,15 @@ OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`
 ```bash
 bash scripts/train.sh --dataset <ds> --split <split> --model <model> --method <method>
 bash scripts/train.sh <ds> <split> <model> <method>
+
+# 或者直接给任意 yaml 序列（--tasks 与 --dataset/--split 互斥，位置参数只剩 model、method）
+bash scripts/train.sh --tasks t1.yaml t2.yaml t3.yaml \
+    --eval-tasks e1.yaml e2.yaml e3.yaml \
+    --cumulative c1.yaml c2.yaml c3.yaml \
+    --tag my-exp --model yolo26 --method pseudo_label+dist
 ```
+
+`--eval-tasks` 省略时逐任务评估复用训练序列；`--cumulative` 省略则不做累积评估。`--tag` 覆盖自动生成的 `DATA_TAG`（影响输出目录名）。
 
 `--method` 为 `+` 连接的组件，可任意组合：`naive`、`bpf`、`pseudo_label`、`ewc`、`l2`、`dist`、`espreg`、`nsgp`、`repre`、`replay`。
 
@@ -117,6 +135,8 @@ bash scripts/train.sh odinw-13 13 yolov8 pseudo_label+nsgp+repre
 | `START_TASK` | 从第几个任务开始（断点续跑） | 1 |
 | `END_TASK` | 到第几个任务结束（部分运行/调试） | 任务总数 |
 
+`DEVICE` 可以是多卡列表（如 `0,1`），训练走 DDP；统计类工具（importance / PCA / 原型）自动只用首卡（可用 `TOOL_DEVICE` 覆盖）。
+
 ```bash
 # 示例：只跑前 2 个任务、每任务 1 个 epoch（冒烟调试）
 EPOCHS=1 END_TASK=2 bash scripts/train.sh odinw-13 13 yolov8 naive
@@ -126,14 +146,16 @@ EPOCHS=1 END_TASK=2 bash scripts/train.sh odinw-13 13 yolov8 naive
 
 ### 3.2 评估
 
-传入任意训练 run 目录即可（可从目录名推断数据集/split）：
+传入任意训练 run 目录即可（优先读训练时写入的 manifest，其次从目录名推断注册数据集/split）：
 
 ```bash
 bash scripts/eval.sh runs/<run>
 bash scripts/eval.sh --dataset voc-tiny --split 15_5 --run runs/<run>
+# 自定义序列也可以显式覆盖（三个 flag 可独立使用）
+bash scripts/eval.sh --tasks t1.yaml t2.yaml --cumulative c1.yaml c2.yaml --run runs/<run>
 ```
 
-对每个任务的 `best.pt` 评估其已见各任务（CIL 另含累积数据集），结果写入 `<run>/evaluation_results/`：逐类指标 CSV、混淆矩阵 CSV、`individual_datasets_eval.csv`、`cumulative_datasets_eval.csv` 与按任务汇总的 mAP 表。
+对每个任务的 `best.pt` 评估其已见各任务（有序列时另含累积数据集），结果写入 `<run>/evaluation_results/`：逐类指标 CSV、混淆矩阵 CSV、`individual_datasets_eval.csv`、`cumulative_datasets_eval.csv` 与按任务汇总的 mAP 表。
 
 ---
 
@@ -141,11 +163,15 @@ bash scripts/eval.sh --dataset voc-tiny --split 15_5 --run runs/<run>
 
 ### 4.1 特征漂移（feature drift）
 
-量化相邻任务 checkpoint 间 backbone 特征的漂移（方向/幅度分解），在该 split 的 task-1 图像上计算：
+量化相邻任务 checkpoint 间 backbone 特征的漂移（方向/幅度分解），在 task-1 图像上计算：
 
 ```bash
 bash scripts/feature_drift.sh voc-tiny 15_5 \
     runs/<run>/task-1/best.pt runs/<run>/task-2/best.pt [save_path]
+
+# 自定义序列：用 --tasks 提供 yaml（其余参数走 flag）
+bash scripts/feature_drift.sh --tasks t1.yaml t2.yaml \
+    --model1 runs/<run>/task-1/best.pt --model2 runs/<run>/task-2/best.pt
 ```
 
 ### 4.2 其余分析工具（统一入口 `scripts/analyze.sh`）

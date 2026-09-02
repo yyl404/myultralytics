@@ -71,8 +71,8 @@ import cv2
 import numpy as np
 
 from ultralytics import YOLO
-from ultralytics.data.utils import IMG_FORMATS, check_det_dataset, img2label_paths
-from ultralytics.utils import LOGGER, TQDM
+from ultralytics.data.utils import IMG_FORMATS, img2label_paths
+from ultralytics.utils import LOGGER, TQDM, YAML
 from ultralytics.utils.ops import xywhn2xyxy
 from ultralytics.utils.plotting import Annotator
 
@@ -186,6 +186,26 @@ def _tokenize_categories(raw: Optional[list]) -> list[str]:
             if token:
                 tokens.append(token)
     return tokens
+
+
+def load_inference_data(yaml_file: str, split: str) -> dict:
+    """Load class names and image paths for one split from a dataset yaml.
+
+    Unlike check_det_dataset, no 'train' key is required: inference only needs the
+    requested split. Relative split paths resolve against the yaml's 'path' key,
+    or the yaml's own directory when 'path' is absent.
+    """
+    data = YAML().load(yaml_file)
+    if "names" not in data:
+        raise SyntaxError(f"{yaml_file} 'names:' key missing ❌.")
+    if split not in data or not data[split]:
+        available = [key for key in ("train", "val", "test") if data.get(key)]
+        raise FileNotFoundError(f"Split '{split}' not found in {yaml_file}. Available: {available}")
+    root = Path(data.get("path") or Path(yaml_file).resolve().parent)
+    entries = data[split] if isinstance(data[split], list) else [data[split]]
+    resolved = [entry if Path(entry).is_absolute() else str(root / entry) for entry in entries]
+    data[split] = resolved if isinstance(data[split], list) else resolved[0]
+    return data
 
 
 def resolve_categories(raw: Optional[list], names: dict[int, str]) -> Optional[list[int]]:
@@ -458,13 +478,10 @@ def main():
     if not 0.0 < args.iou_threshold <= 1.0:
         parser.error("--iou_threshold must be in (0, 1]")
 
-    data = check_det_dataset(args.data)
+    split = dynamic_kwargs.pop("split", args.split)
+    data = load_inference_data(args.data, split)
     names = data["names"]
     class_ids = resolve_categories(args.categories, names)
-    split = dynamic_kwargs.pop("split", args.split)
-    if split not in data or not data[split]:
-        available = [key for key in ("train", "val", "test") if data.get(key)]
-        raise FileNotFoundError(f"Split '{split}' not found in {args.data}. Available: {available}")
 
     image_files = list_images(data[split])
     if not image_files:

@@ -2,9 +2,10 @@
 name: myultralytics-scripts-structure
 description: >-
   Documents the unified scripts/ experiment entry points (train / eval / create /
-  feature_drift / analyze), dataset and model resolution, and the incremental
-  task loop. Use when adding a dataset family, model family, IOD method, or
-  changing experiment orchestration.
+  feature_drift / detect / analyze), the three-yaml-sequence experiment contract
+  (train / per-task eval / cumulative eval), dataset and model resolution, and
+  the incremental task loop. Use when adding a dataset family, model family, IOD
+  method, or changing experiment orchestration.
 ---
 
 # Scripts Structure
@@ -20,22 +21,51 @@ One train/eval/create/feature_drift script covers every combination.
 
 ```text
 scripts/
-├── train.sh                       # dataset × model × method
-├── eval.sh                        # model-agnostic; infers split from the run dir
+├── train.sh                       # dataset × model × method, or --tasks yaml sequence
+├── eval.sh                        # model-agnostic; manifest → dataset/split → run-name inference
 ├── create.sh                      # CIL split builder
 ├── feature_drift.sh               # task-1 feature drift between two ckpts
+├── detect.sh                      # per-task inference over a yaml sequence
 ├── analyze.sh                     # vis / confusion-matrix tools
 ├── run_incremental.sh             # shared task loop (model-agnostic)
-├── lib/
+├── libexec/
 │   └── experiment.sh              # dataset / model / output resolution
 └── model_adapters/
     └── ultralytics.sh             # train + artifact hooks
 ```
 
+## Yaml sequences (the core contract)
+
+Every entry point ultimately resolves **three yaml sequences**:
+
+| Sequence | Source flag | Role | Default |
+|----------|-------------|------|---------|
+| `TASK_DATASETS` | `--tasks` | Incremental train data, one yaml per task | from `--dataset/--split` |
+| `EVAL_DATASETS` | `--eval-tasks` | Per-task eval data, one yaml per task | the train sequence |
+| `CUMULATIVE_DATASETS` | `--cumulative` | Cumulative eval data, one yaml per task | registered CIL splits only |
+
+`--cumulative` is optional: when no cumulative sequence exists, cumulative eval is
+skipped (gated on the sequence being non-empty, not on the CIL/TIL label).
+Explicit sequences are validated fail-fast: files must exist and counts must
+match the task count. A single comma-separated argument also works
+(`--tasks a.yaml,b.yaml`). `--tag NAME` overrides the auto-derived `DATA_TAG`.
+
+A yaml-list flag consumes every following non-flag argument, so put the list
+first and pass everything after it as `--flags` (e.g.
+`--tasks t1.yaml t2.yaml --model yolo26 --method naive`).
+
+The data-split two-level layout is just one way to generate these sequences
+(`create.sh` + the registered families in `experiment_load_dataset`).
+
+`train.sh` persists the resolved sequences to the run directory
+(`task_yamls.txt`, `eval_yamls.txt`, `cumulative_yamls.txt`, `experiment.meta`),
+so `eval.sh runs/<run>` and `detect.sh --run runs/<run>` need no dataset flags.
+`experiment.meta` also carries `EVAL_IOU_THRESHOLD` (e.g. coco's 0.75).
+
 ## Incremental settings
 
-Two settings share `run_incremental.sh`; they differ in how tasks are defined
-and whether cumulative eval data exists.
+Two registered settings share `run_incremental.sh`; they differ in how tasks are
+defined and whether cumulative eval data exists.
 
 | Setting | What each task adds | Typical data layout | `create.sh` | Cumulative eval |
 |---------|---------------------|---------------------|-------------|-----------------|
@@ -47,28 +77,34 @@ Task order is **lexicographic (C locale)** over subdirectory names.
 
 ## Unified commands
 
-Always the same four identity knobs: **dataset**, **split**, **model**, **method**.
-Flags or positionals are equivalent.
+Identity knobs: **dataset + split**, or an explicit **`--tasks`** yaml sequence
+(with optional `--eval-tasks` / `--cumulative` / `--tag`), plus **model** and
+**method**. Flags or positionals are equivalent (with `--tasks`, positionals are
+just model and method).
 
 ```bash
 # Train
 bash scripts/train.sh --dataset voc-tiny --split 15_5 --model yolo26 --method pseudo_label+dist+espreg
 bash scripts/train.sh voc-tiny 15_5 yolo26 pseudo_label+dist+espreg
+bash scripts/train.sh --tasks t1.yaml t2.yaml --eval-tasks e1.yaml e2.yaml \
+    --cumulative c1.yaml c2.yaml --model yolo26 --method naive
 
 # Create a CIL split (TIL has no create step)
 bash scripts/create.sh voc 15_5
 bash scripts/create.sh voc-tiny 15_5
 
-# Eval a finished run (dataset/split inferred from the folder name when omitted)
+# Eval a finished run (sequences recovered from the run manifest, else inferred
+# from the folder name when omitted)
 bash scripts/eval.sh runs/yolo26m_VOC-TINY_15+5_pretrained-from-yoloe-26m-seg_pseudo_label+dist+espreg
 
-# Feature drift on this split's task-1 images
+# Feature drift on task-1 images (registered split or --tasks)
 bash scripts/feature_drift.sh voc-tiny 15_5 runs/<run>/task-1/best.pt runs/<run>/task-2/best.pt
+bash scripts/feature_drift.sh --tasks t1.yaml t2.yaml --model1 runs/<run>/task-1/best.pt --model2 runs/<run>/task-2/best.pt
 ```
 
 `train.sh --` passes extra flags to `tools/train.py`.
 
-## Dataset / split resolution (`lib/experiment.sh`)
+## Dataset / split resolution (`libexec/experiment.sh`)
 
 Known dataset families (add new ones as a `case` branch in `experiment_load_dataset`):
 
@@ -94,8 +130,9 @@ Task yamls (derived, not hardcoded per split):
 - Cumulative: task 1 reuses the per-task yaml; later tasks use
   `task_1-<k>_cls_<sum>/dataset.yaml`
 
-TIL tasks are discovered with `LC_ALL=C` sort of `data/<TAG>/*/` and
-`<dir>/data.yaml`.
+Registered splits fill all three sequences at once: train = eval = per-task
+yamls, cumulative as above. TIL tasks are discovered with `LC_ALL=C` sort of
+`data/<TAG>/*/` and `<dir>/data.yaml`, with no cumulative sequence.
 
 COCO eval adds `--iou_threshold 0.75`. Override with `EVAL_IOU_THRESHOLD`.
 
@@ -159,17 +196,18 @@ runs/${MODEL_ID}_${DATA_TAG}_fromscratch_${METHOD}
 
 | File | Role |
 |------|------|
-| `train.sh` | Parse identity knobs → source `run_incremental.sh` |
+| `train.sh` | Parse identity knobs or `--tasks` → resolve sequences → write manifest → source `run_incremental.sh` |
 | `eval.sh` | Per `task-k/best.pt`, convert class ids → `tools/eval.py` → tables |
 | `create.sh` | CIL only: optional subsample (voc-tiny) then `create_incremental_dataset.py` |
 | `feature_drift.sh` | `tools/feature_drift.py` on `TASK_DATASETS[0]` |
+| `detect.sh` | `tools/detect.py` per task yaml, class ids aligned to the model |
 | `analyze.sh` | Dispatch to vis / confusion-matrix tools |
-| `lib/experiment.sh` | Dataset, model, output, and CIL/TIL path derivation |
+| `libexec/experiment.sh` | Dataset, model, output, and yaml-sequence resolution + manifest IO |
 | `run_incremental.sh` | Validate adapter + loop tasks |
 | `model_adapters/<framework>.sh` | Framework-specific train / artifact hooks |
 
-Eval: CIL writes individual + cumulative tables and
-`final_cumulative_task_mAP.csv`. TIL writes only the individual table.
+Eval always writes the individual table; it adds cumulative tables and
+`final_cumulative_task_mAP.csv` whenever a cumulative sequence exists.
 
 ## Env knobs
 
@@ -190,7 +228,7 @@ Eval: CIL writes individual + cumulative tables and
 Do not duplicate the task loop. Contract:
 
 1. Caller sets `MODEL_ADAPTER`, `METHOD`, `OUTPUT_DIR`, and `TASK_DATASETS`
-   (`train.sh` via `lib/experiment.sh`).
+   (`train.sh` via `libexec/experiment.sh`).
 2. `run_incremental.sh` sources the adapter and requires:
    `model_adapter_validate`, `model_adapter_initialize`,
    `model_adapter_prepare_task`, `model_adapter_train_task`,
@@ -215,7 +253,15 @@ five functions.
 1. Ensure `data/<DATASET>/` exists; each task is a subdirectory with a yaml.
 2. Add a `case` in `experiment_load_dataset` with `INCREMENTAL_SETTING=til`,
    `TASK_YAML_NAME`, and the protocol split id.
-3. Eval automatically skips cumulative tables when setting is TIL.
+3. Eval automatically skips cumulative tables when no cumulative sequence exists.
+
+## Checklist: running an arbitrary incremental protocol
+
+1. No repo change needed: pass `--tasks` (plus optional `--eval-tasks`,
+   `--cumulative`, `--tag`) to `train.sh`; sequences are validated and written
+   to the run manifest.
+2. `eval.sh runs/<run>` / `detect.sh --run runs/<run>` recover the sequences
+   from the manifest; no dataset flags needed afterwards.
 
 ## Checklist: adding a new method
 
