@@ -160,7 +160,8 @@ myultralytics/
 │   ├── train.py                    # 训练入口：--trainer {antiforget,bpf} + 动态参数透传
 │   ├── eval.py                     # 评估入口：per-class 指标 CSV + 混淆矩阵
 │   ├── create_incremental_dataset.py   # 完整数据集 → 多阶段类增量数据集
-│   ├── expand_model_head.py        # 检测头类别数扩展（零初始化 / YOLOE 文本嵌入初始化）
+│   ├── expand_model_head.py        # 检测头类别数扩展：既有类别 id/顺序不变，未见类别按数据集
+│   │                               # 顺序追加在后，同名类对齐既有 id（零初始化 / YOLOE 文本嵌入初始化）
 │   ├── convert_dataset_class_ids.py    # 数据集类别 ID 对齐到模型输出空间
 │   ├── compute_importance.py       # EWC Fisher 重要度估计
 │   ├── expand_importance.py        # 扩头后扩展历史 Fisher/参数快照

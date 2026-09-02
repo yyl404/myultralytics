@@ -75,6 +75,14 @@ defined and whether cumulative eval data exists.
 OdinW-13 is TIL: each subdomain under `data/OdinW-13-yolo/` is one task.
 Task order is **lexicographic (C locale)** over subdirectory names.
 
+Head expansion (`tools/expand_model_head.py`) keeps existing class ids and their
+order in the detection head, and appends classes not yet known to the model after
+them in their dataset order. A class already known to the model keeps its existing
+id — overlapping annotations in the new dataset are aligned to that id by class
+name (`tools/convert_dataset_class_ids.py`), never duplicated. Task, eval, and
+replay datasets are converted into the current model's class-id space by name
+before training/eval, so every DDP rank shares the same class space.
+
 ## Unified commands
 
 Identity knobs: **dataset + split**, or an explicit **`--tasks`** yaml sequence

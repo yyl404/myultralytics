@@ -339,9 +339,18 @@ model_adapter_prepare_task() {
                 echo "Previous task replay dataset not found: $PREVIOUS_REPLAY" >&2
                 exit 1
             fi
+            # Replay labels live in the previous task's class-id space. Head expansion keeps
+            # existing class ids and appends unseen classes after them; remap the replay
+            # dataset into the expanded model's class-id space, same as the task dataset above.
+            converted_replay="${TASK_DIR}/replay_id_converted"
+            python tools/convert_dataset_class_ids.py \
+                --model "$expanded_model" \
+                --dataset "$PREVIOUS_REPLAY/dataset.yaml" \
+                --output_dir "$converted_replay" \
+                --workers "$WORKERS"
             TRAINER_ARGS+=(
                 --replay True
-                --replay_data "$PREVIOUS_REPLAY/dataset.yaml"
+                --replay_data "$converted_replay/dataset.yaml"
                 --replay_loss_weight "$REPLAY_LOSS_WEIGHT"
             )
         fi
@@ -466,8 +475,11 @@ model_adapter_finalize_task() {
         if [[ -n "$PREVIOUS_REPLAY" ]]; then
             history_args=(--load_hist "$PREVIOUS_REPLAY")
         fi
-        # TRAIN_DATA labels are already in the model's global class-id space (task-1 local IDs are
-        # the global IDs; later tasks use the id-converted dataset), so replay labels stay valid.
+        # TRAIN_DATA labels are in this task's class-id space (task-1 local IDs; later tasks use
+        # the id-converted dataset), and select_replay_samples remaps carried-over history labels
+        # into the same space by class name, so each task's replay_dataset stays self-consistent.
+        # The next task's prepare step remaps the replay dataset into the expanded model's
+        # class-id space before training (see model_adapter_prepare_task).
         python tools/select_replay_samples.py \
             --dataset "$TRAIN_DATA" \
             --output_dir "${TASK_DIR}/replay_dataset" \

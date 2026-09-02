@@ -16,7 +16,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER, YAML
 
-from utils import convert_class_ids
+from utils import convert_class_ids, normalize_names
 
 
 _T = TypeVar("_T")
@@ -64,21 +64,6 @@ def _bounded_map(
             pending.append(executor.submit(function, next(item_iterator)))
         except StopIteration:
             pass
-
-
-def _normalize_names(names: list[str] | Mapping[int | str, str], source: str) -> dict[int, str]:
-    """Return class names keyed by integer IDs."""
-    if isinstance(names, list):
-        return dict(enumerate(names))
-    if not isinstance(names, Mapping):
-        raise TypeError(f"Class names in {source} must be a list or mapping, got {type(names)}")
-    normalized = {int(class_id): class_name for class_id, class_name in names.items()}
-    expected_ids = list(range(len(normalized)))
-    if sorted(normalized) != expected_ids:
-        raise ValueError(
-            f"Class IDs in {source} must be contiguous from 0, got {sorted(normalized)}"
-        )
-    return normalized
 
 
 def _build_class_mapping(
@@ -256,12 +241,12 @@ def main() -> None:
     args = parse_args()
     model = YOLO(args.model)
     task = getattr(model, "task", None) or "detect"
-    model_names = _normalize_names(model.names, source=f"model '{args.model}'")
+    model_names = normalize_names(model.names, source=f"model '{args.model}'")
 
     dataset_config = YAML().load(args.dataset)
     if "names" not in dataset_config:
         raise KeyError(f"Dataset config has no 'names': {args.dataset}")
-    source_names = _normalize_names(
+    source_names = normalize_names(
         dataset_config["names"],
         source=f"dataset '{args.dataset}'",
     )

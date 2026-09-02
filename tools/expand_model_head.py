@@ -9,6 +9,13 @@ Usage:
         --save_path <path/to/save.pt> \
         --zero_weight_init (optional)
 
+    Class ordering: existing model classes keep their ids and their order in the
+    classification head; classes from --dataset/--new_classes that are not already
+    known are appended after them in their dataset order. A class already known to
+    the model keeps its existing id and is never duplicated; annotations of that
+    class in the new dataset are aligned to the existing id by class name during
+    dataset conversion (tools/convert_dataset_class_ids.py).
+
     Arguments:
         --model: Path to the trained model checkpoint (.pt file)
         --model_cfg: Path to the model configuration file (.yaml file)
@@ -157,16 +164,18 @@ if __name__ == "__main__":
     else:
         new_classes = parse_list_string(args.new_classes)
 
-    all_classes = list(set(base_classes).union(new_classes))
-    all_classes = sorted(all_classes, key=str)  # Sort lexicographically
-    
-    base_class_id_map = {}
-    for i, cls in enumerate(base_classes):
-        base_class_id_map[i] = all_classes.index(cls)
+    # Existing classes keep their ids and order; unseen classes are appended after them
+    # in dataset order. A class already known to the base model keeps the existing id
+    # (its annotations are aligned to that id by class name during dataset conversion),
+    # so no duplicate channel is created.
+    all_classes = list(base_classes)
+    for cls in new_classes:
+        if cls not in all_classes:
+            all_classes.append(cls)
 
-    new_class_id_map = {}
-    for i, cls in enumerate(new_classes):
-        new_class_id_map[i] = all_classes.index(cls)
+    # Base class channels are preserved 1:1 (identity map); appended classes get
+    # fresh channels initialized by expand_detection_head.
+    base_class_id_map = {i: i for i in range(len(base_classes))}
     
     root_dir, model_name = OSP.split(args.save_path)
     expand_detection_head(args.model, args.model_cfg, base_class_id_map, all_classes,

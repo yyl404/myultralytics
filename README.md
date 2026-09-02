@@ -144,6 +144,8 @@ EPOCHS=1 END_TASK=2 bash scripts/train.sh odinw-13 13 yolov8 naive
 
 训练产物保存在 `runs/<MODEL_ID>_<DATA_TAG>_pretrained-from-<weights>_<method>/task-<k>/`（`best.pt`、EWC 的 `importance.pth`、ESPReg/NSGP 的 `pca_cache.pkl`、RePRE 的 `repre_prototypes.pt` 等）。
 
+类别空间约定：任务 `k>1` 开始时由 `tools/expand_model_head.py` 扩展检测头——既有类别的 id 与在检测头中的顺序保持不变，新数据集中未见过的类别按其 yaml 中的顺序追加在最后；若新数据集含有与既有类别同名的类别，则不新增通道，其标注由 `tools/convert_dataset_class_ids.py` 按类别名统一对齐到既有 id。训练、评估与推理用到的数据集都会先按类别名对齐到当前模型的类别空间，DDP 各 rank 加载同一扩展权重与同一转换后数据集，类别空间天然一致。
+
 ### 3.2 评估
 
 传入任意训练 run 目录即可（优先读训练时写入的 manifest，其次从目录名推断注册数据集/split）：

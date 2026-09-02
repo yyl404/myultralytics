@@ -6,6 +6,7 @@ import os.path as OSP
 import threading
 import time
 import shutil
+from collections.abc import Mapping
 
 from torch import nn
 import torch.nn.functional as F
@@ -56,6 +57,30 @@ def parse_list_string(list_str):
 
 
 # ====== Dataset Utils ======
+def normalize_names(names, source):
+    """Return class names keyed by contiguous integer IDs.
+
+    Args:
+        names: Class names as a list (index = class id) or a mapping of class id -> name.
+        source: Description of where the names come from, used in error messages
+            (e.g. "model 'best.pt'" or "dataset 'dataset.yaml'").
+
+    Returns:
+        dict: {int class_id: class name}, validated to be contiguous from 0.
+    """
+    if isinstance(names, list):
+        return dict(enumerate(names))
+    if not isinstance(names, Mapping):
+        raise TypeError(f"Class names in {source} must be a list or mapping, got {type(names)}")
+    normalized = {int(class_id): class_name for class_id, class_name in names.items()}
+    expected_ids = list(range(len(normalized)))
+    if sorted(normalized) != expected_ids:
+        raise ValueError(
+            f"Class IDs in {source} must be contiguous from 0, got {sorted(normalized)}"
+        )
+    return normalized
+
+
 def calculate_iou_xywh(box1, box2):
     """Calculate IoU between two xywh format boxes.
     
