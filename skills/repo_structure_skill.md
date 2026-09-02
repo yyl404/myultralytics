@@ -23,37 +23,33 @@ Follow these layout rules when creating, moving, or referencing files in this re
 
 ## `scripts/` layout
 
-Organize by dataset → class-incremental split → baseline model:
+One entry point per action. Do **not** add per-dataset / per-model / per-method copies.
 
 ```text
 scripts/
-└── <dataset>/                    # e.g. voc
-    └── <split>/                  # e.g. 15_5
-        ├── <baseline>/           # e.g. yolov8
-        │   └── train_*.sh        # one script per IOD method
-        ├── create_<dataset>_<split>.sh
-        └── eval.sh               # model-agnostic evaluation
+├── train.sh                       # dataset × model × method
+├── eval.sh
+├── create.sh                      # CIL splits only
+├── feature_drift.sh
+├── analyze.sh
+├── run_incremental.sh
+├── lib/experiment.sh              # dataset / model resolution
+└── model_adapters/ultralytics.sh
 ```
 
 Example:
 
-```text
-scripts/
-└── voc/
-    └── 15_5/
-        ├── yolov8/
-        │   ├── train_naive.sh
-        │   ├── train_pseudo_label.sh
-        │   └── ...
-        ├── create_voc_15_5.sh
-        └── eval.sh
+```bash
+bash scripts/train.sh voc-tiny 15_5 yolo26 pseudo_label+dist+espreg
+bash scripts/eval.sh runs/<run>
+bash scripts/create.sh voc 15_5
 ```
 
 Rules:
 - Put **all** launch / scheduling scripts under `scripts/`.
 - Do **not** put implementation code under `scripts/`.
-- Keep eval scripts model-agnostic at the split level (`scripts/<dataset>/<split>/eval.sh`).
-- Keep split-creation scripts at the split level (`create_<dataset>_<split>.sh`).
+- Register a new dataset or model family in `scripts/lib/experiment.sh`, not as a new directory tree.
+- Keep eval model-agnostic: `scripts/eval.sh` takes a run directory.
 
 ## Code placement
 

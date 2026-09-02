@@ -46,21 +46,24 @@ pip install pytest
 
 ### 2.1 类增量数据集（VOC / COCO / VOC-TINY）
 
-先准备完整类别的标准 YOLO 格式数据集（`images/{train,val,test}` + `labels/{train,val,test}` + 含 `train/val/test/names` 字段的 yaml），然后用各 split 的创建脚本切分为多阶段类增量数据集：
+先准备完整类别的标准 YOLO 格式数据集（`images/{train,val,test}` + `labels/{train,val,test}` + 含 `train/val/test/names` 字段的 yaml），然后用统一入口切分：
 
 ```bash
-# 以 VOC-TINY 15+5 为例：源数据集为 data/VOC-TINY-YOLO/（yaml 为 VOC.yaml）
-bash scripts/voc-tiny/15_5/create_voc-tiny_15_5.sh
+# VOC-TINY 15+5：先从 VOC 抽 25% 子样本，再切分
+bash scripts/create.sh voc-tiny 15_5
 # 输出：data/VOC-TINY_15+5/task_1_cls_15、task_2_cls_5、task_1-2_cls_20（累积集）
+
+bash scripts/create.sh voc 15_5
+bash scripts/create.sh coco 70_10
 ```
 
-其余 split 同理（源数据集路径在各 `create_*.sh` 内指定，可按需修改）：
+`--split` 为下划线连接的每任务类别数，对应 `data/` 下的 `+` 目录名（`15_5` → `VOC_15+5`）。任意正整数序列均可，不必再加脚本。
 
-| 数据集 | split | 创建脚本 |
-|---|---|---|
-| VOC | 10+10 / 15+5 / 19+1 / 10+5+5 / 5+5+5+5 / 10+2+2+2+2+2 | `scripts/voc/<split>/create_voc_<split>.sh` |
-| VOC-TINY | 15+5 | `scripts/voc-tiny/15_5/create_voc-tiny_15_5.sh` |
-| COCO | 40+40 / 70+10 | `scripts/coco/<split>/create_coco_<split>.sh` |
+| 数据集 | `--dataset` | 常用 split | 源 yaml |
+|---|---|---|---|
+| VOC | `voc` | `10_10` / `15_5` / `19_1` / `10_5_5` / `5_5_5_5` / `10_2_2_2_2_2` | `data/VOC-YOLO/VOC.yaml` |
+| VOC-TINY | `voc-tiny` | `15_5` | 先 subsample 到 `data/VOC-TINY-YOLO/` |
+| COCO | `coco` | `40_40` / `70_10` | `data/coco-yolo/coco.yaml` |
 
 ### 2.2 任务增量数据集（OdinW-13）
 
@@ -70,9 +73,10 @@ OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`
 
 将以下权重文件放在**仓库根目录**（训练脚本按相对路径引用）：
 
-- `yolov8x-cls.pt`：ImageNet 分类预训练权重，`yolov8` baseline 的检测初始化
-- `yoloe-v8l-seg.pt`：YOLOE 分割预训练权重，`yoloe-v8` baseline 的初始化
-- `yolo26x.pt`：COCO 检测预训练权重，`yolo26` baseline（yolo26x）的初始化
+- `yolov8x-cls.pt`：ImageNet 分类预训练，默认 `yolov8`（size x）
+- `yoloe-v8m-seg.pt` / `yoloe-v8l-seg.pt`：YOLOE 分割预训练（voc-tiny 的 yolov8m / `yoloe-v8`）
+- `yoloe-26m-seg.pt`：YOLOE-26 分割预训练，默认 voc-tiny 的 `yolo26`
+- `yolo26x.pt`：COCO 检测预训练，默认非 tiny 的 `yolo26`（size x）
 
 ---
 
@@ -80,51 +84,53 @@ OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`
 
 ### 3.1 训练
 
-每个 `<dataset>/<split>/<baseline>` 目录下每个方法一个启动脚本：
+统一入口，任意数据集 × 模型 × IOD 方法：
 
 ```bash
-bash scripts/<dataset>/<split>/<baseline>/train_<method>.sh
+bash scripts/train.sh --dataset <ds> --split <split> --model <model> --method <method>
+bash scripts/train.sh <ds> <split> <model> <method>
 ```
 
-`<method>` 取值（9 个）：`naive`、`pseudo_label`、`pseudo_label+ewc`、`pseudo_label+l2`、`pseudo_label+espreg`、`pseudo_label+dist+espreg`、`pseudo_label+nsgp`、`pseudo_label+nsgp+repre`、`bpf`。
+`--method` 为 `+` 连接的组件，可任意组合：`naive`、`bpf`、`pseudo_label`、`ewc`、`l2`、`dist`、`espreg`、`nsgp`、`repre`、`replay`。
 
-注：`yolo26` baseline（end2end 检测头）当前仅提供 `pseudo_label+dist+espreg` 启动脚本。
+`--model` 为族名，可带尺寸后缀（`yolo26` / `yolo26m` / `yolov8x` / `yoloe-v8`）。voc-tiny 默认 size `m`，`yoloe-v8` 默认 `l`，其余默认 `x`。
+
+YOLO26 会自动加上 `--end2end False`；在 voc-tiny 上另外使用 AdamW、`lr0=0.001`、`mosaic=0.5`、`freeze=10`（可用环境变量覆盖，或 `YOLO26_DEFAULT_HYPS=0` 关掉）。
 
 示例：
 
 ```bash
-# VOC-TINY 15+5，yolov8 baseline，naive 微调
-bash scripts/voc-tiny/15_5/yolov8/train_naive.sh
+# VOC-TINY 15+5，yolo26m + yoloe-26m-seg，伪标签 + dist + espreg
+bash scripts/train.sh voc-tiny 15_5 yolo26 pseudo_label+dist+espreg
 
-# VOC 15+5，yoloe-v8 baseline，伪标签 + EWC
-bash scripts/voc/15_5/yoloe-v8/train_pseudo_label+ewc.sh
+# VOC 15+5，yoloe-v8，伪标签 + EWC
+bash scripts/train.sh voc 15_5 yoloe-v8 pseudo_label+ewc
 
 # OdinW-13 任务增量，伪标签 + NSGP + RePRE
-bash scripts/odinw-13/13/yolov8/train_pseudo_label+nsgp+repre.sh
+bash scripts/train.sh odinw-13 13 yolov8 pseudo_label+nsgp+repre
 ```
-
-通用环境变量（在各 `config.sh` / `run_incremental.sh` 中生效）：
 
 | 变量 | 含义 | 默认值 |
 |---|---|---|
-| `EPOCHS` | 每任务训练轮数 | 各 config.sh 内指定 |
+| `EPOCHS` | 每任务训练轮数 | voc 100 / voc-tiny 10 / coco 12 / odinw-13 100 |
 | `BATCH_SIZE` / `IMGSZ` / `WORKERS` / `DEVICE` | 训练超参 | 16 / 640 / 8 / 0 |
 | `START_TASK` | 从第几个任务开始（断点续跑） | 1 |
 | `END_TASK` | 到第几个任务结束（部分运行/调试） | 任务总数 |
 
 ```bash
 # 示例：只跑前 2 个任务、每任务 1 个 epoch（冒烟调试）
-EPOCHS=1 END_TASK=2 bash scripts/odinw-13/13/yolov8/train_naive.sh
+EPOCHS=1 END_TASK=2 bash scripts/train.sh odinw-13 13 yolov8 naive
 ```
 
-训练产物保存在 `runs/<OUTPUT_PREFIX>_<method>/task-<k>/`（`best.pt`、EWC 的 `importance.pth`、ESPReg/NSGP 的 `pca_cache.pkl`、RePRE 的 `repre_prototypes.pt` 等）。
+训练产物保存在 `runs/<MODEL_ID>_<DATA_TAG>_pretrained-from-<weights>_<method>/task-<k>/`（`best.pt`、EWC 的 `importance.pth`、ESPReg/NSGP 的 `pca_cache.pkl`、RePRE 的 `repre_prototypes.pt` 等）。
 
 ### 3.2 评估
 
-评估脚本是 split 级、模型无关的，传入任意训练 run 的输出目录即可：
+传入任意训练 run 目录即可（可从目录名推断数据集/split）：
 
 ```bash
-bash scripts/<dataset>/<split>/eval.sh runs/<OUTPUT_PREFIX>_<method>
+bash scripts/eval.sh runs/<run>
+bash scripts/eval.sh --dataset voc-tiny --split 15_5 --run runs/<run>
 ```
 
 对每个任务的 `best.pt` 评估其已见各任务（CIL 另含累积数据集），结果写入 `<run>/evaluation_results/`：逐类指标 CSV、混淆矩阵 CSV、`individual_datasets_eval.csv`、`cumulative_datasets_eval.csv` 与按任务汇总的 mAP 表。
@@ -135,10 +141,10 @@ bash scripts/<dataset>/<split>/eval.sh runs/<OUTPUT_PREFIX>_<method>
 
 ### 4.1 特征漂移（feature drift）
 
-量化相邻任务 checkpoint 间 backbone 特征的漂移（方向/幅度分解），数据集按 split 固定：
+量化相邻任务 checkpoint 间 backbone 特征的漂移（方向/幅度分解），在该 split 的 task-1 图像上计算：
 
 ```bash
-bash scripts/<dataset>/<split>/feature_drift.sh \
+bash scripts/feature_drift.sh voc-tiny 15_5 \
     runs/<run>/task-1/best.pt runs/<run>/task-2/best.pt [save_path]
 ```
 

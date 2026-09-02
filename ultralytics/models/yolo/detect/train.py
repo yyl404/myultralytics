@@ -146,6 +146,9 @@ class DetectionTrainer(BaseTrainer):
         self.model.nc = self.data["nc"]  # attach number of classes to model
         self.model.names = self.data["names"]  # attach class names to model
         self.model.args = self.args  # attach hyperparameters to model
+        # Apply before criterion init so train/val use one2many+NMS when end2end=False.
+        if getattr(self.args, "end2end", None) is not None:
+            self.model.end2end = self.args.end2end
         if getattr(self.model, "end2end", False):
             self.model.set_head_attr(max_det=self.args.max_det)
 
