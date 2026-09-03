@@ -109,6 +109,8 @@ fi
     usage >&2
     experiment_die "Need a run directory (--run)"
 }
+# Absolute paths: a relative ultralytics --project would be re-rooted under runs/detect/.
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 experiment_resolve_eval_dataset "$OUTPUT_DIR"
 
@@ -147,6 +149,8 @@ for model_task in $(seq 1 "$NUM_TASKS"); do
         python tools/convert_dataset_class_ids.py \
             --model "$MODEL_PATH" --dataset "$DATASET_PATH" \
             --output_dir "$CONVERTED_DATASET_DIR" --splits train val test
+        # Clear validator intermediates from a previous eval so reruns do not accumulate val2/val3/... .
+        rm -rf "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_task_${dataset_task}"
         python tools/eval.py \
             --model "$MODEL_PATH" --data "${CONVERTED_DATASET_DIR}/dataset.yaml" \
             --device "$DEVICE" --batch 1 \
@@ -162,6 +166,8 @@ for model_task in $(seq 1 "$NUM_TASKS"); do
             python tools/convert_dataset_class_ids.py \
                 --model "$MODEL_PATH" --dataset "$CUMULATIVE_DATASET_PATH" \
                 --output_dir "$CUMULATIVE_CONVERTED_DIR" --splits train val test
+            # Clear validator intermediates from a previous eval (see above).
+            rm -rf "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_cumulative"
             python tools/eval.py \
                 --model "$MODEL_PATH" --data "${CUMULATIVE_CONVERTED_DIR}/dataset.yaml" \
                 --device "$DEVICE" \
@@ -183,4 +189,8 @@ if (( ${#CUMULATIVE_DATASETS[@]} > 0 )); then
         --evaluation_csv "${EVAL_OUTPUT_DIR}/model_${NUM_TASKS}_eval_cumulative.csv" \
         --task_data "${EVAL_DATASETS[@]}" \
         --output "${EVAL_OUTPUT_DIR}/final_cumulative_task_mAP.csv"
+    # Per-stage mAP matrices on the cumulative eval, grouped by the class spaces recorded
+    # in each checkpoint's own incremental history (independent of the eval task yamls).
+    python tools/cumulative_stage_map.py \
+        --run_dir "$OUTPUT_DIR" --eval_dir "$EVAL_OUTPUT_DIR" --num_tasks "$NUM_TASKS"
 fi

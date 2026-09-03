@@ -154,6 +154,8 @@ fi
 
 SAVE_PATH="${SAVE_PATH:-$(dirname "$MODEL")/detect}"
 mkdir -p "$SAVE_PATH"
+# Absolute paths: a relative ultralytics --project would be re-rooted under runs/detect/.
+SAVE_PATH="$(cd "$SAVE_PATH" && pwd)"
 
 echo "=========================================="
 echo "Incremental detect (${DATA_TAG}, ${INCREMENTAL_SETTING})"
@@ -176,6 +178,8 @@ for task_index in "${!TASK_DATASETS[@]}"; do
     python tools/convert_dataset_class_ids.py \
         --model "$MODEL" --dataset "$DATASET_PATH" \
         --output_dir "$CONVERTED_DIR" --splits "$PRED_SPLIT"
+    # Clear predictor intermediates from a previous run so reruns do not accumulate predict2/... .
+    rm -rf "${TASK_OUT}/predict"
     detect_args=(
         python tools/detect.py
         --model "$MODEL"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -188,6 +189,12 @@ def calculate_importance(
     calculator = None
     optimizer_step_count = 0
 
+    # Keep the Fisher-pass trainer intermediates next to the artifact (under the run's task
+    # dir) instead of the ultralytics default runs/detect/train, and clear leftovers from a
+    # previous run so reruns overwrite instead of accumulating train2/train3/... .
+    project_dir = Path(save_path).resolve().parent / "importance"
+    shutil.rmtree(project_dir, ignore_errors=True)
+
     train_kwargs = {
         "data": dataset,
         "epochs": 1,
@@ -201,6 +208,7 @@ def calculate_importance(
         "save": False,
         "amp": False,
         "model": model.ckpt_path,
+        "project": str(project_dir),
         "ewc": False,
         "pseudo_label": reference_model is not None,
         "reference_model": reference_model,

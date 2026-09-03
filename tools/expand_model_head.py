@@ -65,8 +65,9 @@ from ultralytics.utils import YAML
 from utils import parse_list_string
 
 
-def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save_dir, output_name, 
-                          zero_weight_init=False, class_embedding_init=False, yoloe_model_path=None):
+def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save_dir, output_name,
+                          zero_weight_init=False, class_embedding_init=False, yoloe_model_path=None,
+                          incremental_history=None):
     """Expand the detection head output channels and migrate weights from old to new channels.
     
     This function expands the model's detection head to support more classes by allocating
@@ -87,6 +88,9 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
             Defaults to False.
         yoloe_model_path (str, optional): Path to YOLOE model for generating embeddings.
             Required if class_embedding_init is True.
+        incremental_history (list[dict], optional): Incremental class-space history to attach to
+            the expanded model ([{"task": int, "names": list[str]}, ...], one entry per stage).
+            Stored as a plain module attribute so every later checkpoint carries it.
     
     Returns:
         None: The function saves the expanded model to disk but does not return anything.
@@ -139,6 +143,7 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
 
     new_model.model.load_state_dict(new_weight)
     new_model.model.names = {k: v for k, v in enumerate(classes_names)}
+    new_model.model.incremental_history = incremental_history
     new_model.save(OSP.join(save_dir, output_name))
 
 
@@ -176,8 +181,23 @@ if __name__ == "__main__":
     # Base class channels are preserved 1:1 (identity map); appended classes get
     # fresh channels initialized by expand_detection_head.
     base_class_id_map = {i: i for i in range(len(base_classes))}
-    
+
+    # Carry the incremental class-space history forward: one entry per stage, so the
+    # expanded model remembers which classes each completed task introduced. A model
+    # without a recorded history has seen a single stage: its whole class space.
+    base_history = getattr(base_model.model, "incremental_history", None)
+    if base_history is None:
+        base_history = [{"task": 1, "names": base_classes}]
+    history_names = [name for stage in base_history for name in stage["names"]]
+    if history_names != base_classes:
+        raise ValueError(
+            f"incremental_history of {args.model} does not match its class space: "
+            f"history covers {history_names}, model names are {base_classes}"
+        )
+    incremental_history = [*base_history, {"task": len(base_history) + 1, "names": all_classes[len(base_classes):]}]
+
     root_dir, model_name = OSP.split(args.save_path)
     expand_detection_head(args.model, args.model_cfg, base_class_id_map, all_classes,
-                          root_dir, model_name, args.zero_weight_init, 
-                          args.class_embedding_init, args.yoloe_model)
+                          root_dir, model_name, args.zero_weight_init,
+                          args.class_embedding_init, args.yoloe_model,
+                          incremental_history=incremental_history)

@@ -1,0 +1,5 @@
+- You are allowed to use the conda env `mr-gdino` for debugging. But **DO NOT** include the exact env name or path in any code/scripts/docs. Keep the project's env name/path agnostic.
+- You are required to keep newly modified or appended content compatible with existing content. Especially avoid silent errors in logical/mathematical aspects.
+- You are required to update README.md, skill docs, and any other related docs.
+- You are required to keep the project compatible with DDP training, evaluation, and inference.
+- You are required to be confident in the decisions you make. As soon as you encounter a decision you are not confident about, ask me.

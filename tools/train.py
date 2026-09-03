@@ -156,6 +156,22 @@ def parse_dynamic_named_args(tokens):
     return extra
 
 
+def _attach_incremental_history(model, history) -> None:
+    """Attach an incremental class-space history to the model, validating it tiles the class space.
+
+    The attribute rides along with the pickled module (like `names`), so every checkpoint
+    saved from this model carries it.
+    """
+    names = [model.model.names[i] for i in sorted(model.model.names)]  # set by the trainer from the dataset
+    history_names = [name for stage in history for name in stage["names"]]
+    if history_names != names:
+        raise ValueError(
+            f"incremental_history does not match the trained model's class space: "
+            f"history covers {history_names}, model names are {names}"
+        )
+    model.model.incremental_history = history
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, help="Model to train(.pt/.yaml)")
@@ -188,6 +204,15 @@ def main():
             # This is for loading weights of heterogeneous models while preserving the architecture of the originally initialized model
             model.load(args.weight)
 
+    # The trainer rebuilds the model from its YAML and transfers only the weights, so the
+    # incremental history stamped on the input checkpoint (tools/expand_model_head.py) would
+    # not reach the saved model by itself. Capture it here and re-attach after training.
+    # When resuming, the in-training checkpoint has no history either, so fall back to --model.
+    incremental_history = getattr(model.model, "incremental_history", None)
+    if incremental_history is None and args.resume_checkpoint is not None \
+            and args.model and str(args.model).endswith(".pt"):
+        incremental_history = getattr(YOLO(args.model).model, "incremental_history", None)
+
     # Select trainer by model task and user-specified trainer type.
     # When trainer is None, do not pass trainer so the model uses its task-specific default (OBBTrainer for obb, etc.).
     # When trainer is "antiforget", use the task-appropriate anti-forget trainer.
@@ -202,6 +227,11 @@ def main():
         trainer = None  # use model's default (OBBTrainer for obb, DetectionTrainer for detect, etc.)
     model.train(data=args.data, epochs=args.epochs, batch=args.batch_size, workers=args.workers,
                 device=args.device, project=args.project, trainer=trainer, **dynamic_kwargs)
+    if incremental_history is None:
+        # No history on the input model: this is the first stage, the whole class space.
+        names = model.model.names
+        incremental_history = [{"task": 1, "names": [names[i] for i in sorted(names)]}]
+    _attach_incremental_history(model, incremental_history)
     model.save(args.save_path)
 
 

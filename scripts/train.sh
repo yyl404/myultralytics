@@ -189,6 +189,9 @@ if (( ${#PASSTHROUGH[@]} > 0 )); then
     EXTRA_TRAIN_ARGS+=("${PASSTHROUGH[@]}")
 fi
 experiment_set_output_paths "$METHOD"
+# Absolute paths: a relative ultralytics --project would be re-rooted under runs/detect/.
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 experiment_write_manifest "$OUTPUT_DIR"
 
 echo "=========================================="

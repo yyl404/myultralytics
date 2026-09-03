@@ -83,6 +83,12 @@ name (`tools/convert_dataset_class_ids.py`), never duplicated. Task, eval, and
 replay datasets are converted into the current model's class-id space by name
 before training/eval, so every DDP rank shares the same class space.
 
+Every `best.pt` also carries its incremental history as a module attribute
+`incremental_history` (`[{"task": k, "names": [...]}]`, one entry per stage):
+task 1 is stamped by `tools/train.py` at save time, later stages are appended by
+`expand_model_head.py`. Eval reads the stage class spaces from the checkpoint
+itself, never assuming the eval-time task datasets match the training ones.
+
 ## Unified commands
 
 Identity knobs: **dataset + split**, or an explicit **`--tasks`** yaml sequence
@@ -215,7 +221,18 @@ runs/${MODEL_ID}_${DATA_TAG}_fromscratch_${METHOD}
 | `model_adapters/<framework>.sh` | Framework-specific train / artifact hooks |
 
 Eval always writes the individual table; it adds cumulative tables and
-`final_cumulative_task_mAP.csv` whenever a cumulative sequence exists.
+`final_cumulative_task_mAP.csv` whenever a cumulative sequence exists, plus the
+per-stage mAP matrix sequence from `tools/cumulative_stage_map.py`
+(`model_<k>_eval_cumulative_stage_mAP.csv` per model and the combined
+`cumulative_stage_mAP_sequence.csv`), which groups cumulative per-class rows by
+each checkpoint's own `incremental_history`.
+
+Trainer/validator/predictor intermediates live inside the run dir, never under
+`runs/detect/`: entry points absolutize `OUTPUT_DIR` (a relative ultralytics
+`--project` would be re-rooted at `runs/detect/`), so training logs land in
+`task-<k>/train/` and eval logs in `evaluation_results/model_*_eval_*/val/`.
+Reruns clear these intermediate dirs first (skipped when `RESUME_CHECKPOINT` is
+set); final artifacts (`best.pt`, CSVs) are overwritten in place.
 
 ## Env knobs
 

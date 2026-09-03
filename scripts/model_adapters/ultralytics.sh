@@ -179,6 +179,13 @@ model_adapter_initialize() {
 model_adapter_prepare_task() {
     model_adapter_check_method_components
 
+    # Trainer intermediates land in $TASK_DIR (absolute --project). Drop leftovers from a
+    # previous attempt at this task so a rerun overwrites instead of accumulating
+    # train2/train3/... . Skipped when resuming: the in-training checkpoint may live there.
+    if [[ -z "$RESUME_CHECKPOINT" ]]; then
+        rm -rf "${TASK_DIR}/train" "${TASK_DIR}/interim/train"
+    fi
+
     TRAINER_ARGS=()
     WEIGHT_ARGS=()
     FREEZE_ARGS=()

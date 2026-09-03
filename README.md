@@ -142,9 +142,9 @@ bash scripts/train.sh odinw-13 13 yolov8 pseudo_label+nsgp+repre
 EPOCHS=1 END_TASK=2 bash scripts/train.sh odinw-13 13 yolov8 naive
 ```
 
-训练产物保存在 `runs/<MODEL_ID>_<DATA_TAG>_pretrained-from-<weights>_<method>/task-<k>/`（`best.pt`、EWC 的 `importance.pth`、ESPReg/NSGP 的 `pca_cache.pkl`、RePRE 的 `repre_prototypes.pt` 等）。
+训练产物保存在 `runs/<MODEL_ID>_<DATA_TAG>_pretrained-from-<weights>_<method>/task-<k>/`（`best.pt`、EWC 的 `importance.pth`、ESPReg/NSGP 的 `pca_cache.pkl`、RePRE 的 `repre_prototypes.pt` 等）。训练器中间产物（`weights/`、`results.csv`、曲线图等）保存在 `task-<k>/train/` 下，重跑同一任务前会清空重建，不会累积 `train2/train3/...`。
 
-类别空间约定：任务 `k>1` 开始时由 `tools/expand_model_head.py` 扩展检测头——既有类别的 id 与在检测头中的顺序保持不变，新数据集中未见过的类别按其 yaml 中的顺序追加在最后；若新数据集含有与既有类别同名的类别，则不新增通道，其标注由 `tools/convert_dataset_class_ids.py` 按类别名统一对齐到既有 id。训练、评估与推理用到的数据集都会先按类别名对齐到当前模型的类别空间，DDP 各 rank 加载同一扩展权重与同一转换后数据集，类别空间天然一致。
+类别空间约定：任务 `k>1` 开始时由 `tools/expand_model_head.py` 扩展检测头——既有类别的 id 与在检测头中的顺序保持不变，新数据集中未见过的类别按其 yaml 中的顺序追加在最后；若新数据集含有与既有类别同名的类别，则不新增通道，其标注由 `tools/convert_dataset_class_ids.py` 按类别名统一对齐到既有 id。训练、评估与推理用到的数据集都会先按类别名对齐到当前模型的类别空间，DDP 各 rank 加载同一扩展权重与同一转换后数据集，类别空间天然一致。此外，每个 `best.pt` 都以模块属性 `incremental_history`（`[{"task": k, "names": [...]}]`，每增量阶段一条）携带自身经历的类别空间历史：任务 1 由 `tools/train.py` 在保存时写入，后续任务由 `expand_model_head.py` 追加；评估侧因此无需假设评估用任务数据集与训练时一致。
 
 ### 3.2 评估
 
@@ -157,7 +157,7 @@ bash scripts/eval.sh --dataset voc-tiny --split 15_5 --run runs/<run>
 bash scripts/eval.sh --tasks t1.yaml t2.yaml --cumulative c1.yaml c2.yaml --run runs/<run>
 ```
 
-对每个任务的 `best.pt` 评估其已见各任务（有序列时另含累积数据集），结果写入 `<run>/evaluation_results/`：逐类指标 CSV、混淆矩阵 CSV、`individual_datasets_eval.csv`、`cumulative_datasets_eval.csv` 与按任务汇总的 mAP 表。
+对每个任务的 `best.pt` 评估其已见各任务（有序列时另含累积数据集），结果写入 `<run>/evaluation_results/`：逐类指标 CSV、混淆矩阵 CSV、`individual_datasets_eval.csv`、`cumulative_datasets_eval.csv` 与按任务汇总的 mAP 表。有累积序列时还会输出按增量阶段类别空间分别统计的 mAP 矩阵序列：`model_<k>_eval_cumulative_stage_mAP.csv`（任务 k 模型在累积测试集上、按各阶段类别空间聚合的矩阵）与汇总全部模型的 `cumulative_stage_mAP_sequence.csv`；阶段划分读取 checkpoint 自带的 `incremental_history`，不依赖评估时的任务数据集划分。评估器中间产物（`<eval>/model_*_eval_*/val/`）在每次重跑评估前清空重建。
 
 ---
 
