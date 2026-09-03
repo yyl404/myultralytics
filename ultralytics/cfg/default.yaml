@@ -178,11 +178,11 @@ reference_model: None
 
 # L2 regularization settings (naive parameter-distance penalty towards the reference model)
 l2: False # (bool) whether to use L2 regularization
-l2_loss_weight: 100.0 # (float) L2 regularization loss weight
+l2_loss_weight: 1.0 # (float) L2 regularization loss weight
 
 # ESPReg (Eigen-value Scaled Projection Regularization) settings -----------------------------------------------
 espreg: False # (bool) whether to use ESPReg
-espreg_loss_weight: 100.0 # (float) the contribution weight of ESPReg loss in total loss
+espreg_loss_weight: 1.0 # (float) the contribution weight of ESPReg loss in total loss
 pca_cache_path: None # (str, optional)
 
 # NSGP settings ----------------------------------------------------------------------------------------------------

@@ -23,15 +23,17 @@ Follow these layout rules when creating, moving, or referencing files in this re
 
 ## `scripts/` layout
 
-One entry point per action. Do **not** add per-dataset / per-model / per-method copies.
+One entry point per action. Do **not** add per-dataset / per-model / per-method
+copies. The only exception is the demo tree (`scripts/voc/tiny/15+5/`), which
+just composes the unified entry points.
 
 ```text
 scripts/
-├── train.sh                       # dataset × model × method, or --tasks yaml sequence
-├── eval.sh
-├── create.sh                      # CIL splits only
+├── train.sh                       # --tasks yaml sequence × model × method
+├── eval.sh                        # run dir × explicit eval yaml sequences
+├── create.sh                      # CIL splits only (the only --dataset/--split entry)
 ├── feature_drift.sh
-├── detect.sh                      # per-task inference dumps
+├── predict.sh                     # per-dataset inference dumps
 ├── analyze.sh
 ├── run_incremental.sh
 ├── libexec/experiment.sh          # dataset / model resolution
@@ -41,15 +43,16 @@ scripts/
 Example:
 
 ```bash
-bash scripts/train.sh voc-tiny 15_5 yolo26 pseudo_label+dist+espreg
-bash scripts/eval.sh runs/<run>
+bash scripts/train.sh --tasks t1.yaml t2.yaml --model yolo26 --method pseudo_label+dist+espreg
+bash scripts/eval.sh runs/<run> --tasks e1.yaml e2.yaml
 bash scripts/create.sh voc 15_5
 ```
 
 Rules:
 - Put **all** launch / scheduling scripts under `scripts/`.
 - Do **not** put implementation code under `scripts/`.
-- Register a new dataset or model family in `scripts/libexec/experiment.sh`, not as a new directory tree.
+- `--dataset/--split` is registered in `scripts/libexec/experiment.sh` and used
+  by `create.sh` only; train / eval / predict take explicit yaml sequences.
 - Keep eval model-agnostic: `scripts/eval.sh` takes a run directory.
 
 ## Code placement

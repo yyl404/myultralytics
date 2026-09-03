@@ -1,68 +1,71 @@
-"""Dump per-image detections, visualize boxes, and split images by GT matching.
+"""Run detection on an image directory, optionally scoring against GT labels.
 
-This script runs a trained YOLO detector on a dataset split, writes YOLO-format
-prediction txt files plus images with boxes and confidence scores, then compares
-each image against ground truth and copies results into three folders:
+This script runs a trained YOLO detector on a directory of images and writes
+YOLO-format prediction txt files plus images with boxes and confidence scores.
 
-    - correct: no false alarms and no missed GT
-    - missed: at least one unmatched GT box
-    - false_alarm: at least one unmatched prediction
+When a label directory is given, each image is additionally compared against its
+ground truth (<labels>/<image-stem>.txt; a missing file means no GT boxes):
+
+    - per-class and overall TP / FP / FN / Precision / Recall / F1 are written to
+      metrics.csv
+    - results are copied into three folders:
+        - correct: no false alarms and no missed GT
+        - missed: at least one unmatched GT box
+        - false_alarm: at least one unmatched prediction
 
 An image that has both missed boxes and false alarms is copied into both folders.
 
 Usage:
-    $ python tools/detect.py \
+    $ python tools/predict.py \
         --model <path/to/model.pt> \
-        --data <path/to/dataset.yaml> \
+        --images <path/to/image_dir> \
+        [--labels <path/to/label_dir>] \
         [--weight <path/to/weight.pt>] \
         [--device <device>] \
         [--project <project_dir>] \
         [--save_path <output_dir>] \
         [--iou_threshold <0.50>] \
-        [--split <val|test|train>] \
         [--categories <name_or_id ...>] \
         [--<additional_args> ...]
 
 Arguments:
     --model: Path to the model checkpoint file (.pt) or model configuration file (.yaml).
         Required argument.
-    --data: Path to the dataset configuration file (.yaml). Required argument.
+    --images: Directory of images to run inference on (a txt/csv list of image
+        paths also works). Required argument.
+    --labels: Optional directory with YOLO-format GT labels. When omitted, only
+        inference runs and no GT comparison is made.
     --weight: Path to the model weight file to load (.pt). Optional argument.
     --device: Device to use for inference (e.g., 'cuda', 'cpu', '0', '1').
         Default: 'cuda'.
     --project: Project directory forwarded to YOLO predict logs.
         Default: 'runs/detect'.
-    --save_path: Output directory for txt files, visualized images, and the three
-        matched folders. Default: 'detection_results'.
-    --split: Dataset split to run on ('val', 'test', or 'train'). Default: 'val'.
+    --save_path: Output directory for txt files, visualized images, metrics.csv,
+        and the three matched folders. Default: 'prediction_results'.
     --iou_threshold: IoU threshold used to match predictions with GT. This does
         not change NMS IoU (pass --iou for NMS). Default: 0.5.
     --categories: Optional class names or ids to keep. Images without these
         classes in GT or predictions are skipped. If omitted, all classes are used.
     --<additional_args>: Additional dynamic arguments passed to model.predict().
-        Examples include --imgsz, --conf, --iou, --batch, etc.
+        Examples include --imgsz, --conf, --iou, --agnostic_nms, --batch, etc.
 
 Examples:
-    $ python tools/detect.py \
-        --model runs/yolov8l_voc_inc_10_10_fromscratch_pseudo_label/task-1/best.pt \
-        --data data/VOC_inc_10_10/task_1_cls_10/dataset.yaml \
-        --device 0 \
-        --save_path det_vis \
-        --categories person car
+    $ python tools/predict.py \
+        --model runs/<run>/task-2/best.pt \
+        --images data/VOC-TINY_15+5/task_1-2_cls_20/images/test \
+        --labels data/VOC-TINY_15+5/task_1-2_cls_20/labels/test \
+        --agnostic_nms True
 
-    $ python tools/detect.py \
+    $ python tools/predict.py \
         --model best.pt \
-        --data dataset.yaml \
-        --split test \
-        --iou_threshold 0.5 \
-        --categories 14 \
-        --conf 0.25 \
-        --imgsz 640
+        --images some/images \
+        --conf 0.25
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -71,8 +74,8 @@ import cv2
 import numpy as np
 
 from ultralytics import YOLO
-from ultralytics.data.utils import IMG_FORMATS, img2label_paths
-from ultralytics.utils import LOGGER, TQDM, YAML
+from ultralytics.data.utils import IMG_FORMATS
+from ultralytics.utils import LOGGER, TQDM
 from ultralytics.utils.ops import xywhn2xyxy
 from ultralytics.utils.plotting import Annotator
 
@@ -188,28 +191,8 @@ def _tokenize_categories(raw: Optional[list]) -> list[str]:
     return tokens
 
 
-def load_inference_data(yaml_file: str, split: str) -> dict:
-    """Load class names and image paths for one split from a dataset yaml.
-
-    Unlike check_det_dataset, no 'train' key is required: inference only needs the
-    requested split. Relative split paths resolve against the yaml's 'path' key,
-    or the yaml's own directory when 'path' is absent.
-    """
-    data = YAML().load(yaml_file)
-    if "names" not in data:
-        raise SyntaxError(f"{yaml_file} 'names:' key missing ❌.")
-    if split not in data or not data[split]:
-        available = [key for key in ("train", "val", "test") if data.get(key)]
-        raise FileNotFoundError(f"Split '{split}' not found in {yaml_file}. Available: {available}")
-    root = Path(data.get("path") or Path(yaml_file).resolve().parent)
-    entries = data[split] if isinstance(data[split], list) else [data[split]]
-    resolved = [entry if Path(entry).is_absolute() else str(root / entry) for entry in entries]
-    data[split] = resolved if isinstance(data[split], list) else resolved[0]
-    return data
-
-
 def resolve_categories(raw: Optional[list], names: dict[int, str]) -> Optional[list[int]]:
-    """Map category names or ids onto dataset class ids."""
+    """Map category names or ids onto model class ids."""
     tokens = _tokenize_categories(raw)
     if not tokens:
         return None
@@ -234,7 +217,7 @@ def resolve_categories(raw: Optional[list], names: dict[int, str]) -> Optional[l
 
 
 def list_images(source: str) -> list[str]:
-    """Collect image files from a YOLO split path (directory or txt list)."""
+    """Collect image files from a directory or a txt/csv list of image paths."""
     path = Path(source)
     if path.is_dir():
         return sorted(
@@ -253,7 +236,7 @@ def list_images(source: str) -> list[str]:
             if resolved.suffix[1:].lower() in IMG_FORMATS:
                 images.append(str(resolved))
         return images
-    raise FileNotFoundError(f"Split path does not exist or is not an image source: {source}")
+    raise FileNotFoundError(f"Image source does not exist or is not an image source: {source}")
 
 
 def load_gt_boxes(
@@ -436,28 +419,59 @@ def draw_comparison(
     return np.concatenate([bar, canvas], axis=0)
 
 
-def prepare_output_dirs(save_path: Path) -> dict[str, Path]:
-    folders = {
-        FOLDER_ALL: save_path / FOLDER_ALL,
-        FOLDER_CORRECT: save_path / FOLDER_CORRECT,
-        FOLDER_MISSED: save_path / FOLDER_MISSED,
-        FOLDER_FALSE_ALARM: save_path / FOLDER_FALSE_ALARM,
-    }
+def prepare_output_dirs(save_path: Path, with_gt: bool) -> dict[str, Path]:
+    folder_names = [FOLDER_ALL]
+    if with_gt:
+        folder_names += [FOLDER_CORRECT, FOLDER_MISSED, FOLDER_FALSE_ALARM]
+    folders = {name: save_path / name for name in folder_names}
     for folder in folders.values():
         (folder / "images").mkdir(parents=True, exist_ok=True)
         (folder / "labels").mkdir(parents=True, exist_ok=True)
     return folders
 
 
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator > 0 else 0.0
+
+
+def write_metrics_csv(save_path: Path, class_counts: dict[int, list[int]], names: dict) -> None:
+    """Write per-class and overall TP/FP/FN/Precision/Recall/F1 to metrics.csv."""
+    rows = []
+    total_tp = total_fp = total_fn = 0
+    for class_id in sorted(class_counts):
+        tp, fp, fn = class_counts[class_id]
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+        rows.append((class_name(names, class_id), tp, fp, fn))
+    rows.append(("all", total_tp, total_fp, total_fn))
+
+    metrics_path = save_path / "metrics.csv"
+    with metrics_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Class", "TP", "FP", "FN", "Precision", "Recall", "F1"])
+        for name, tp, fp, fn in rows:
+            precision = _safe_ratio(tp, tp + fp)
+            recall = _safe_ratio(tp, tp + fn)
+            f1 = _safe_ratio(2 * precision * recall, precision + recall)
+            writer.writerow([name, tp, fp, fn, f"{precision:.4f}", f"{recall:.4f}", f"{f1:.4f}"])
+    print(f"Metrics saved to {metrics_path}")
+    name, tp, fp, fn = rows[-1]
+    print(
+        f"  {name}: TP={tp} FP={fp} FN={fn} "
+        f"Precision={_safe_ratio(tp, tp + fp):.4f} Recall={_safe_ratio(tp, tp + fn):.4f}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, help="Model to evaluate(.pt/.yaml)")
     parser.add_argument("--weight", type=str, default=None, help="Model weight to load(.pt)")
-    parser.add_argument("--data", type=str, help="Data config path(.yaml)")
+    parser.add_argument("--images", type=str, help="Directory of images to run inference on")
+    parser.add_argument("--labels", type=str, default=None, help="Optional directory with YOLO-format GT labels")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument("--project", type=str, default="runs/detect", help="Project name(where to save logs)")
-    parser.add_argument("--save_path", type=str, default="detection_results", help="Directory to save detection dumps")
-    parser.add_argument("--split", type=str, default="val", help="Dataset split to run on (val/test/train)")
+    parser.add_argument("--save_path", type=str, default="prediction_results", help="Directory to save prediction dumps")
     parser.add_argument(
         "--iou_threshold",
         type=float,
@@ -473,27 +487,28 @@ def main():
     args, unknown = parser.parse_known_args()
     dynamic_kwargs = parse_dynamic_named_args(unknown)
 
-    if not args.model or not args.data:
-        parser.error("--model and --data are required")
+    if not args.model or not args.images:
+        parser.error("--model and --images are required")
     if not 0.0 < args.iou_threshold <= 1.0:
         parser.error("--iou_threshold must be in (0, 1]")
 
-    split = dynamic_kwargs.pop("split", args.split)
-    data = load_inference_data(args.data, split)
-    names = data["names"]
-    class_ids = resolve_categories(args.categories, names)
+    labels_dir = Path(args.labels) if args.labels is not None else None
+    if labels_dir is not None and not labels_dir.is_dir():
+        parser.error(f"--labels directory not found: {labels_dir}")
 
-    image_files = list_images(data[split])
+    image_files = list_images(args.images)
     if not image_files:
-        raise FileNotFoundError(f"No images found in split '{split}': {data[split]}")
+        raise FileNotFoundError(f"No images found under: {args.images}")
 
     save_path = Path(args.save_path)
-    folders = prepare_output_dirs(save_path)
+    folders = prepare_output_dirs(save_path, with_gt=labels_dir is not None)
 
     model = YOLO(args.model)
     if args.weight is not None:
         # This is for loading weights of heterogeneous models while preserving the architecture of the originally initialized model
         model.load(args.weight)
+    names = model.names
+    class_ids = resolve_categories(args.categories, names)
 
     predict_kwargs = {
         "device": args.device,
@@ -511,10 +526,9 @@ def main():
         predict_kwargs["classes"] = class_ids
 
     counts = {"all": 0, "correct": 0, "missed": 0, "false_alarm": 0, "skipped": 0}
-    # Pass the split directory, not a Python list of paths. A list is treated as
-    # in-memory images and renamed to image0.jpg, image1.jpg, which breaks GT lookup.
-    results = model.predict(source=data[split], **predict_kwargs)
-    for result in TQDM(results, total=len(image_files), desc="Dumping detections"):
+    class_counts: dict[int, list[int]] = {}  # class_id -> [tp, fp, fn]
+    results = model.predict(source=args.images, **predict_kwargs)
+    for result in TQDM(results, total=len(image_files), desc="Dumping predictions"):
         image_path = Path(result.path)
         height, width = result.orig_shape[:2]
         orig_img = result.orig_img
@@ -526,16 +540,16 @@ def main():
                 continue
 
         pred_xyxy, pred_xywhn, pred_cls, pred_conf = extract_predictions(result, class_ids)
-        gt_path = Path(img2label_paths([str(image_path)])[0])
-        gt_xyxy, gt_cls = load_gt_boxes(gt_path, width, height, class_ids)
+
+        gt_xyxy = np.zeros((0, 4), dtype=np.float32)
+        gt_cls = np.zeros((0,), dtype=np.int32)
+        if labels_dir is not None:
+            gt_xyxy, gt_cls = load_gt_boxes(labels_dir / f"{image_path.stem}.txt", width, height, class_ids)
 
         if class_ids is not None and len(pred_cls) == 0 and len(gt_cls) == 0:
             counts["skipped"] += 1
             continue
 
-        tp, fp, fn = match_predictions(pred_xyxy, pred_cls, pred_conf, gt_xyxy, gt_cls, args.iou_threshold)
-        has_fp = bool(fp.any())
-        has_fn = bool(fn.any())
         vis_names = result.names if getattr(result, "names", None) else names
 
         stem = image_path.stem
@@ -547,6 +561,19 @@ def main():
         save_pair(pred_vis, txt_content, folders[FOLDER_ALL], image_name, label_name)
         counts["all"] += 1
 
+        if labels_dir is None:
+            continue
+
+        tp, fp, fn = match_predictions(pred_xyxy, pred_cls, pred_conf, gt_xyxy, gt_cls, args.iou_threshold)
+        for class_id in pred_cls[tp]:
+            class_counts.setdefault(int(class_id), [0, 0, 0])[0] += 1
+        for class_id in pred_cls[fp]:
+            class_counts.setdefault(int(class_id), [0, 0, 0])[1] += 1
+        for class_id in gt_cls[fn]:
+            class_counts.setdefault(int(class_id), [0, 0, 0])[2] += 1
+
+        has_fp = bool(fp.any())
+        has_fn = bool(fn.any())
         targets = []
         if has_fn:
             targets.append(FOLDER_MISSED)
@@ -569,17 +596,19 @@ def main():
                 copy_pair(first_image, first_label, folders[folder_name], image_name, label_name)
 
     LOGGER.info(
-        "Detection dump saved to "
+        "Prediction dump saved to "
         f"{save_path} | all={counts['all']} correct={counts['correct']} "
         f"missed={counts['missed']} false_alarm={counts['false_alarm']} skipped={counts['skipped']}"
     )
     print(f"Results saved to {save_path}")
-    print(
-        f"  {FOLDER_ALL}: {counts['all']}\n"
-        f"  {FOLDER_CORRECT}: {counts['correct']}\n"
-        f"  {FOLDER_MISSED}: {counts['missed']}\n"
-        f"  {FOLDER_FALSE_ALARM}: {counts['false_alarm']}"
-    )
+    print(f"  {FOLDER_ALL}: {counts['all']}")
+    if labels_dir is not None:
+        print(
+            f"  {FOLDER_CORRECT}: {counts['correct']}\n"
+            f"  {FOLDER_MISSED}: {counts['missed']}\n"
+            f"  {FOLDER_FALSE_ALARM}: {counts['false_alarm']}"
+        )
+        write_metrics_csv(save_path, class_counts, names)
 
 
 if __name__ == "__main__":

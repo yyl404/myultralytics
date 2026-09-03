@@ -1,17 +1,19 @@
 #!/bin/bash
-# Unified incremental eval entry. Model-agnostic: pass a finished run directory.
+# Unified incremental eval entry. Model-agnostic: pass a finished run directory
+# plus an explicit eval yaml sequence.
 #
 # Usage:
-#   bash scripts/eval.sh --run runs/<run>
-#   bash scripts/eval.sh --dataset voc-tiny --split 15_5 --run runs/<run>
-#   bash scripts/eval.sh --tasks t1.yaml t2.yaml --cumulative c1.yaml c2.yaml --run runs/<run>
-#   bash scripts/eval.sh runs/<run>
+#   bash scripts/eval.sh --run runs/<run> --tasks e1.yaml e2.yaml
+#   bash scripts/eval.sh runs/<run> --tasks e1.yaml e2.yaml --cumulative c1.yaml c2.yaml
 #
-# The yaml sequences come from (first match wins): explicit --tasks/--eval-tasks/
-# --cumulative, --dataset/--split, the run manifest written by train.sh, or the
-# run folder name. Per-task eval defaults to the train sequence; cumulative eval
-# runs only when a cumulative sequence is available (registered CIL splits always
-# have one). Cumulative results include final_cumulative_task_mAP.csv.
+# The result matrix is built strictly from what actually exists: every
+# task-k/best.pt found under the run directory x every eval yaml given. The
+# train sequence and the eval sequence do not have to match in order, kind, or
+# length. Cells whose classes are disjoint from the model's class space produce
+# empty per-class CSVs and show up as N/A in the tables.
+#
+# Per-stage task aggregation reads each checkpoint's own incremental_history
+# (tools/stage_task_map.py), never the eval yaml order.
 
 set -euo pipefail
 
@@ -22,31 +24,29 @@ source scripts/libexec/experiment.sh
 
 usage() {
     cat <<'EOF'
-Unified incremental eval. Pass a finished run directory; the yaml sequences are
-recovered from the run manifest or inferred from the folder name when not given.
+Unified incremental eval: run directory x explicit eval yaml sequence.
 
-  bash scripts/eval.sh --run runs/<run>
-  bash scripts/eval.sh --dataset voc-tiny --split 15_5 --run runs/<run>
-  bash scripts/eval.sh --tasks t1.yaml t2.yaml --run runs/<run>
-  bash scripts/eval.sh runs/<run>
+  bash scripts/eval.sh --run runs/<run> --tasks e1.yaml e2.yaml
+  bash scripts/eval.sh runs/<run> --tasks e1.yaml e2.yaml --cumulative c1.yaml c2.yaml
 
 Options:
-  --run DIR                Run directory to evaluate (also accepted positionally)
-  --dataset --split        Registered experiment identity
-  --tasks yaml [yaml ...]  Explicit train task yaml sequence
-  --eval-tasks yaml [yaml ...]   Per-task eval yamls (default: the train sequence)
-  --cumulative yaml [yaml ...]   Cumulative eval yamls, one per task (optional)
-  --tag NAME               Override the auto-derived DATA_TAG
+  --run DIR                  Run directory holding task-k/best.pt (also positional)
+  --tasks yaml [yaml ...]    Per-task eval yaml sequence (required)
+  --cumulative yaml [yaml ...]   Cumulative eval yaml sequence (optional)
+  --split auto|test|val|train    Split to evaluate on (default: auto = test, else val)
+  --iou-threshold FLOAT      Extra per-class AP IoU threshold column (e.g. 0.75)
+  --                         Extra flags forwarded to tools/eval.py (e.g. --agnostic_nms True)
+
+Env: DEVICE (default 0).
 EOF
 }
 
-DATASET=""
-SPLIT=""
 OUTPUT_DIR=""
-DATA_TAG_OVERRIDE=""
-TASK_YAMLS=()
+SPLIT="auto"
+IOU_THRESHOLD=""
 EVAL_YAMLS=()
 CUMULATIVE_YAMLS=()
+PASSTHROUGH=()
 POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
@@ -54,14 +54,6 @@ while [[ $# -gt 0 ]]; do
         -h|--help|help)
             usage
             exit 0
-            ;;
-        --dataset)
-            DATASET="${2:?}"
-            shift 2
-            ;;
-        --split)
-            SPLIT="${2:?}"
-            shift 2
             ;;
         --run|--output)
             OUTPUT_DIR="${2:?}"
@@ -71,26 +63,26 @@ while [[ $# -gt 0 ]]; do
             shift
             experiment_collect_yaml_args "$@"
             shift "$EXPERIMENT_CONSUMED"
-            TASK_YAMLS=("${EXPERIMENT_YAML_ARGS[@]}")
-            (( ${#TASK_YAMLS[@]} > 0 )) || experiment_die "--tasks needs at least one yaml"
-            ;;
-        --eval-tasks)
-            shift
-            experiment_collect_yaml_args "$@"
-            shift "$EXPERIMENT_CONSUMED"
             EVAL_YAMLS=("${EXPERIMENT_YAML_ARGS[@]}")
-            (( ${#EVAL_YAMLS[@]} > 0 )) || experiment_die "--eval-tasks needs at least one yaml"
             ;;
         --cumulative)
             shift
             experiment_collect_yaml_args "$@"
             shift "$EXPERIMENT_CONSUMED"
             CUMULATIVE_YAMLS=("${EXPERIMENT_YAML_ARGS[@]}")
-            (( ${#CUMULATIVE_YAMLS[@]} > 0 )) || experiment_die "--cumulative needs at least one yaml"
             ;;
-        --tag)
-            DATA_TAG_OVERRIDE="${2:?}"
+        --split)
+            SPLIT="${2:?}"
             shift 2
+            ;;
+        --iou-threshold|--iou_threshold)
+            IOU_THRESHOLD="${2:?}"
+            shift 2
+            ;;
+        --)
+            shift
+            PASSTHROUGH+=("$@")
+            break
             ;;
         --*)
             experiment_die "Unknown option: $1"
@@ -109,88 +101,92 @@ fi
     usage >&2
     experiment_die "Need a run directory (--run)"
 }
+(( ${#EVAL_YAMLS[@]} > 0 )) || {
+    usage >&2
+    experiment_die "Need --tasks <yaml...>"
+}
+experiment_check_yamls "${EVAL_YAMLS[@]}"
+if (( ${#CUMULATIVE_YAMLS[@]} > 0 )); then
+    experiment_check_yamls "${CUMULATIVE_YAMLS[@]}"
+fi
 # Absolute paths: a relative ultralytics --project would be re-rooted under runs/detect/.
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
-experiment_resolve_eval_dataset "$OUTPUT_DIR"
+experiment_list_model_tasks "$OUTPUT_DIR"
+MODEL_TASKS=("${EXPERIMENT_MODEL_TASKS[@]}")
 
 EVAL_OUTPUT_DIR="${OUTPUT_DIR}/evaluation_results"
-NUM_TASKS=${#TASK_DATASETS[@]}
 mkdir -p "$EVAL_OUTPUT_DIR"
 
-eval_extra=()
-if [[ -n "${EVAL_IOU_THRESHOLD:-}" ]]; then
-    eval_extra+=(--iou_threshold "$EVAL_IOU_THRESHOLD")
+eval_extra=(--device "${DEVICE:-0}")
+if [[ -n "$IOU_THRESHOLD" ]]; then
+    eval_extra+=(--iou_threshold "$IOU_THRESHOLD")
+fi
+if (( ${#PASSTHROUGH[@]} > 0 )); then
+    eval_extra+=("${PASSTHROUGH[@]}")
 fi
 
 echo "=========================================="
-echo "Incremental evaluation (${DATA_TAG}, ${INCREMENTAL_SETTING})"
+echo "Incremental evaluation"
 echo "  run     : ${OUTPUT_DIR}"
 echo "  results : ${EVAL_OUTPUT_DIR}"
-echo "  tasks   : ${NUM_TASKS}  (eval yamls: ${#EVAL_DATASETS[@]}, cumulative: ${#CUMULATIVE_DATASETS[@]})"
+echo "  models  : ${#MODEL_TASKS[@]}  eval yamls: ${#EVAL_YAMLS[@]}  cumulative: ${#CUMULATIVE_YAMLS[@]}"
+echo "  split   : ${SPLIT}"
 echo "=========================================="
 
-for model_task in $(seq 1 "$NUM_TASKS"); do
+# Evaluate one model on one dataset yaml and write the per-class CSVs.
+# Args: model_path dataset_yaml tag
+eval_one() {
+    local model_path="$1" dataset_yaml="$2" tag="$3"
+    local split
+    split="$(experiment_resolve_split "$dataset_yaml" "$SPLIT")"
+    # The ultralytics validator requires train/val keys in the data yaml, so
+    # convert every split the yaml defines, not only the evaluated one.
+    local available_splits
+    available_splits="$(experiment_yaml_splits "$dataset_yaml")"
+    local converted_dir="${EVAL_OUTPUT_DIR}/${tag}_converted"
+    python tools/convert_dataset_class_ids.py \
+        --model "$model_path" --dataset "$dataset_yaml" \
+        --output_dir "$converted_dir" --splits $available_splits
+    # Clear validator intermediates from a previous eval so reruns do not accumulate val2/val3/... .
+    rm -rf "${EVAL_OUTPUT_DIR}/${tag}"
+    python tools/eval.py \
+        --model "$model_path" --data "${converted_dir}/dataset.yaml" \
+        --save_path "${EVAL_OUTPUT_DIR}/${tag}.csv" \
+        --confusion_matrix_path "${EVAL_OUTPUT_DIR}/${tag}_confusion_matrix.csv" \
+        --project "${EVAL_OUTPUT_DIR}/${tag}" \
+        --split "$split" \
+        "${eval_extra[@]}"
+}
+
+for model_task in "${MODEL_TASKS[@]}"; do
     MODEL_PATH="${OUTPUT_DIR}/task-${model_task}/best.pt"
-    if [[ ! -f "$MODEL_PATH" ]]; then
-        echo "Warning: Model not found: $MODEL_PATH" >&2
-        continue
-    fi
     echo "=========================================="
     echo "Evaluating model from task ${model_task}"
     echo "=========================================="
-    for dataset_task in $(seq 1 "$model_task"); do
-        DATASET_PATH="${EVAL_DATASETS[$((dataset_task - 1))]}"
-        if [[ ! -f "$DATASET_PATH" ]]; then
-            echo "Warning: Dataset not found: $DATASET_PATH" >&2
-            continue
-        fi
-        CONVERTED_DATASET_DIR="${EVAL_OUTPUT_DIR}/task_${model_task}_task_${dataset_task}_converted"
-        python tools/convert_dataset_class_ids.py \
-            --model "$MODEL_PATH" --dataset "$DATASET_PATH" \
-            --output_dir "$CONVERTED_DATASET_DIR" --splits train val test
-        # Clear validator intermediates from a previous eval so reruns do not accumulate val2/val3/... .
-        rm -rf "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_task_${dataset_task}"
-        python tools/eval.py \
-            --model "$MODEL_PATH" --data "${CONVERTED_DATASET_DIR}/dataset.yaml" \
-            --device "$DEVICE" --batch 1 \
-            --save_path "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_task_${dataset_task}.csv" \
-            --confusion_matrix_path "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_task_${dataset_task}_confusion_matrix.csv" \
-            --project "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_task_${dataset_task}" \
-            "${eval_extra[@]}"
+    for dataset_index in "${!EVAL_YAMLS[@]}"; do
+        dataset_task=$((dataset_index + 1))
+        eval_one "$MODEL_PATH" "${EVAL_YAMLS[$dataset_index]}" "model_${model_task}_eval_task_${dataset_task}"
     done
-    if (( ${#CUMULATIVE_DATASETS[@]} > 0 )); then
-        CUMULATIVE_DATASET_PATH="${CUMULATIVE_DATASETS[$((model_task - 1))]}"
-        if [[ -f "$CUMULATIVE_DATASET_PATH" ]]; then
-            CUMULATIVE_CONVERTED_DIR="${EVAL_OUTPUT_DIR}/task_${model_task}_cumulative_converted"
-            python tools/convert_dataset_class_ids.py \
-                --model "$MODEL_PATH" --dataset "$CUMULATIVE_DATASET_PATH" \
-                --output_dir "$CUMULATIVE_CONVERTED_DIR" --splits train val test
-            # Clear validator intermediates from a previous eval (see above).
-            rm -rf "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_cumulative"
-            python tools/eval.py \
-                --model "$MODEL_PATH" --data "${CUMULATIVE_CONVERTED_DIR}/dataset.yaml" \
-                --device "$DEVICE" \
-                --save_path "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_cumulative.csv" \
-                --confusion_matrix_path "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_cumulative_confusion_matrix.csv" \
-                --project "${EVAL_OUTPUT_DIR}/model_${model_task}_eval_cumulative" \
-                "${eval_extra[@]}"
-        fi
-    fi
+    for dataset_index in "${!CUMULATIVE_YAMLS[@]}"; do
+        cumulative_task=$((dataset_index + 1))
+        eval_one "$MODEL_PATH" "${CUMULATIVE_YAMLS[$dataset_index]}" "model_${model_task}_eval_cumulative_${cumulative_task}"
+    done
     echo ""
 done
 
-python tools/generate_eval_tables.py \
-    --eval_dir "$EVAL_OUTPUT_DIR" --num_tasks "$NUM_TASKS" --output_dir "$EVAL_OUTPUT_DIR"
-echo "Evaluation complete. Tables under ${EVAL_OUTPUT_DIR}"
-
-if (( ${#CUMULATIVE_DATASETS[@]} > 0 )); then
-    python tools/summarize_cumulative_task_map.py \
-        --evaluation_csv "${EVAL_OUTPUT_DIR}/model_${NUM_TASKS}_eval_cumulative.csv" \
-        --task_data "${EVAL_DATASETS[@]}" \
-        --output "${EVAL_OUTPUT_DIR}/final_cumulative_task_mAP.csv"
-    # Per-stage mAP matrices on the cumulative eval, grouped by the class spaces recorded
-    # in each checkpoint's own incremental history (independent of the eval task yamls).
-    python tools/cumulative_stage_map.py \
-        --run_dir "$OUTPUT_DIR" --eval_dir "$EVAL_OUTPUT_DIR" --num_tasks "$NUM_TASKS"
+table_args=(
+    --eval_dir "$EVAL_OUTPUT_DIR"
+    --model_tasks "${MODEL_TASKS[@]}"
+    --num_eval_tasks "${#EVAL_YAMLS[@]}"
+    --output_dir "$EVAL_OUTPUT_DIR"
+)
+if (( ${#CUMULATIVE_YAMLS[@]} > 0 )); then
+    table_args+=(--num_cumulative "${#CUMULATIVE_YAMLS[@]}")
 fi
+python tools/generate_eval_tables.py "${table_args[@]}"
+
+# Per-stage task aggregation from each checkpoint's own incremental_history.
+python tools/stage_task_map.py --run_dir "$OUTPUT_DIR" --eval_dir "$EVAL_OUTPUT_DIR"
+
+echo "Evaluation complete. Tables under ${EVAL_OUTPUT_DIR}"
