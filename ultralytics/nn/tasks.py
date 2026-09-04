@@ -323,6 +323,18 @@ class BaseModel(torch.nn.Module):
 
         updated_csd = intersect_dicts(csd, self.state_dict())  # intersect
         self.load_state_dict(updated_csd, strict=False)  # load
+        # ========= MODIFIED =========
+        # `end2end`/`agnostic_nms`/`max_det` are Python attributes on the Detect head, not
+        # state_dict entries, so a yaml rebuild + weight transfer would silently revert them
+        # to the yaml defaults (yolo26 yaml says end2end=True, decoding the untrained one2one
+        # branch). Inherit them from the source model; explicit train/val/predict args still
+        # override afterwards.
+        source_head = getattr(model, "model", [None])[-1]
+        head = self.model[-1]
+        for attr in ("end2end", "agnostic_nms", "max_det"):
+            if hasattr(source_head, attr) and hasattr(head, attr):
+                setattr(head, attr, getattr(source_head, attr))
+        # ========= END MODIFIED ======
         len_updated_csd = len(updated_csd) + cls_remapped
         first_conv = "model.0.conv.weight"  # hard-coded to yolo models for now
         # mostly used to boost multi-channel training

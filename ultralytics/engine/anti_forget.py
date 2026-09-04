@@ -100,6 +100,46 @@ def _get_detect_head(model):
     raise TypeError(f"Unsupported head type: {type(head)}")
 
 
+def _apply_train_head_args(model, args):
+    """Copy train-time decode settings onto a (possibly frozen) detection model.
+
+    `Detect._end2end` and `agnostic_nms` are Python attributes, not state_dict
+    entries. A yaml-rebuilt YOLO26 head defaults to end2end=True, so a teacher
+    loaded from an expanded checkpoint would otherwise decode the untrained
+    one2one branch while the student trains one2many+NMS — which silently
+    destroys pseudo-label quality and anti-forgetting.
+    """
+    if not hasattr(model, "end2end"):
+        return
+    if getattr(args, "end2end", None) is not None:
+        model.end2end = args.end2end
+    head_kwargs = {}
+    if getattr(args, "agnostic_nms", None) is not None:
+        head_kwargs["agnostic_nms"] = args.agnostic_nms
+    if getattr(model, "end2end", False):
+        head_kwargs["max_det"] = args.max_det
+    if head_kwargs:
+        model.set_head_attr(**head_kwargs)
+
+
+def _check_teacher_decode_alignment(teacher, student, teacher_name):
+    """Fail fast if a frozen teacher's decode mode differs from the student's.
+
+    `Detect._end2end` is a Python attribute, not a state_dict entry, so a teacher
+    checkpoint can silently disagree with the current training configuration (e.g.
+    an expanded head rebuilt from a yaml whose default is end2end=True) and decode
+    the untrained one2one branch for pseudo labels instead of one2many+NMS.
+    """
+    expected = getattr(student, "end2end", None)
+    actual = getattr(teacher, "end2end", None)
+    if expected is not None and actual is not None and expected != actual:
+        raise ValueError(
+            f"{teacher_name} decode mismatch: expected end2end={expected} (current training model), "
+            f"got end2end={actual}. Pass a matching --end2end or re-generate the checkpoint with "
+            f"tools/expand_model_head.py, which copies the source head's decode attributes."
+        )
+
+
 def _get_nsgp_backbone_names(model, module_names):
     """Return PCA module names that belong to the configured YOLO backbone."""
     backbone_config = getattr(model, "yaml", {}).get("backbone")
@@ -146,7 +186,7 @@ def _extract_pca_spectra(pca_cache):
     return components, eigen_values
 
 
-def _head_raw_output_to_list(head, raw_output, img_h, img_w, conf_threshold):
+def _head_raw_output_to_list(head, raw_output, img_h, img_w, conf_threshold, agnostic_nms=False):
     """Convert head raw output to list of detections per image for merging.
     Detect: list of (num_boxes, 6) [xywhn, conf, cls].
     OBB: list of (num_boxes, 7) [xywhn, conf, cls, angle] with rotated NMS and angle preserved.
@@ -161,6 +201,7 @@ def _head_raw_output_to_list(head, raw_output, img_h, img_w, conf_threshold):
             iou_thres=0.45,
             max_det=head.max_det,
             nc=head.nc,
+            agnostic=agnostic_nms,
             rotated=True,
         )
         # pred: list of (num_boxes, 7) [xywh_px, conf, cls, angle_rad]; convert xywh to xywhn
@@ -186,6 +227,7 @@ def _head_raw_output_to_list(head, raw_output, img_h, img_w, conf_threshold):
         iou_thres=0.45,
         max_det=head.max_det,
         nc=head.nc,
+        agnostic=agnostic_nms,
     )
     base_model_pred_xywh = []
     for p in pred:
@@ -200,7 +242,7 @@ def _head_raw_output_to_list(head, raw_output, img_h, img_w, conf_threshold):
 
 
 def merge_pseudo_labels_with_gt(
-    batch, base_model, conf_threshold, filter_iou_threshold, device, base_model_pred=None
+    batch, base_model, conf_threshold, filter_iou_threshold, device, base_model_pred=None, agnostic_nms=False
 ):
     """
     Generate pseudo labels from base model and merge with GT labels, filtering by IoU.
@@ -213,6 +255,7 @@ def merge_pseudo_labels_with_gt(
         filter_iou_threshold: IoU threshold for filtering pseudo labels
         device: Device to run inference on
         base_model_pred (Optional): The prediction of base model
+        agnostic_nms (bool): Class-agnostic NMS, matching train/eval `agnostic_nms`.
     Returns:
         Modified batch dict with merged labels
     """
@@ -221,7 +264,7 @@ def merge_pseudo_labels_with_gt(
     head = _get_detect_head(base_model)
     img_h, img_w = batch['img'].shape[-2:]
     base_model_pred_list = _head_raw_output_to_list(
-        head, base_model_pred, img_h, img_w, conf_threshold
+        head, base_model_pred, img_h, img_w, conf_threshold, agnostic_nms=agnostic_nms
     )
     is_obb = isinstance(head, OBB)
     # Detect: list of (num_boxes, 6) [xywhn, conf, cls]. OBB: list of (num_boxes, 7) [xywhn, conf, cls, angle].
@@ -428,6 +471,8 @@ class AntiForgetTrainer(BaseTrainer):
         else:
             self.base_model = deepcopy(self.model).eval()
         self.base_model.requires_grad_(False)
+        _apply_train_head_args(self.base_model, self.args)
+        _check_teacher_decode_alignment(self.base_model, self.model, "reference_model")
         # ============================== END: set up base model =================================================
 
         # ============================== MODIFIED: validate distillation settings ==============================
@@ -445,6 +490,8 @@ class AntiForgetTrainer(BaseTrainer):
                 self.bpf_source_model, _ = load_checkpoint(self.args.bpf_source_model, device=self.device)
                 self.bpf_source_model = self.bpf_source_model.eval()
                 self.bpf_source_model.requires_grad_(False)
+                _apply_train_head_args(self.bpf_source_model, self.args)
+                _check_teacher_decode_alignment(self.bpf_source_model, self.model, "bpf_source_model")
                 if not isinstance(_get_detect_head(self.bpf_source_model), Detect):
                     raise TypeError("BPF source model must use a Detect head")
             if self.args.bpf_dwf:
@@ -453,6 +500,8 @@ class AntiForgetTrainer(BaseTrainer):
                 self.bpf_interim_model, _ = load_checkpoint(self.args.bpf_interim_model, device=self.device)
                 self.bpf_interim_model = self.bpf_interim_model.eval()
                 self.bpf_interim_model.requires_grad_(False)
+                _apply_train_head_args(self.bpf_interim_model, self.args)
+                _check_teacher_decode_alignment(self.bpf_interim_model, self.model, "bpf_interim_model")
                 if not isinstance(_get_detect_head(self.bpf_interim_model), Detect):
                     raise TypeError("BPF interim model must use a Detect head")
             if self.args.bpf_dwf and self.args.distillation:
@@ -737,6 +786,7 @@ class AntiForgetTrainer(BaseTrainer):
                             self.args.filter_iou_threshold,
                             self.device,
                             base_model_pred,
+                            agnostic_nms=self.args.agnostic_nms,
                         )
                     # ============================== END: generate pseudo labels ====================================
 

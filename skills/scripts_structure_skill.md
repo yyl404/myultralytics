@@ -76,6 +76,21 @@ name (`tools/convert_dataset_class_ids.py`), never duplicated. Task, eval, and
 replay datasets are converted into the current model's class-id space by name
 before training/eval/predict, so every DDP rank shares the same class space.
 
+Decode-config consistency: `end2end` / `agnostic_nms` / `max_det` are Python
+attributes on the Detect head, not state_dict entries, so any yaml rebuild
+(`yolo26*.yaml` defaults to `end2end: True`) would silently revert them. The
+pipeline keeps them consistent everywhere: head expansion copies all three from
+the source checkpoint's head onto the expanded model; every "yaml rebuild +
+weight transfer" path (trainer `setup_model`, the pre-build inside
+`Model.train`, the distillation teacher rebuild) inherits them from the source
+model in `BaseModel.load` (`ultralytics/nn/tasks.py`), and explicit train args
+still win afterwards in `set_model_attributes`; the AntiForget/BPF frozen
+teacher and reference models get the current train args applied via
+`_apply_train_head_args` (`ultralytics/engine/anti_forget.py`) and a
+teacher/student `end2end` mismatch raises immediately with expected vs actual.
+Eval/predict use the checkpoint's pickled attributes unless explicit args are
+passed through `--`.
+
 Every `best.pt` also carries its incremental history as a module attribute
 `incremental_history` (`[{"task": k, "names": [...]}]`, one entry per stage):
 task 1 is stamped by `tools/train.py` at save time, later stages are appended by

@@ -160,6 +160,8 @@ EPOCHS=1 END_TASK=2 bash scripts/train.sh --tasks data/OdinW-13-yolo/*/data.yaml
 
 类别空间约定：任务 `k>1` 开始时由 `tools/expand_model_head.py` 扩展检测头——既有类别的 id 与在检测头中的顺序保持不变，新数据集中未见过的类别按其 yaml 中的顺序追加在最后；若新数据集含有与既有类别同名的类别，则不新增通道，其标注由 `tools/convert_dataset_class_ids.py` 按类别名统一对齐到既有 id。训练、评估与推理用到的数据集都会先按类别名对齐到当前模型的类别空间，DDP 各 rank 加载同一扩展权重与同一转换后数据集，类别空间天然一致。此外，每个 `best.pt` 都以模块属性 `incremental_history`（`[{"task": k, "names": [...]}]`，每增量阶段一条）携带自身经历的类别空间历史：任务 1 由 `tools/train.py` 在保存时写入，后续任务由 `expand_model_head.py` 追加；评估侧因此无需假设评估用任务数据集与训练时一致。
 
+解码配置一致性：`end2end` / `agnostic_nms` / `max_det` 是 Detect 头上的 Python 属性，不在 state_dict 中；从 yaml 重建检测头会回落到 yaml 默认值（`yolo26*.yaml` 为 `end2end=True`），若不加处理，扩展后的模型会静默改走未训练的 one2one 分支（伪标签、抗遗忘随之失效）。管线各环节以「当前阶段实际生效的训练/评估参数 + 上一阶段 checkpoint 保存的属性」为准：`tools/expand_model_head.py` 扩头时把源模型检测头的这三个属性随权重一起复制到扩展模型；所有"yaml 重建 + 权重迁移"的路径（训练器 `setup_model`、`Model.train` 内部预重建、蒸馏教师重建）经 `BaseModel.load`（`ultralytics/nn/tasks.py`）从源模型继承这些属性，显式传入的 `--end2end` 等训练参数仍在其后优先生效；AntiForget/BPF 的冻结教师与参考模型加载后套用当前训练参数（`ultralytics/engine/anti_forget.py` 的 `_apply_train_head_args`），且教师的 `end2end` 与学生不一致时立即报错（给出期望 vs 实际），不会静默回退到 yaml 默认。评估与推理沿用 checkpoint 中保存的属性，经 `--` 显式透传的 `--end2end` / `--agnostic_nms` / `--max_det` 优先。
+
 ### 3.2 评估
 
 传入训练 run 目录 + 显式评估 yaml 序列（评估不读训练产物中的任何数据清单，序列完全由评估命令决定）：
@@ -266,7 +268,7 @@ bash scripts/analyze.sh confusion_matrix \
 ## 5. 测试与代码结构
 
 ```bash
-pytest tests/test_bpf.py tests/test_ewc.py
+pytest tests/test_anti_forget.py tests/test_bpf.py tests/test_ewc.py
 ```
 
 仓库结构与重构记录见 [REFACTORING.md](REFACTORING.md)；脚本目录规范见 [skills/scripts_structure_skill.md](skills/scripts_structure_skill.md)；项目设计文档与实验记录归档在 [docs/project/](docs/project/)。

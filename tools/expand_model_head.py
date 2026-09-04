@@ -142,6 +142,14 @@ def expand_detection_head(ckpt_path, model_cfg, channel_map, classes_names, save
                 new_weight[key] = weight[key].clone()
 
     new_model.model.load_state_dict(new_weight)
+    # `_end2end` / `agnostic_nms` / `max_det` live on the Detect head as Python attributes,
+    # not in the state_dict. A yaml-rebuilt YOLO26 head defaults to end2end=True, so without
+    # copying them the expanded model (and any teacher loaded from it) would decode the
+    # untrained one2one branch instead of the one2many+NMS path the source model used.
+    new_model.model.end2end = model.model.end2end
+    src_head, dst_head = model.model.model[-1], new_model.model.model[-1]
+    dst_head.agnostic_nms = src_head.agnostic_nms
+    dst_head.max_det = src_head.max_det
     new_model.model.names = {k: v for k, v in enumerate(classes_names)}
     new_model.model.incremental_history = incremental_history
     new_model.save(OSP.join(save_dir, output_name))
