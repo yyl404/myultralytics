@@ -76,7 +76,7 @@ OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`
 - **训练**：`--tasks` 增量训练数据集序列（每任务一个 yaml，必需）；
 - **评估**：`--tasks` 单任务评估数据集序列（必需）+ `--cumulative` 累积评估数据集序列（可选，不提供则不做累积评估）。
 
-训练序列与评估序列不必相同，也不必等长：评估矩阵严格按 run 目录里实际的 `task-*/best.pt` 数量 × 实际给定的评估 yaml 数量构建（全 cross product）。`train.sh` / `eval.sh` / `predict.sh` / `feature_drift.sh` 均接受 `--tasks`（单个逗号分隔参数也可以）。
+训练序列与评估序列不必相同，也不必等长：评估矩阵严格按 run 目录里实际的 `task-*/best.pt` 数量 × 实际给定的评估 yaml 数量构建（全 cross product）。`train.sh` / `eval.sh` / `predict.sh` / `feature_drift.sh` / `dataset_similarity.sh` 均接受 `--tasks`（单个逗号分隔参数也可以）。
 
 ### 2.4 预训练权重
 
@@ -105,13 +105,14 @@ bash scripts/voc/tiny/15+5/pipeline.sh   # 训练 → 评估 → 有标签推理
 bash scripts/voc/tiny/15+5/train.sh
 bash scripts/voc/tiny/15+5/eval.sh
 bash scripts/voc/tiny/15+5/predict.sh
+bash scripts/voc/tiny/15+5/similarity.sh   # 任务序列的 N x N 图像域特征相似度（无需训练产物）
 
 # 环境变量覆盖示例（冒烟调试 / 临时换设置，无需改文件）
 EPOCHS=1 MODEL=yolo26x RUN_DIR=runs/smoke bash scripts/voc/tiny/15+5/pipeline.sh
 TASK_YAMLS="data/A/t1.yaml data/A/t2.yaml" bash scripts/voc/tiny/15+5/train.sh
 ```
 
-约定：`yolo26m` + `yoloe-26m-seg.pt` 预训练；训练 / 评估 / 推理均开启 NMS 且为 `agnostic_nms`；评估与推理按任务数据集、任务累积数据集的顺序，对各 yaml 的 `test` 分割运行（无 `test` 则用 `val`）。
+约定：`yolo26m` + `yoloe-26m-seg.pt` 预训练；解码 / NMS 模式是 `common.sh` 中醒目列出的旋钮——`END2END`（默认 `False`，one2many + NMS）、`AGNOSTIC_NMS`（默认 `True`）、`MAX_DET`（默认 `300`），经 `DECODE_ARGS` 统一透传到训练 / 评估 / 推理三个环节，改默认值只改 `common.sh` 一处；评估与推理按任务数据集、任务累积数据集的顺序，对各 yaml 的 `test` 分割运行（无 `test` 则用 `val`）；`similarity.sh` 的骨干权重为 `SIMILARITY_WEIGHTS`（默认取 `WEIGHTS`，即 `yoloe-26m-seg.pt`）。
 
 ### 3.1 训练
 
@@ -205,7 +206,17 @@ bash scripts/feature_drift.sh --tasks t1.yaml t2.yaml \
     --model1 runs/<run>/task-1/best.pt --model2 runs/<run>/task-2/best.pt
 ```
 
-### 4.2 其余分析工具（统一入口 `scripts/analyze.sh`）
+### 4.2 数据集间图像域特征相似度（dataset similarity）
+
+用预训练模型 backbone（最后一个 stride-32 尺度，SPPF 输出）提取各数据集图像的深度特征：每张图像经全局平均池化得到一个特征向量，数据集特征取全体图像的均值，再计算 N 个数据集两两之间的余弦相似度矩阵（打印到终端并保存 CSV）：
+
+```bash
+# 权重默认 yoloe-26m-seg.pt，可用 --weights 更改；数据集序列任意
+bash scripts/dataset_similarity.sh --tasks t1.yaml t2.yaml [t3.yaml ...]
+bash scripts/dataset_similarity.sh --tasks t1.yaml t2.yaml --weights yolo26x.pt --save-path out/sim.csv
+```
+
+### 4.3 其余分析工具（统一入口 `scripts/analyze.sh`）
 
 ```bash
 bash scripts/analyze.sh <analysis> [工具参数...]

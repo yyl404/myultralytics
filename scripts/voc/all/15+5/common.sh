@@ -9,7 +9,7 @@
 #   EPOCHS=1 MODEL=yolo26x RUN_DIR=runs/smoke bash <this-dir>/pipeline.sh
 #   TASK_YAMLS="data/A/t1.yaml data/A/t2.yaml" bash <this-dir>/train.sh
 
-DATA_ROOT="${DATA_ROOT:-data/VOC-TINY_15+5}"
+DATA_ROOT="${DATA_ROOT:-data/VOC_15+5}"
 
 # Incremental task datasets, one yaml per task, in task order.
 if [[ -z "${TASK_YAMLS:-}" ]]; then
@@ -27,7 +27,7 @@ read -ra CUMULATIVE_YAMLS <<< "$CUMULATIVE_YAMLS"
 MODEL="${MODEL:-yolo26m}"
 WEIGHTS="${WEIGHTS:-yoloe-26m-seg.pt}"
 METHOD="${METHOD:-naive}"
-DATA_TAG="${DATA_TAG:-VOC-TINY_15+5}"
+DATA_TAG="${DATA_TAG:-VOC_15+5}"
 # Default output dir is composed from the identity above (same naming rule as
 # scripts/train.sh); override RUN_DIR to use a fixed location instead.
 if [[ -z "${RUN_DIR:-}" ]]; then

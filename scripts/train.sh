@@ -22,7 +22,7 @@
 # afterwards with scripts/eval.sh on any yaml sequence.
 #
 # Env: EPOCHS, BATCH_SIZE, IMGSZ, WORKERS, DEVICE, START_TASK, END_TASK,
-#      DIST_LOSS_WEIGHT, DIST_TOPK, ESPREG_LOSS_WEIGHT,
+#      DIST_LOSS_WEIGHT, DIST_TOPK, ESPREG_LOSS_WEIGHT, END2END (yolo26 hyps),
 #      YOLO26_DEFAULT_HYPS=0 to disable yolo26 hyps.
 
 set -euo pipefail
@@ -49,7 +49,7 @@ Options:
   --                                   Extra flags forwarded to tools/train.py
 
 Env: EPOCHS, BATCH_SIZE, IMGSZ, WORKERS, DEVICE, START_TASK, END_TASK,
-     DIST_LOSS_WEIGHT, DIST_TOPK, ESPREG_LOSS_WEIGHT,
+     DIST_LOSS_WEIGHT, DIST_TOPK, ESPREG_LOSS_WEIGHT, END2END (yolo26 hyps),
      YOLO26_DEFAULT_HYPS=0 to disable yolo26 hyps.
 EOF
     echo ""

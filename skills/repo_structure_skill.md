@@ -33,6 +33,7 @@ scripts/
 ├── eval.sh                        # run dir × explicit eval yaml sequences
 ├── create.sh                      # CIL splits only (the only --dataset/--split entry)
 ├── feature_drift.sh
+├── dataset_similarity.sh
 ├── predict.sh                     # per-dataset inference dumps
 ├── analyze.sh
 ├── run_incremental.sh
