@@ -95,7 +95,7 @@ OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`
 
 ### 3.0 快速上手：VOC-TINY 15+5 示范
 
-`scripts/voc/tiny/15+5/` 提供一条龙管线与各环节的独立脚本（参数集中在 `common.sh`，迁移到其它增量数据集只需改这一个文件；所有参数也可用**同名环境变量**临时覆盖，列表参数用空格分隔字符串）：
+`scripts/voc/tiny/15+5/` 提供一条龙管线与各环节的独立脚本（参数集中在 `common.sh`，迁移到其它增量数据集只需改文件开头的数据集块：`DATA_ROOT` / `DATA_TAG` 与三个数据集序列 `TRAIN_YAMLS` / `EVAL_YAMLS` / `CUMULATIVE_YAMLS`，各数据集与划分下的 `common.sh` 只有这一块不同；数据集序列只能在配置文件中修改，不接受环境变量或命令行覆盖，其余标量参数仍可用**同名环境变量**临时覆盖）：
 
 ```bash
 # 前置：数据集已就绪（否则先 bash scripts/create.sh voc-tiny 15_5）
@@ -105,14 +105,13 @@ bash scripts/voc/tiny/15+5/pipeline.sh   # 训练 → 评估 → 有标签推理
 bash scripts/voc/tiny/15+5/train.sh
 bash scripts/voc/tiny/15+5/eval.sh
 bash scripts/voc/tiny/15+5/predict.sh
-bash scripts/voc/tiny/15+5/similarity.sh   # 任务序列的 N x N 图像域特征相似度（无需训练产物）
+bash scripts/voc/tiny/15+5/similarity.sh   # 训练序列的 N x N 图像域特征相似度（无需训练产物）
 
-# 环境变量覆盖示例（冒烟调试 / 临时换设置，无需改文件）
+# 环境变量覆盖示例（冒烟调试 / 临时换设置，无需改文件；仅标量，数据集序列除外）
 EPOCHS=1 MODEL=yolo26x RUN_DIR=runs/smoke bash scripts/voc/tiny/15+5/pipeline.sh
-TASK_YAMLS="data/A/t1.yaml data/A/t2.yaml" bash scripts/voc/tiny/15+5/train.sh
 ```
 
-约定：`yolo26m` + `yoloe-26m-seg.pt` 预训练；解码 / NMS 模式是 `common.sh` 中醒目列出的旋钮——`END2END`（默认 `False`，one2many + NMS）、`AGNOSTIC_NMS`（默认 `True`）、`MAX_DET`（默认 `300`），经 `DECODE_ARGS` 统一透传到训练 / 评估 / 推理三个环节，改默认值只改 `common.sh` 一处；评估与推理按任务数据集、任务累积数据集的顺序，对各 yaml 的 `test` 分割运行（无 `test` 则用 `val`）；`similarity.sh` 的骨干权重为 `SIMILARITY_WEIGHTS`（默认取 `WEIGHTS`，即 `yoloe-26m-seg.pt`）。
+约定：`yolo26m` + `yoloe-26m-seg.pt` 预训练；三个数据集序列完全解耦——`train.sh` 只在 `TRAIN_YAMLS` 上增量训练，`eval.sh` / `predict.sh` 依次在独立评估序列 `EVAL_YAMLS` 与累积评估序列 `CUMULATIVE_YAMLS`（置为 `()` 则跳过累积评估）上运行，三者内容、顺序、长度互不必一致；对各 yaml 的 `test` 分割运行（无 `test` 则用 `val`）；解码 / NMS 模式是 `common.sh` 中醒目列出的旋钮——`END2END`（默认 `False`，one2many + NMS）、`AGNOSTIC_NMS`（默认 `True`）、`MAX_DET`（默认 `300`），经 `DECODE_ARGS` 统一透传到训练 / 评估 / 推理三个环节，改默认值只改 `common.sh` 一处；`similarity.sh` 的骨干权重为 `SIMILARITY_WEIGHTS`（默认取 `WEIGHTS`，即 `yoloe-26m-seg.pt`）。
 
 ### 3.1 训练
 

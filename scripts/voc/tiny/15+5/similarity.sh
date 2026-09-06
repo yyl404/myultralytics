@@ -1,6 +1,6 @@
 #!/bin/bash
 # Demo similarity stage: N x N image-domain deep-feature similarity matrix
-# across the task yaml sequence, computed with a frozen pretrained backbone.
+# across the TRAIN_YAMLS sequence, computed with a frozen pretrained backbone.
 # Runs standalone (no trained checkpoint needed). Tunables live in common.sh.
 
 set -euo pipefail
@@ -19,14 +19,14 @@ fi
 cd "$REPO_ROOT"
 source "$DEMO_DIR/common.sh"
 
-for yaml in "${TASK_YAMLS[@]}"; do
+for yaml in "${TRAIN_YAMLS[@]}"; do
     if [[ ! -f "$yaml" ]]; then
-        echo "Task yaml not found: $yaml" >&2
-        echo "Create the dataset first, or fix TASK_YAMLS in common.sh" >&2
+        echo "Train yaml not found: $yaml" >&2
+        echo "Create the dataset first, or fix TRAIN_YAMLS in common.sh" >&2
         exit 1
     fi
 done
 
 bash scripts/dataset_similarity.sh \
-    --tasks "${TASK_YAMLS[@]}" \
+    --tasks "${TRAIN_YAMLS[@]}" \
     --weights "$SIMILARITY_WEIGHTS"

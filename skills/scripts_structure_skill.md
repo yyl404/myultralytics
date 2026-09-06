@@ -136,24 +136,30 @@ A minimal end-to-end example and the template for new incremental datasets:
 
 ```text
 scripts/voc/tiny/15+5/
-├── common.sh       # the ONLY file to edit when migrating: yaml sequences,
-│                   # model/weights/method, RUN_DIR, decode knobs (END2END /
-│                   # AGNOSTIC_NMS / MAX_DET), EXTRA_*_ARGS, EPOCHS, DEVICE
-├── train.sh        # checks yamls exist (hint: create the dataset), then scripts/train.sh
-├── eval.sh         # scripts/eval.sh on the task + cumulative sequences
-├── predict.sh      # scripts/predict.sh on the same sequences (labeled inference)
-├── similarity.sh   # scripts/dataset_similarity.sh on the task sequence (standalone)
+├── common.sh       # the ONLY file to edit when migrating, and only its first
+│                   # block: DATA_ROOT / DATA_TAG plus the three yaml sequences
+│                   # TRAIN_YAMLS (incremental train), EVAL_YAMLS (independent
+│                   # eval), CUMULATIVE_YAMLS (cumulative eval, () to skip)
+├── train.sh        # checks TRAIN_YAMLS exist (hint: create the dataset), then scripts/train.sh
+├── eval.sh         # scripts/eval.sh on EVAL_YAMLS + CUMULATIVE_YAMLS
+├── predict.sh      # scripts/predict.sh on the same two sequences (labeled inference)
+├── similarity.sh   # scripts/dataset_similarity.sh on TRAIN_YAMLS (standalone)
 └── pipeline.sh     # train → eval → predict
 ```
 
 The stage scripts resolve their own directory at runtime (`DEMO_DIR`) and walk
 up to the repo root (the directory holding `scripts/train.sh`), so copying the
 whole folder to any depth under the repo gives a working demo for a new
-dataset: edit only the copied `common.sh`. Every `common.sh` value can also be
-overridden per launch with an environment variable of the same name (lists as
-space-separated strings), e.g.
-`EPOCHS=1 RUN_DIR=runs/smoke bash <dir>/pipeline.sh` or
-`TASK_YAMLS="t1.yaml t2.yaml" bash <dir>/train.sh`.
+dataset. Every demo copy under `scripts/` (voc-tiny / voc, 15+5 / joint)
+shares byte-identical stage scripts, and their `common.sh` files differ only
+in the first dataset block — migrate by editing just that block. The three
+yaml sequences are plain bash arrays read from `common.sh` only (no
+environment or command-line override); the train, independent-eval, and
+cumulative-eval sequences are fully decoupled and may differ in content,
+order, and length. The scalar knobs further down (`MODEL`, `WEIGHTS`,
+`METHOD`, `RUN_DIR`, decode knobs, `EXTRA_*_ARGS`, `EPOCHS`, `DEVICE`) can
+still be overridden per launch with an environment variable of the same name,
+e.g. `EPOCHS=1 RUN_DIR=runs/smoke bash <dir>/pipeline.sh`.
 
 Conventions demonstrated: `yolo26m` + `yoloe-26m-seg.pt`; decode modes
 (`end2end` / `agnostic_nms` / `max_det`) are prominent knobs in `common.sh`
@@ -161,8 +167,8 @@ Conventions demonstrated: `yolo26m` + `yoloe-26m-seg.pt`; decode modes
 forwarded to train/eval/predict via `DECODE_ARGS` in every `EXTRA_*_ARGS`;
 small-data hyps (AdamW, lr0, mosaic, freeze) passed explicitly after `--` via
 `EXTRA_TRAIN_ARGS` in `common.sh`; eval/predict on the `test` split (`val`
-fallback) in per-task then cumulative order; `similarity.sh` runs the N x N
-dataset image-domain feature similarity on the task sequence with the
+fallback) in EVAL_YAMLS then CUMULATIVE_YAMLS order; `similarity.sh` runs the
+N x N dataset image-domain feature similarity on TRAIN_YAMLS with the
 pretrained backbone (`SIMILARITY_WEIGHTS`, defaults to `WEIGHTS`).
 
 ## Dataset / split resolution (`libexec/experiment.sh`, create.sh only)
@@ -327,7 +333,8 @@ five functions.
 
 1. No repo change needed: pass `--tasks` to `train.sh`, and any (possibly
    different) `--tasks` / `--cumulative` sequences to `eval.sh` / `predict.sh`.
-2. Copy `scripts/voc/tiny/15+5/` as a starting point and edit `common.sh`.
+2. Copy `scripts/voc/tiny/15+5/` as a starting point and edit only the dataset
+   block of the copied `common.sh`.
 
 ## Checklist: adding a new method
 

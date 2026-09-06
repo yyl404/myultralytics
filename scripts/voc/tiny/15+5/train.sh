@@ -1,5 +1,5 @@
 #!/bin/bash
-# Demo train stage: incremental training on the task yaml sequence.
+# Demo train stage: incremental training on the TRAIN_YAMLS sequence.
 # Produces task-1, task-2, ... under RUN_DIR. Tunables live in common.sh.
 
 set -euo pipefail
@@ -18,16 +18,16 @@ fi
 cd "$REPO_ROOT"
 source "$DEMO_DIR/common.sh"
 
-for yaml in "${TASK_YAMLS[@]}"; do
+for yaml in "${TRAIN_YAMLS[@]}"; do
     if [[ ! -f "$yaml" ]]; then
-        echo "Task yaml not found: $yaml" >&2
-        echo "Create the dataset first, or fix TASK_YAMLS in common.sh" >&2
+        echo "Train yaml not found: $yaml" >&2
+        echo "Create the dataset first, or fix TRAIN_YAMLS in common.sh" >&2
         exit 1
     fi
 done
 
 bash scripts/train.sh \
-    --tasks "${TASK_YAMLS[@]}" \
+    --tasks "${TRAIN_YAMLS[@]}" \
     --model "$MODEL" \
     --method "$METHOD" \
     --weights "$WEIGHTS" \

@@ -1,6 +1,7 @@
 #!/bin/bash
-# Demo eval stage: evaluate every task-k/best.pt under RUN_DIR on the task
-# datasets and the cumulative datasets (test split, val if absent).
+# Demo eval stage: evaluate every task-k/best.pt under RUN_DIR on the
+# independent eval sequence (EVAL_YAMLS) and the cumulative eval sequence
+# (CUMULATIVE_YAMLS, skipped when empty); test split, val if absent.
 # Produces RUN_DIR/evaluation_results. Tunables live in common.sh.
 
 set -euo pipefail
@@ -25,9 +26,8 @@ if [[ ! -d "$RUN_DIR" ]]; then
     exit 1
 fi
 
-bash scripts/eval.sh \
-    --run "$RUN_DIR" \
-    --tasks "${TASK_YAMLS[@]}" \
-    --cumulative "${CUMULATIVE_YAMLS[@]}" \
-    -- \
-    "${EXTRA_EVAL_ARGS[@]}"
+eval_args=(--run "$RUN_DIR" --tasks "${EVAL_YAMLS[@]}")
+if (( ${#CUMULATIVE_YAMLS[@]} > 0 )); then
+    eval_args+=(--cumulative "${CUMULATIVE_YAMLS[@]}")
+fi
+bash scripts/eval.sh "${eval_args[@]}" -- "${EXTRA_EVAL_ARGS[@]}"

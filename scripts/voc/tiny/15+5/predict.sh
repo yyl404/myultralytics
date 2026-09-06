@@ -1,8 +1,9 @@
 #!/bin/bash
-# Demo predict stage: labeled inference with PREDICT_MODEL on the task datasets
-# and the cumulative datasets (test split, val if absent), in the same order as
-# eval. Produces RUN_DIR/predictions (per-dataset metrics.csv plus TP/FP/FN
-# visualizations). Tunables live in common.sh.
+# Demo predict stage: labeled inference with PREDICT_MODEL on the independent
+# eval sequence (EVAL_YAMLS) and the cumulative eval sequence
+# (CUMULATIVE_YAMLS, skipped when empty), in the same order as eval; test
+# split, val if absent. Produces RUN_DIR/predictions (per-dataset metrics.csv
+# plus TP/FP/FN visualizations). Tunables live in common.sh.
 
 set -euo pipefail
 
@@ -26,10 +27,8 @@ if [[ ! -f "$PREDICT_MODEL" ]]; then
     exit 1
 fi
 
-bash scripts/predict.sh \
-    --model "$PREDICT_MODEL" \
-    --tasks "${TASK_YAMLS[@]}" \
-    --cumulative "${CUMULATIVE_YAMLS[@]}" \
-    --save-path "$RUN_DIR/predictions" \
-    -- \
-    "${EXTRA_PREDICT_ARGS[@]}"
+predict_args=(--model "$PREDICT_MODEL" --tasks "${EVAL_YAMLS[@]}" --save-path "$RUN_DIR/predictions")
+if (( ${#CUMULATIVE_YAMLS[@]} > 0 )); then
+    predict_args+=(--cumulative "${CUMULATIVE_YAMLS[@]}")
+fi
+bash scripts/predict.sh "${predict_args[@]}" -- "${EXTRA_PREDICT_ARGS[@]}"

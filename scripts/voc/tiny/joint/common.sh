@@ -22,12 +22,11 @@
 #   CUMULATIVE_YAMLS   cumulative EVAL sequence (optional); set to () to skip
 #                      cumulative evaluation (eval.sh / predict.sh)
 # ============================================================================
-DATA_ROOT="data/VOC-TINY_15+5"
-DATA_TAG="VOC-TINY_15+5"
+DATA_ROOT="data/VOC-TINY-YOLO"
+DATA_TAG="VOC_15+5"
 
 TRAIN_YAMLS=(
-    "$DATA_ROOT/task_1_cls_15/dataset.yaml"
-    "$DATA_ROOT/task_2_cls_5/dataset.yaml"
+    "$DATA_ROOT/VOC.yaml"
 )
 EVAL_YAMLS=(
     "$DATA_ROOT/task_1_cls_15/dataset.yaml"
