@@ -542,3 +542,33 @@ class DetectionValidator(BaseValidator):
             except Exception as e:
                 LOGGER.warning(f"faster-coco-eval unable to run: {e}")
         return stats
+
+
+class ClassAgnosticDetectionValidator(DetectionValidator):
+    """Detection validator that scores every detection against a single `object` class.
+
+    Forces `single_cls` semantics: NMS becomes class-agnostic and each kept detection carries the per-location
+    maximum over the model's classification channels as its objectness confidence, with the class index zeroed
+    before matching. Ground-truth labels are expected to be mapped to the single class id 0 (see
+    tools/convert_dataset_class_ids.py --class_agnostic). Metrics, outputs, and artifacts are identical in shape
+    to the class-aware protocol.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        """Initialize the validator with `single_cls` forced on."""
+        super().__init__(*args, **kwargs)
+        self.args.single_cls = True
+
+    def init_metrics(self, model: torch.nn.Module) -> None:
+        """Initialize metrics over the single `object` class instead of the model's class space.
+
+        Args:
+            model (torch.nn.Module): Model to validate.
+        """
+        super().init_metrics(model)
+        self.names = {0: "object"}
+        self.nc = 1
+        self.metrics.names = self.names
+        self.confusion_matrix = ConfusionMatrix(
+            names=self.names, save_matches=self.args.plots and self.args.visualize
+        )

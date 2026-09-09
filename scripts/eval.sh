@@ -12,8 +12,15 @@
 # length. Cells whose classes are disjoint from the model's class space produce
 # empty per-class CSVs and show up as N/A in the tables.
 #
-# Per-stage task aggregation reads each checkpoint's own incremental_history
-# (tools/stage_task_map.py), never the eval yaml order.
+# Every cell is evaluated under two protocols: the class-aware protocol
+# (model_<k>_eval_<tag>.csv) and, unless CLASS_AGNOSTIC_EVAL=0, the
+# class-agnostic protocol (model_<k>_eval_<tag>_object.csv), which collapses
+# all classification channels into a per-location max objectness confidence and
+# maps every dataset class to a single 'object' class.
+#
+# Per-stage task aggregation groups each cell's per-class rows by the class
+# spaces of the --tasks eval yaml sequence (tools/stage_task_map.py): stage j
+# is the class space of the j-th eval yaml.
 
 set -euo pipefail
 
@@ -37,7 +44,8 @@ Options:
   --iou-threshold FLOAT      Extra per-class AP IoU threshold column (e.g. 0.75)
   --                         Extra flags forwarded to tools/eval.py (e.g. --agnostic_nms True)
 
-Env: DEVICE (default 0).
+Env: DEVICE (default 0), CLASS_AGNOSTIC_EVAL (default 1; set 0 to skip the
+     class-agnostic 'object' protocol pass).
 EOF
 }
 
@@ -126,18 +134,24 @@ if (( ${#PASSTHROUGH[@]} > 0 )); then
     eval_extra+=("${PASSTHROUGH[@]}")
 fi
 
+CLASS_AGNOSTIC_EVAL="${CLASS_AGNOSTIC_EVAL:-1}"
+
 echo "=========================================="
 echo "Incremental evaluation"
 echo "  run     : ${OUTPUT_DIR}"
 echo "  results : ${EVAL_OUTPUT_DIR}"
 echo "  models  : ${#MODEL_TASKS[@]}  eval yamls: ${#EVAL_YAMLS[@]}  cumulative: ${#CUMULATIVE_YAMLS[@]}"
-echo "  split   : ${SPLIT}"
+echo "  split   : ${SPLIT}  class-agnostic: $([[ "$CLASS_AGNOSTIC_EVAL" == "1" ]] && echo on || echo off)"
 echo "=========================================="
 
 # Evaluate one model on one dataset yaml and write the per-class CSVs.
-# Args: model_path dataset_yaml tag
+# Args: model_path dataset_yaml tag class_agnostic(0|1)
+# With class_agnostic=1 the dataset is converted to a single 'object' class
+# (no model alignment needed) and tools/eval.py runs the class-agnostic
+# protocol: per-location max over all classification channels as objectness
+# confidence, identical metrics and CSV shape.
 eval_one() {
-    local model_path="$1" dataset_yaml="$2" tag="$3"
+    local model_path="$1" dataset_yaml="$2" tag="$3" class_agnostic="$4"
     local split
     split="$(experiment_resolve_split "$dataset_yaml" "$SPLIT")"
     # The ultralytics validator requires train/val keys in the data yaml, so
@@ -145,18 +159,22 @@ eval_one() {
     local available_splits
     available_splits="$(experiment_yaml_splits "$dataset_yaml")"
     local converted_dir="${EVAL_OUTPUT_DIR}/${tag}_converted"
-    python tools/convert_dataset_class_ids.py \
-        --model "$model_path" --dataset "$dataset_yaml" \
-        --output_dir "$converted_dir" --splits $available_splits
+    local convert_args=(--dataset "$dataset_yaml" --output_dir "$converted_dir" --splits $available_splits)
+    local eval_args=(--model "$model_path" --data "${converted_dir}/dataset.yaml"
+        --save_path "${EVAL_OUTPUT_DIR}/${tag}.csv"
+        --confusion_matrix_path "${EVAL_OUTPUT_DIR}/${tag}_confusion_matrix.csv"
+        --project "${EVAL_OUTPUT_DIR}/${tag}"
+        --split "$split")
+    if [[ "$class_agnostic" == "1" ]]; then
+        convert_args+=(--class_agnostic)
+        eval_args+=(--class_agnostic)
+    else
+        convert_args+=(--model "$model_path")
+    fi
+    python tools/convert_dataset_class_ids.py "${convert_args[@]}"
     # Clear validator intermediates from a previous eval so reruns do not accumulate val2/val3/... .
     rm -rf "${EVAL_OUTPUT_DIR}/${tag}"
-    python tools/eval.py \
-        --model "$model_path" --data "${converted_dir}/dataset.yaml" \
-        --save_path "${EVAL_OUTPUT_DIR}/${tag}.csv" \
-        --confusion_matrix_path "${EVAL_OUTPUT_DIR}/${tag}_confusion_matrix.csv" \
-        --project "${EVAL_OUTPUT_DIR}/${tag}" \
-        --split "$split" \
-        "${eval_extra[@]}"
+    python tools/eval.py "${eval_args[@]}" "${eval_extra[@]}"
 }
 
 for model_task in "${MODEL_TASKS[@]}"; do
@@ -166,12 +184,25 @@ for model_task in "${MODEL_TASKS[@]}"; do
     echo "=========================================="
     for dataset_index in "${!EVAL_YAMLS[@]}"; do
         dataset_task=$((dataset_index + 1))
-        eval_one "$MODEL_PATH" "${EVAL_YAMLS[$dataset_index]}" "model_${model_task}_eval_task_${dataset_task}"
+        eval_one "$MODEL_PATH" "${EVAL_YAMLS[$dataset_index]}" "model_${model_task}_eval_task_${dataset_task}" 0
     done
     for dataset_index in "${!CUMULATIVE_YAMLS[@]}"; do
         cumulative_task=$((dataset_index + 1))
-        eval_one "$MODEL_PATH" "${CUMULATIVE_YAMLS[$dataset_index]}" "model_${model_task}_eval_cumulative_${cumulative_task}"
+        eval_one "$MODEL_PATH" "${CUMULATIVE_YAMLS[$dataset_index]}" "model_${model_task}_eval_cumulative_${cumulative_task}" 0
     done
+    if [[ "$CLASS_AGNOSTIC_EVAL" == "1" ]]; then
+        echo "=========================================="
+        echo "Class-agnostic ('object') eval of model from task ${model_task}"
+        echo "=========================================="
+        for dataset_index in "${!EVAL_YAMLS[@]}"; do
+            dataset_task=$((dataset_index + 1))
+            eval_one "$MODEL_PATH" "${EVAL_YAMLS[$dataset_index]}" "model_${model_task}_eval_task_${dataset_task}_object" 1
+        done
+        for dataset_index in "${!CUMULATIVE_YAMLS[@]}"; do
+            cumulative_task=$((dataset_index + 1))
+            eval_one "$MODEL_PATH" "${CUMULATIVE_YAMLS[$dataset_index]}" "model_${model_task}_eval_cumulative_${cumulative_task}_object" 1
+        done
+    fi
     echo ""
 done
 
@@ -185,8 +216,12 @@ if (( ${#CUMULATIVE_YAMLS[@]} > 0 )); then
     table_args+=(--num_cumulative "${#CUMULATIVE_YAMLS[@]}")
 fi
 python tools/generate_eval_tables.py "${table_args[@]}"
+if [[ "$CLASS_AGNOSTIC_EVAL" == "1" ]]; then
+    python tools/generate_eval_tables.py "${table_args[@]}" --cell_suffix _object
+fi
 
-# Per-stage task aggregation from each checkpoint's own incremental_history.
-python tools/stage_task_map.py --run_dir "$OUTPUT_DIR" --eval_dir "$EVAL_OUTPUT_DIR"
+# Per-stage task aggregation over the class spaces of the per-task eval yaml
+# sequence (class-aware cells only; *_object cells carry a single 'object' class).
+python tools/stage_task_map.py --eval_dir "$EVAL_OUTPUT_DIR" --tasks "${EVAL_YAMLS[@]}"
 
 echo "Evaluation complete. Tables under ${EVAL_OUTPUT_DIR}"

@@ -31,6 +31,11 @@ Arguments:
         Default: 'confusion_matrix.csv'.
     --iou_threshold: Optional AP IoU threshold to export as an additional per-class CSV column.
         Must be on the COCO 0.50:0.05:0.95 grid. This does not change NMS IoU.
+    --class_agnostic: Class-agnostic protocol. All model classification channels are collapsed
+        per location into a single objectness confidence (max class score), and the dataset is
+        expected to already be converted to a single 'object' class (id 0) via
+        tools/convert_dataset_class_ids.py --class_agnostic. Metrics and CSV shapes are
+        identical to the class-aware protocol. Default: off.
     --<additional_args>: Additional dynamic arguments can be passed to the model.val()
         method. These will be automatically parsed and passed through. Examples include
         --imgsz, --conf, --iou, --batch, etc.
@@ -58,6 +63,7 @@ import csv
 from typing import Optional
 
 from ultralytics import YOLO
+from ultralytics.models.yolo.detect import ClassAgnosticDetectionValidator
 
 
 def _ap_iou_index(iou_threshold: float) -> tuple[int, float]:
@@ -193,6 +199,13 @@ def main():
         default=None,
         help="Optional per-class AP IoU threshold to export (0.50:0.05:0.95); this does not change NMS IoU",
     )
+    parser.add_argument(
+        "--class_agnostic",
+        action="store_true",
+        help="Class-agnostic protocol: collapse all class channels into a single 'object' class "
+        "(per-location max class confidence) and evaluate against a single-class 'object' dataset "
+        "(see tools/convert_dataset_class_ids.py --class_agnostic)",
+    )
     args, unknown = parser.parse_known_args()
     dynamic_kwargs = parse_dynamic_named_args(unknown) # Other dynamic arguments
 
@@ -200,7 +213,10 @@ def main():
     if args.weight is not None:
         # This is for loading weights of heterogeneous models while preserving the architecture of the originally initialized model
         model.load(args.weight)
-    results = model.val(data=args.data, device=args.device, project=args.project, **dynamic_kwargs)
+    val_kwargs = dict(data=args.data, device=args.device, project=args.project, **dynamic_kwargs)
+    if args.class_agnostic:
+        val_kwargs["validator"] = ClassAgnosticDetectionValidator
+    results = model.val(**val_kwargs)
     summary = results.summary()
     optional_ap_column = add_ap_iou_metric(summary, results.box, args.iou_threshold)
     confusion_matrix = results.confusion_matrix.summary()

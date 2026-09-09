@@ -27,10 +27,13 @@ Arguments:
     --num_eval_tasks: Number of per-task evaluation datasets.
     --num_cumulative: Number of cumulative evaluation datasets (0 = skip the
         cumulative table).
+    --cell_suffix: Optional suffix of the per-cell CSV names and the generated tables,
+        e.g. '_object' reads 'model_{k}_eval_task_{j}_object.csv' and writes
+        'individual_datasets_eval_object.csv'. Default: '' (class-aware protocol).
     --output_dir: Directory where the generated evaluation tables will be saved.
         The script will create:
-        - individual_datasets_eval.csv: Table with mAP values for each model on each dataset
-        - cumulative_datasets_eval.csv: Table with mAP values for each model on cumulative datasets
+        - individual_datasets_eval<cell_suffix>.csv: Table with mAP values for each model on each dataset
+        - cumulative_datasets_eval<cell_suffix>.csv: Table with mAP values for each model on cumulative datasets
 
 Examples:
     $ python tools/generate_eval_tables.py \
@@ -146,6 +149,9 @@ def main():
                        help="Number of per-task evaluation datasets")
     parser.add_argument("--num_cumulative", type=int, default=0,
                        help="Number of cumulative evaluation datasets (0 = skip cumulative table)")
+    parser.add_argument("--cell_suffix", type=str, default="",
+                       help="Suffix of the per-cell CSV names and output tables (e.g. '_object' for "
+                            "the class-agnostic protocol)")
     parser.add_argument("--output_dir", type=str, required=True,
                        help="Output directory for tables")
     args = parser.parse_args()
@@ -154,21 +160,21 @@ def main():
 
     individual_results = collect_matrix(
         args.eval_dir, args.model_tasks, args.num_eval_tasks,
-        "model_{model}_eval_task_{dataset}.csv",
+        f"model_{{model}}_eval_task_{{dataset}}{args.cell_suffix}.csv",
     )
     generate_matrix_table(
         individual_results, "Task",
-        os.path.join(args.output_dir, "individual_datasets_eval.csv"),
+        os.path.join(args.output_dir, f"individual_datasets_eval{args.cell_suffix}.csv"),
     )
 
     if args.num_cumulative > 0:
         cumulative_results = collect_matrix(
             args.eval_dir, args.model_tasks, args.num_cumulative,
-            "model_{model}_eval_cumulative_{dataset}.csv",
+            f"model_{{model}}_eval_cumulative_{{dataset}}{args.cell_suffix}.csv",
         )
         generate_matrix_table(
             cumulative_results, "Cumulative",
-            os.path.join(args.output_dir, "cumulative_datasets_eval.csv"),
+            os.path.join(args.output_dir, f"cumulative_datasets_eval{args.cell_suffix}.csv"),
         )
 
     print("Evaluation tables generated successfully!")

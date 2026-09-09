@@ -1,12 +1,10 @@
-"""Per-stage mAP aggregation of evaluation CSVs, read from the models' own history.
+"""Per-stage mAP aggregation of evaluation CSVs over the eval dataset sequence.
 
 For every evaluation CSV ``model_<k>_eval_<tag>.csv`` under ``--eval_dir`` (per-task
-and cumulative cells alike), aggregate its per-class rows into the class space of
-each incremental stage the model went through. The stage class spaces come from the
-checkpoint itself (the ``incremental_history`` module attribute stamped by
-tools/train.py and tools/expand_model_head.py), never from the eval-time task
-yamls, so the breakdown stays correct when the eval datasets differ from the
-training ones in order, kind, or number.
+and cumulative cells alike; class-agnostic ``*_object`` cells are excluded — a single
+``object`` class has no per-stage class breakdown), aggregate its per-class rows into
+the class space of each incremental stage. The stage class spaces come from the
+``--tasks`` eval dataset sequence: stage j is the class space of the j-th yaml.
 
 Outputs (under <eval_dir>):
     model_<k>_eval_<tag>_stage_mAP.csv   one table per evaluation cell: rows =
@@ -17,7 +15,7 @@ Outputs (under <eval_dir>):
 
 Usage:
     $ python tools/stage_task_map.py \
-        --run_dir runs/<run> --eval_dir runs/<run>/evaluation_results
+        --eval_dir runs/<run>/evaluation_results --tasks e1.yaml e2.yaml
 """
 
 from __future__ import annotations
@@ -27,12 +25,14 @@ import csv
 import re
 from pathlib import Path
 
-from ultralytics import YOLO
+from ultralytics.utils import YAML
+
+from utils import normalize_names
 
 METRIC_ORDER = ("mAP50", "mAP75", "mAP50-95")
 
 EVAL_CSV_PATTERN = re.compile(r"^model_(\d+)_eval_(.+)\.csv$")
-EXCLUDED_SUFFIXES = ("_stage_mAP", "_confusion_matrix")
+EXCLUDED_SUFFIXES = ("_stage_mAP", "_confusion_matrix", "_object")
 
 
 def _normalize_class_name(name: str) -> str:
@@ -74,29 +74,21 @@ def load_per_class_metrics(evaluation_csv: Path) -> tuple[dict[str, dict[str, fl
     return class_metrics, metrics
 
 
-def load_incremental_history(model_path: Path) -> list[list[str]]:
-    """Return the per-stage class-name lists recorded in the checkpoint.
+def load_stage_class_spaces(task_yamls: list[Path]) -> list[list[str]]:
+    """Return the per-stage class-name lists defined by the eval dataset sequence.
 
-    Fails fast when the checkpoint predates history stamping or when the recorded
-    stages do not exactly tile the model's current class space.
+    Stage j is the class space of the j-th yaml.
     """
-    if not model_path.is_file():
-        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
-    model = YOLO(str(model_path))
-    history = getattr(model.model, "incremental_history", None)
-    if not history:
-        raise ValueError(
-            f"{model_path} carries no incremental_history; retrain it with the current "
-            f"tools/train.py and tools/expand_model_head.py"
-        )
-    model_names = [model.model.names[i] for i in sorted(model.model.names)]
-    history_names = [name for stage in history for name in stage["names"]]
-    if history_names != model_names:
-        raise ValueError(
-            f"incremental_history of {model_path} does not match its class space: "
-            f"history covers {history_names}, model names are {model_names}"
-        )
-    return [stage["names"] for stage in history]
+    stage_class_spaces = []
+    for yaml_path in task_yamls:
+        if not yaml_path.is_file():
+            raise FileNotFoundError(f"Eval dataset yaml not found: {yaml_path}")
+        data_cfg = YAML.load(yaml_path)
+        if "names" not in data_cfg:
+            raise KeyError(f"Dataset config has no 'names': {yaml_path}")
+        names = normalize_names(data_cfg["names"], source=f"dataset '{yaml_path}'")
+        stage_class_spaces.append([names[i] for i in sorted(names)])
+    return stage_class_spaces
 
 
 def summarize_task_metrics(
@@ -157,9 +149,12 @@ def write_task_metrics(output_csv: Path, summaries: list[dict[str, object]], met
 def main() -> None:
     """Build per-stage mAP tables for every evaluation cell under the eval dir."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run_dir", type=Path, required=True, help="Run directory holding task-k/best.pt")
     parser.add_argument("--eval_dir", type=Path, required=True, help="Directory with model_k_eval_*.csv files")
+    parser.add_argument("--tasks", type=Path, required=True, nargs="+",
+                        help="Per-task eval yaml sequence; stage j is the class space of the j-th yaml")
     args = parser.parse_args()
+
+    stage_class_spaces = load_stage_class_spaces(args.tasks)
 
     evaluation_csvs = []
     for csv_path in sorted(args.eval_dir.glob("model_*_eval_*.csv")):
@@ -170,7 +165,6 @@ def main() -> None:
     if not evaluation_csvs:
         raise ValueError(f"No model_<k>_eval_*.csv files found under {args.eval_dir}")
 
-    histories: dict[int, list[list[str]]] = {}
     sequence_rows: list[dict[str, object]] = []
     metrics: list[str] | None = None
     for csv_path, model_task, eval_tag in evaluation_csvs:
@@ -182,9 +176,7 @@ def main() -> None:
             metrics = cell_metrics
         elif cell_metrics != metrics:
             raise ValueError(f"Metric columns of {csv_path} differ from earlier cells: {cell_metrics} vs {metrics}")
-        if model_task not in histories:
-            histories[model_task] = load_incremental_history(args.run_dir / f"task-{model_task}" / "best.pt")
-        summaries = summarize_task_metrics(class_metrics, histories[model_task], cell_metrics)
+        summaries = summarize_task_metrics(class_metrics, stage_class_spaces, cell_metrics)
         output_csv = args.eval_dir / f"{csv_path.stem}_stage_mAP.csv"
         write_task_metrics(output_csv, summaries, cell_metrics)
         print(f"Stage-wise mAP for {csv_path.name} saved to {output_csv}")

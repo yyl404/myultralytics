@@ -88,6 +88,12 @@ read -ra EXTRA_EVAL_ARGS <<< "$EXTRA_EVAL_ARGS"
 EXTRA_PREDICT_ARGS="${EXTRA_PREDICT_ARGS:-$DECODE_ARGS}"
 read -ra EXTRA_PREDICT_ARGS <<< "$EXTRA_PREDICT_ARGS"
 
+# Class-agnostic eval protocol: scripts/eval.sh scores every eval cell a
+# second time with all classes merged into a single 'object' class (model
+# class channels collapsed to per-location max confidence as objectness).
+# Set CLASS_AGNOSTIC_EVAL=0 to skip that pass (eval.sh / pipeline.sh).
+export CLASS_AGNOSTIC_EVAL="${CLASS_AGNOSTIC_EVAL:-1}"
+
 # Train knobs (read from the environment by scripts/train.sh).
 export EPOCHS="${EPOCHS:-10}"
 export DEVICE="${DEVICE:-0}"

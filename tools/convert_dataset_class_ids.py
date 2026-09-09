@@ -1,4 +1,8 @@
-"""Align dataset class IDs with a model output space using parallel file I/O."""
+"""Align dataset class IDs with a model output space using parallel file I/O.
+
+With --class_agnostic, no model is needed: every class is mapped to a single
+'object' class (id 0) for the class-agnostic evaluation protocol.
+"""
 
 from __future__ import annotations
 
@@ -210,10 +214,20 @@ def _run_parallel(
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, required=True, help="Expanded model checkpoint")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help="Expanded model checkpoint (required unless --class_agnostic)",
+    )
     parser.add_argument("--dataset", type=Path, required=True, help="Source dataset YAML")
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
+    parser.add_argument(
+        "--class_agnostic",
+        action="store_true",
+        help="Map every class to a single 'object' class (id 0); no model checkpoint is needed",
+    )
     parser.add_argument(
         "--keep_unrecognized_classes",
         action="store_true",
@@ -231,6 +245,8 @@ def parse_args() -> argparse.Namespace:
         help="Number of parallel label/link I/O workers",
     )
     args = parser.parse_args()
+    if not args.class_agnostic and args.model is None:
+        parser.error("--model is required unless --class_agnostic")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     return args
@@ -239,9 +255,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Convert requested splits and save an aligned dataset config."""
     args = parse_args()
-    model = YOLO(args.model)
-    task = getattr(model, "task", None) or "detect"
-    model_names = normalize_names(model.names, source=f"model '{args.model}'")
 
     dataset_config = YAML().load(args.dataset)
     if "names" not in dataset_config:
@@ -250,11 +263,20 @@ def main() -> None:
         dataset_config["names"],
         source=f"dataset '{args.dataset}'",
     )
-    class_id_map, output_names = _build_class_mapping(
-        source_names=source_names,
-        model_names=model_names,
-        keep_unrecognized=args.keep_unrecognized_classes,
-    )
+
+    if args.class_agnostic:
+        task = "detect"
+        class_id_map = dict.fromkeys(source_names, 0)
+        output_names = {0: "object"}
+    else:
+        model = YOLO(args.model)
+        task = getattr(model, "task", None) or "detect"
+        model_names = normalize_names(model.names, source=f"model '{args.model}'")
+        class_id_map, output_names = _build_class_mapping(
+            source_names=source_names,
+            model_names=model_names,
+            keep_unrecognized=args.keep_unrecognized_classes,
+        )
 
     if args.output_dir.exists() or args.output_dir.is_symlink():
         if args.output_dir.is_symlink() or args.output_dir.is_file():

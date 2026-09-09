@@ -7,7 +7,7 @@
 VOC-TINY
 |Method|old (15)|new (5)|all (20)|
 |---|---|---|---|
-|joint|-|-|-|
+|joint|82.6|81.6|82.4|
 |dist|
 |pseudo_label|
 |pseudo_label+dist|58.0|65.1|59.8|

@@ -158,7 +158,7 @@ EPOCHS=1 END_TASK=2 bash scripts/train.sh --tasks data/OdinW-13-yolo/*/data.yaml
 
 训练产物保存在 `runs/<MODEL_ID>_<DATA_TAG>_pretrained-from-<weights>_<method>/task-<k>/`（`best.pt`、EWC 的 `importance.pth`、ESPReg/NSGP 的 `pca_cache.pkl`、RePRE 的 `repre_prototypes.pt` 等）。训练器中间产物（`weights/`、`results.csv`、曲线图等）保存在 `task-<k>/train/` 下，重跑同一任务前会清空重建，不会累积 `train2/train3/...`。
 
-类别空间约定：任务 `k>1` 开始时由 `tools/expand_model_head.py` 扩展检测头——既有类别的 id 与在检测头中的顺序保持不变，新数据集中未见过的类别按其 yaml 中的顺序追加在最后；若新数据集含有与既有类别同名的类别，则不新增通道，其标注由 `tools/convert_dataset_class_ids.py` 按类别名统一对齐到既有 id。训练、评估与推理用到的数据集都会先按类别名对齐到当前模型的类别空间，DDP 各 rank 加载同一扩展权重与同一转换后数据集，类别空间天然一致。此外，每个 `best.pt` 都以模块属性 `incremental_history`（`[{"task": k, "names": [...]}]`，每增量阶段一条）携带自身经历的类别空间历史：任务 1 由 `tools/train.py` 在保存时写入，后续任务由 `expand_model_head.py` 追加；评估侧因此无需假设评估用任务数据集与训练时一致。
+类别空间约定：任务 `k>1` 开始时由 `tools/expand_model_head.py` 扩展检测头——既有类别的 id 与在检测头中的顺序保持不变，新数据集中未见过的类别按其 yaml 中的顺序追加在最后；若新数据集含有与既有类别同名的类别，则不新增通道，其标注由 `tools/convert_dataset_class_ids.py` 按类别名统一对齐到既有 id。训练、评估与推理用到的数据集都会先按类别名对齐到当前模型的类别空间，DDP 各 rank 加载同一扩展权重与同一转换后数据集，类别空间天然一致。
 
 解码配置一致性：`end2end` / `agnostic_nms` / `max_det` 是 Detect 头上的 Python 属性，不在 state_dict 中；从 yaml 重建检测头会回落到 yaml 默认值（`yolo26*.yaml` 为 `end2end=True`），若不加处理，扩展后的模型会静默改走未训练的 one2one 分支（伪标签、抗遗忘随之失效）。管线各环节以「当前阶段实际生效的训练/评估参数 + 上一阶段 checkpoint 保存的属性」为准：`tools/expand_model_head.py` 扩头时把源模型检测头的这三个属性随权重一起复制到扩展模型；所有"yaml 重建 + 权重迁移"的路径（训练器 `setup_model`、`Model.train` 内部预重建、蒸馏教师重建）经 `BaseModel.load`（`ultralytics/nn/tasks.py`）从源模型继承这些属性，显式传入的 `--end2end` 等训练参数仍在其后优先生效；AntiForget/BPF 的冻结教师与参考模型加载后套用当前训练参数（`ultralytics/engine/anti_forget.py` 的 `_apply_train_head_args`），且教师的 `end2end` 与学生不一致时立即报错（给出期望 vs 实际），不会静默回退到 yaml 默认。评估与推理沿用 checkpoint 中保存的属性，经 `--` 显式透传的 `--end2end` / `--agnostic_nms` / `--max_det` 优先。
 
@@ -177,7 +177,12 @@ bash scripts/eval.sh runs/<run> --tasks e1.yaml e2.yaml -- --agnostic_nms True
 
 结果矩阵严格按实际构建：run 目录中每个 `task-k/best.pt` × 每个评估 yaml（per-task 与 cumulative 序列各自做全 cross product），两个序列的长度与顺序都不必与训练序列一致。每个 yaml 默认在 `test` 分割上评估，无 `test` 键则用 `val`（`--split` 可覆盖）。模型类空间与某评估数据集完全不相交的格子产出空 CSV，在表中标为 `N/A`。
 
-结果写入 `<run>/evaluation_results/`：逐类指标 CSV（`model_<k>_eval_task_<j>.csv` / `model_<k>_eval_cumulative_<j>.csv`）、混淆矩阵 CSV、矩阵表 `individual_datasets_eval.csv` 与 `cumulative_datasets_eval.csv`，以及按增量阶段聚合的 mAP 表——`tools/stage_task_map.py` 对每个评估 CSV 用对应 checkpoint 自带的 `incremental_history` 划分阶段类别空间，产出 `<同名>_stage_mAP.csv` 与汇总 `stage_mAP_sequence.csv`，不依赖评估时的任务数据集划分。评估器中间产物（`<eval>/model_*_eval_*/`）在每次重跑评估前清空重建。
+每个评估格子在两种协议下各评一次：
+
+- **类别相关（class-aware）**：现有协议，逐类对齐模型类别空间。
+- **类别无关（class-agnostic，默认开启，`CLASS_AGNOSTIC_EVAL=0` 关闭）**：模型全部分类通道的置信度按逐位置取 max 汇聚为 objectness 置信度（类别无关 NMS，预测类别 id 归零，由 `ClassAgnosticDetectionValidator` 强制 `single_cls` 语义实现）；评估数据经 `tools/convert_dataset_class_ids.py --class_agnostic` 把全部类别统一映射为单一 `object` 类（id 0）；随后完全沿用类别相关评估的流程与指标，独立评估序列与累积评估序列都各产出一份结果。
+
+结果写入 `<run>/evaluation_results/`：逐类指标 CSV（类别相关为 `model_<k>_eval_task_<j>.csv` / `model_<k>_eval_cumulative_<j>.csv`，类别无关为同名加 `_object` 后缀）、混淆矩阵 CSV、矩阵表 `individual_datasets_eval[_object].csv` 与 `cumulative_datasets_eval[_object].csv`，以及按增量阶段聚合的 mAP 表——`tools/stage_task_map.py` 对每个类别相关评估 CSV 按独立评估 yaml 序列（`--tasks`）划分阶段类别空间（第 `j` 阶段的类别空间即第 `j` 个评估 yaml 的类别集合），产出 `<同名>_stage_mAP.csv` 与汇总 `stage_mAP_sequence.csv`（类别无关格子只有单一 `object` 类，无阶段类别拆分，不参与该聚合）。评估器中间产物（`<eval>/model_*_eval_*/`）在每次重跑评估前清空重建。
 
 ### 3.3 推理（predict）
 

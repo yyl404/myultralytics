@@ -92,13 +92,9 @@ teacher/student `end2end` mismatch raises immediately with expected vs actual.
 Eval/predict use the checkpoint's pickled attributes unless explicit args are
 passed through `--`.
 
-Every `best.pt` also carries its incremental history as a module attribute
-`incremental_history` (`[{"task": k, "names": [...]}]`, one entry per stage):
-task 1 is stamped by `tools/train.py` at save time, later stages are appended by
-`expand_model_head.py`. Task-specific aggregation at eval time
-(`tools/stage_task_map.py`) reads the stage class spaces from the checkpoint
-itself — like `model.names`, but per stage — never from the eval-time task
-yamls, so it stays correct when the eval datasets differ from the training ones.
+Per-stage aggregation at eval time (`tools/stage_task_map.py`) takes the stage
+class spaces from the per-task eval yaml sequence: stage j is the class space
+of the j-th `--tasks` eval yaml.
 
 ## Unified commands
 
@@ -157,7 +153,8 @@ yaml sequences are plain bash arrays read from `common.sh` only (no
 environment or command-line override); the train, independent-eval, and
 cumulative-eval sequences are fully decoupled and may differ in content,
 order, and length. The scalar knobs further down (`MODEL`, `WEIGHTS`,
-`METHOD`, `RUN_DIR`, decode knobs, `EXTRA_*_ARGS`, `EPOCHS`, `DEVICE`) can
+`METHOD`, `RUN_DIR`, decode knobs, `EXTRA_*_ARGS`, `CLASS_AGNOSTIC_EVAL`,
+`EPOCHS`, `DEVICE`) can
 still be overridden per launch with an environment variable of the same name,
 e.g. `EPOCHS=1 RUN_DIR=runs/smoke bash <dir>/pipeline.sh`.
 
@@ -261,7 +258,7 @@ of the train yamls.
 | File | Role |
 |------|------|
 | `train.sh` | Parse `--tasks` + model/method → resolve → source `run_incremental.sh` |
-| `eval.sh` | Discover `task-*/best.pt` → per (model, yaml) convert class ids → `tools/eval.py` → tables + `tools/stage_task_map.py` |
+| `eval.sh` | Discover `task-*/best.pt` → per (model, yaml) convert class ids → `tools/eval.py` (class-aware + class-agnostic `object` pass) → tables + `tools/stage_task_map.py` |
 | `create.sh` | CIL only: optional subsample (voc-tiny) then `create_incremental_dataset.py` |
 | `feature_drift.sh` | `tools/feature_drift.py` on `TASK_DATASETS[0]` |
 | `dataset_similarity.sh` | `tools/dataset_similarity.py` over the whole `--tasks` sequence |
@@ -272,10 +269,19 @@ of the train yamls.
 | `model_adapters/<framework>.sh` | Framework-specific train / artifact hooks |
 
 Eval always writes the individual matrix table; it adds the cumulative matrix
-table whenever a cumulative sequence is given. `tools/stage_task_map.py` then
-aggregates every `model_<k>_eval_*.csv` into per-stage mAP tables
-(`<name>_stage_mAP.csv`) grouped by each checkpoint's own
-`incremental_history`, plus the combined `stage_mAP_sequence.csv`.
+table whenever a cumulative sequence is given. Every cell is additionally
+scored under the class-agnostic protocol (disable with
+`CLASS_AGNOSTIC_EVAL=0`): all model class channels collapse to a per-location
+max objectness confidence and the eval dataset is converted to a single
+`object` class (`tools/convert_dataset_class_ids.py --class_agnostic`), then
+the same eval flow and metrics run unchanged, producing `*_object.csv` cells
+and `individual_datasets_eval_object.csv` / `cumulative_datasets_eval_object.csv`
+tables alongside the class-aware ones. `tools/stage_task_map.py` then
+aggregates every class-aware `model_<k>_eval_*.csv` into per-stage mAP tables
+(`<name>_stage_mAP.csv`) grouped by the class spaces of the per-task eval yaml
+sequence, plus the combined `stage_mAP_sequence.csv`
+(`*_object` cells are excluded — a single `object` class has no per-stage
+class breakdown).
 
 Trainer/validator/predictor intermediates live inside the run dir, never under
 `runs/detect/`: entry points absolutize `OUTPUT_DIR` (a relative ultralytics
@@ -294,6 +300,7 @@ set); final artifacts (`best.pt`, CSVs) are overwritten in place.
 | `DIST_LOSS_WEIGHT` / `DIST_TOPK` / `ESPREG_LOSS_WEIGHT` | Method weights | adapter defaults (100 / 1 / 100) |
 | `YOLO26_DEFAULT_HYPS` | Set `0` to skip yolo26 extras | 1 |
 | `TINY_FRACTION` / `SEED` | voc-tiny subsample (create.sh) | 0.1 / 0 |
+| `CLASS_AGNOSTIC_EVAL` | Set `0` to skip the class-agnostic eval pass | 1 |
 
 `DEVICE` may be a multi-GPU list for training (`0,1`). Artifact tools use
 `TOOL_DEVICE` (first GPU of `DEVICE` unless overridden).

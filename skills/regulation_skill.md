@@ -3,3 +3,6 @@
 - You are required to update README.md, skill docs, and any other related docs.
 - You are required to keep the project compatible with DDP training, evaluation, and inference.
 - You are required to be confident in the decisions you make. As soon as you encounter a decision you are not confident about, ask me.
+- When writing comments or user-facing strings, do not mention differences from a previous version (e.g. "removed xxx"). Comments should describe only the current logic. User-facing strings should only convey information the user needs.
+- You should store files that take up a large amount of disk space in `/hy-tmp` or in an appropriate location under its nested subdirectories.
+- When editing or creating incremental-learning experiment scheduler scripts, all scripts that share the same function but target different datasets or configs must use an identical template and differ only in a few variables. Immutable parts of comments and output text must also be identical, so switching to another dataset or config only requires changing those few key variables.
