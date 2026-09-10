@@ -29,7 +29,7 @@ scripts/
 ├── eval.sh                        # run dir × explicit eval yaml sequences
 ├── create.sh                      # CIL split builder (the ONLY --dataset/--split entry)
 ├── feature_drift.sh               # task-1 feature drift between two ckpts
-├── dataset_similarity.sh          # N x N image-domain feature similarity over a yaml sequence
+├── domain_similarity.sh           # N x N image-domain distribution similarity (pluggable features x metrics)
 ├── predict.sh                     # per-dataset inference over yaml sequences
 ├── analyze.sh                     # vis / confusion-matrix tools
 ├── run_incremental.sh             # shared task loop (model-agnostic)
@@ -118,8 +118,10 @@ bash scripts/predict.sh --model runs/<run>/task-2/best.pt --tasks t1.yaml t2.yam
 # Feature drift on task-1 images
 bash scripts/feature_drift.sh --tasks t1.yaml t2.yaml --model1 runs/<run>/task-1/best.pt --model2 runs/<run>/task-2/best.pt
 
-# N x N image-domain feature similarity over a dataset sequence
-bash scripts/dataset_similarity.sh --tasks t1.yaml t2.yaml --weights yoloe-26m-seg.pt
+# N x N image-domain distribution similarity over a yaml sequence or image dirs
+# (pluggable feature blocks x distribution metrics)
+bash scripts/domain_similarity.sh --tasks t1.yaml t2.yaml --backbone yoloe-26m-seg.pt
+bash scripts/domain_similarity.sh --images DIR_A DIR_B --features backbone+color_hist --metrics all
 ```
 
 `train.sh --` passes extra flags to `tools/train.py`; `eval.sh --` and
@@ -139,7 +141,7 @@ scripts/voc/tiny/15+5/
 ├── train.sh        # checks TRAIN_YAMLS exist (hint: create the dataset), then scripts/train.sh
 ├── eval.sh         # scripts/eval.sh on EVAL_YAMLS + CUMULATIVE_YAMLS
 ├── predict.sh      # scripts/predict.sh on the same two sequences (labeled inference)
-├── similarity.sh   # scripts/dataset_similarity.sh on TRAIN_YAMLS (standalone)
+├── similarity.sh   # scripts/domain_similarity.sh on TRAIN_YAMLS x EVAL_YAMLS: every feature block x all metrics (standalone)
 └── pipeline.sh     # train → eval → predict
 ```
 
@@ -164,9 +166,13 @@ Conventions demonstrated: `yolo26m` + `yoloe-26m-seg.pt`; decode modes
 forwarded to train/eval/predict via `DECODE_ARGS` in every `EXTRA_*_ARGS`;
 small-data hyps (AdamW, lr0, mosaic, freeze) passed explicitly after `--` via
 `EXTRA_TRAIN_ARGS` in `common.sh`; eval/predict on the `test` split (`val`
-fallback) in EVAL_YAMLS then CUMULATIVE_YAMLS order; `similarity.sh` runs the
-N x N dataset image-domain feature similarity on TRAIN_YAMLS with the
-pretrained backbone (`SIMILARITY_WEIGHTS`, defaults to `WEIGHTS`).
+fallback) in EVAL_YAMLS then CUMULATIVE_YAMLS order; `similarity.sh` runs
+`scripts/domain_similarity.sh` on the deduplicated union of TRAIN_YAMLS and
+EVAL_YAMLS (the union matrix covers every train x eval pair) once per feature
+block (`SIMILARITY_FEATURES`, defaults to every available block) with
+`--metrics all`, writing `runs/domain_similarity/<DATA_TAG>/<feature>.json`;
+the backbone block uses `SIMILARITY_WEIGHTS` (defaults to `WEIGHTS`) as its
+backbone spec.
 
 ## Dataset / split resolution (`libexec/experiment.sh`, create.sh only)
 
@@ -261,7 +267,7 @@ of the train yamls.
 | `eval.sh` | Discover `task-*/best.pt` → per (model, yaml) convert class ids → `tools/eval.py` (class-aware + class-agnostic `object` pass) → tables + `tools/stage_task_map.py` |
 | `create.sh` | CIL only: optional subsample (voc-tiny) then `create_incremental_dataset.py` |
 | `feature_drift.sh` | `tools/feature_drift.py` on `TASK_DATASETS[0]` |
-| `dataset_similarity.sh` | `tools/dataset_similarity.py` over the whole `--tasks` sequence |
+| `domain_similarity.sh` | `tools/domain_similarity.py` over `--tasks` yamls or `--images` dirs: pluggable feature blocks (`tools/feature_extractors.py`) x distribution metrics (`tools/distribution_metrics.py`) |
 | `predict.sh` | Per yaml: convert class ids → `tools/predict.py --images --labels` |
 | `analyze.sh` | Dispatch to vis / confusion-matrix tools |
 | `libexec/experiment.sh` | create recipe, model/output resolution, yaml/split/model helpers |

@@ -18,7 +18,8 @@
 #                      task, in task order (train.sh / similarity.sh)
 #   EVAL_YAMLS         independent EVAL sequence: datasets each checkpoint is
 #                      evaluated on one by one; may differ from TRAIN_YAMLS in
-#                      content, order, and length (eval.sh / predict.sh)
+#                      content, order, and length (eval.sh / predict.sh /
+#                      similarity.sh, crossed with TRAIN_YAMLS)
 #   CUMULATIVE_YAMLS   cumulative EVAL sequence (optional); set to () to skip
 #                      cumulative evaluation (eval.sh / predict.sh)
 # ============================================================================
@@ -55,8 +56,9 @@ fi
 # Model used for the predict stage (any task-k/best.pt).
 PREDICT_MODEL="${PREDICT_MODEL:-$RUN_DIR/task-2/best.pt}"
 
-# Pretrained backbone weights for the similarity stage (similarity.sh);
-# defaults to the same weights used to initialize training.
+# Backbone spec for the backbone feature block of the similarity stage
+# (similarity.sh): a local YOLO .pt path, torchvision:<name> or
+# timm:<name>; defaults to the same weights used to initialize training.
 SIMILARITY_WEIGHTS="${SIMILARITY_WEIGHTS:-$WEIGHTS}"
 
 # ============================================================================
