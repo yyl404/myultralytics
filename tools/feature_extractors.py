@@ -225,7 +225,7 @@ class BackboneFeature(FeatureExtractor):
         """One BGR uint8 image -> (3, H, W) float32 model input."""
         if self.source == 'yolo':
             img = self.letterbox(image=img)
-            return img[:, :, ::-1].transpose(2, 0, 1) / 255.0
+            return img[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (self.imgsz, self.imgsz),
                          interpolation=cv2.INTER_LINEAR)

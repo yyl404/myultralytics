@@ -87,17 +87,18 @@ def print_matrix(title: str, labels: List[str], matrix: np.ndarray) -> None:
 
 
 def make_labels(dirs: List[str]) -> List[str]:
-    """Label each image directory by its basename; prepend the parent
-    directory name when basenames collide."""
-    labels = [osp.basename(osp.normpath(d)) for d in dirs]
-    if len(set(labels)) == len(labels):
-        return labels
-    labels = [osp.join(osp.basename(osp.dirname(osp.normpath(d))),
-                       osp.basename(osp.normpath(d))) for d in dirs]
-    if len(set(labels)) != len(labels):
-        raise ValueError(f'Cannot disambiguate image directory labels: '
-                         f'{dirs}')
-    return labels
+    """Label each image directory by its basename; prepend ancestor directory
+    names one level at a time while labels collide."""
+    parts = [osp.normpath(d).split(osp.sep) for d in dirs]
+    depth = 1
+    while True:
+        labels = [osp.join(*p[-depth:]) for p in parts]
+        if len(set(labels)) == len(labels):
+            return labels
+        if all(len(p) <= depth for p in parts):
+            raise ValueError(f'Cannot disambiguate image directory labels: '
+                             f'{dirs}')
+        depth += 1
 
 
 def resolve_inputs(args) -> Tuple[List[str], List[str]]:
