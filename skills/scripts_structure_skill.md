@@ -16,9 +16,10 @@ and `ultralytics/`. Entry points `cd` to the repo root, so they can be launched
 from anywhere; relative paths like `data/...` and `tools/...` are repo-relative.
 
 Do **not** add per-dataset, per-split, per-model, or per-method launcher copies.
-One train/eval/create/feature_drift script covers every combination. The single
-sanctioned exception is the demo under `scripts/voc/tiny/15+5/` (see below),
-which only composes the unified entry points and holds its tunables in
+One train/eval/create/feature_drift/prune script covers every combination. The
+sanctioned exceptions are the demo under `scripts/voc/tiny/15+5/` and the
+prune-vs-random comparison under `scripts/prune_compare/voc/` (see below),
+which only compose the unified entry points and hold their tunables in
 `common.sh`.
 
 ## Layout
@@ -28,6 +29,7 @@ scripts/
 ├── train.sh                       # --tasks yaml sequence × model × method
 ├── eval.sh                        # run dir × explicit eval yaml sequences
 ├── create.sh                      # CIL split builder (the ONLY --dataset/--split entry)
+├── prune.sh                       # dataset coreset prune (ratio or absolute count)
 ├── feature_drift.sh               # task-1 feature drift between two ckpts
 ├── domain_similarity.sh           # N x N image-domain distribution similarity (pluggable features x metrics)
 ├── predict.sh                     # per-dataset inference over yaml sequences
@@ -37,7 +39,8 @@ scripts/
 │   └── experiment.sh              # dataset / model / output resolution
 ├── model_adapters/
 │   └── ultralytics.sh             # train + artifact hooks
-└── voc/tiny/15+5/                 # VOC-TINY 15+5 demo (common.sh + train/eval/predict/similarity/pipeline)
+├── voc/tiny/15+5/                 # VOC-TINY 15+5 demo (common.sh + train/eval/predict/similarity/pipeline)
+└── prune_compare/voc/             # VOC prune-vs-random template (common.sh + run.sh)
 ```
 
 ## The yaml-sequence contract (train / eval decoupled)
@@ -127,6 +130,39 @@ bash scripts/domain_similarity.sh --images DIR_A DIR_B --features backbone+color
 `train.sh --` passes extra flags to `tools/train.py`; `eval.sh --` and
 `predict.sh --` forward to `tools/eval.py` / `tools/predict.py` (e.g.
 `-- --agnostic_nms True`).
+
+## Dataset prune (`scripts/prune.sh`)
+
+Keep a ratio or an absolute count of **existing** samples (images are
+symlinked; no new samples are synthesized). Each requested split is compressed
+independently. Splits listed in `--random_splits` (default `val test`) are
+drawn uniformly so they stay on the source distribution; the rest use a
+rarest-class stratified coreset (`tools/prune_dataset.py`). Splits omitted from
+`--splits` are absent from the output dataset. YAML paths are relative to the
+written `dataset.yaml`. Algorithm: `docs/project/dataset_prune.md`.
+
+```bash
+bash scripts/prune.sh --src_data data/VOC-YOLO/VOC.yaml --out_dir data/VOC-pruned --ratio 0.1
+bash scripts/prune.sh --src_data data/VOC-YOLO/VOC.yaml --out_dir data/VOC-pruned-500 --num_out 500
+```
+
+## Prune-vs-random comparison (`scripts/prune_compare/voc/`)
+
+Template for checking that the coreset beats uniform sampling on the original
+full eval split (mAP50), at the same train hyperparameters and epoch budget:
+
+```text
+scripts/prune_compare/voc/
+├── common.sh   # the ONLY file to edit when migrating, and only its first
+│               # block: SRC_DATA / DATA_TAG / EVAL_YAML / EVAL_SPLIT /
+│               # RATIOS / SPLITS / RANDOM_SPLITS / PREP_CMDS
+└── run.sh      # prune coreset + random subsets → train → eval → summarize
+```
+
+Copy the folder, edit the first block of `common.sh`, and run
+`bash scripts/prune_compare/<copy>/run.sh`. The test passes when coreset mAP50
+is strictly higher than random on a contiguous ratio interval of length
+`MIN_INTERVAL` (default 2).
 
 ## Demo: VOC-TINY 15+5 (`scripts/voc/tiny/15+5/`)
 
@@ -266,6 +302,7 @@ of the train yamls.
 | `train.sh` | Parse `--tasks` + model/method → resolve → source `run_incremental.sh` |
 | `eval.sh` | Discover `task-*/best.pt` → per (model, yaml) convert class ids → `tools/eval.py` (class-aware + class-agnostic `object` pass) → tables + `tools/stage_task_map.py` |
 | `create.sh` | CIL only: optional subsample (voc-tiny) then `create_incremental_dataset.py` |
+| `prune.sh` | Dataset coreset prune (`tools/prune_dataset.py`): ratio or `--num_out`, per-split |
 | `feature_drift.sh` | `tools/feature_drift.py` on `TASK_DATASETS[0]` |
 | `domain_similarity.sh` | `tools/domain_similarity.py` over `--tasks` yamls or `--images` dirs: pluggable feature blocks (`tools/feature_extractors.py`) x distribution metrics (`tools/distribution_metrics.py`) |
 | `predict.sh` | Per yaml: convert class ids → `tools/predict.py --images --labels` |

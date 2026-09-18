@@ -24,21 +24,24 @@ Follow these layout rules when creating, moving, or referencing files in this re
 ## `scripts/` layout
 
 One entry point per action. Do **not** add per-dataset / per-model / per-method
-copies. The only exception is the demo tree (`scripts/voc/tiny/15+5/`), which
-just composes the unified entry points.
+copies. The only exceptions are the demo tree (`scripts/voc/tiny/15+5/`) and
+the prune-vs-random comparison tree (`scripts/prune_compare/voc/`), which
+just compose the unified entry points.
 
 ```text
 scripts/
 ├── train.sh                       # --tasks yaml sequence × model × method
 ├── eval.sh                        # run dir × explicit eval yaml sequences
 ├── create.sh                      # CIL splits only (the only --dataset/--split entry)
+├── prune.sh                       # dataset coreset prune (ratio or absolute count)
 ├── feature_drift.sh
 ├── domain_similarity.sh             # pluggable feature x distribution-metric similarity over yamls or image dirs
 ├── predict.sh                     # per-dataset inference dumps
 ├── analyze.sh
 ├── run_incremental.sh
 ├── libexec/experiment.sh          # dataset / model resolution
-└── model_adapters/ultralytics.sh
+├── model_adapters/ultralytics.sh
+└── prune_compare/voc/             # VOC prune-vs-random template (common.sh + run.sh)
 ```
 
 Example:

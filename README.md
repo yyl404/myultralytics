@@ -67,7 +67,13 @@ bash scripts/create.sh coco 70_10
 
 ### 2.2 任务增量数据集（OdinW-13）
 
-OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`（13 个子域目录，各含 `data.yaml`）放入 `data/` 即可。训练 / 评估时显式给出任务序列，如 `--tasks data/OdinW-13-yolo/*/data.yaml`（shell glob 按词典序展开）。
+OdinW-13 为预打包数据集。源数据若为 COCO json（`data/OdinW-13/`），先转为 YOLO：
+
+```bash
+python tools/convert_odinw13_to_yolo.py --src_dir data/OdinW-13 --out_dir data/OdinW-13-yolo
+```
+
+然后将 `OdinW-13-yolo/`（13 个子域目录，各含 `dataset.yaml`）放入 `data/`。训练 / 评估时显式给出任务序列，如 `--tasks data/OdinW-13-yolo/*/dataset.yaml`（shell glob 按词典序展开）。
 
 ### 2.3 任意增量 yaml 序列
 
@@ -86,6 +92,25 @@ OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`
 - `yoloe-v8m-seg.pt` / `yoloe-v8l-seg.pt`：YOLOE 分割预训练（`yolov8m` / `yoloe-v8`）
 - `yoloe-26m-seg.pt`：YOLOE-26 分割预训练，默认 `yolo26m`
 - `yolo26x.pt`：COCO 检测预训练，默认 `yolo26`（size x）
+
+### 2.5 数据集剪枝（coreset）
+
+`scripts/prune.sh` / `tools/prune_dataset.py` 只筛选保留原有样本（图像与标签走符号链接），不合成新样本。每个被请求的 split 独立压缩到 `--ratio` 或 `--num_out`（指定 `--num_out` 时忽略比例）。未列入 `--splits` 的 split 不会出现在输出目录。`--random_splits`（默认 `val test`）上均匀抽样以保持与源分布一致；其余 split 使用按最稀有类别分层的系统抽样 coreset（对稀有层做轻度上采）。写出的 `dataset.yaml` 使用相对于该 yaml 的路径（`images/<split>`）。算法细节见 [docs/project/dataset_prune.md](docs/project/dataset_prune.md)。
+
+```bash
+bash scripts/prune.sh --src_data data/VOC-YOLO/VOC.yaml --out_dir data/VOC-pruned --ratio 0.1
+bash scripts/prune.sh --src_data data/VOC-YOLO/VOC.yaml --out_dir data/VOC-pruned-500 --num_out 500 \
+    --splits train val test --random_splits val test
+```
+
+与随机子集的对比模板在 `scripts/prune_compare/voc/`：只改 `common.sh` 开头的数据集块（`SRC_DATA` / `DATA_TAG` / `EVAL_YAML` / `EVAL_SPLIT` / `RATIOS` / `SPLITS` / `RANDOM_SPLITS` / `ATTACH_SOURCE_SPLITS` / `PREP_CMDS`），`run.sh` 在各数据集副本间保持一致。对每个 keep 比例分别训练 coreset 子集与随机子集（相同超参与轮数），在原始完整 eval split 上比较 mAP50。本仓库内 VOC 在 keep 比例 0.20–0.25 上通过；ODinW-13 的 VehiclesOpenImages 域在 0.15–0.20 上通过。
+
+```bash
+bash scripts/prune_compare/voc/run.sh
+bash scripts/prune_compare/odinw13/run.sh
+```
+
+ODinW-13 源数据为 COCO json 时，先转为 YOLO：`python tools/convert_odinw13_to_yolo.py --src_dir data/OdinW-13 --out_dir data/OdinW-13-yolo`。
 
 ---
 
@@ -301,7 +326,7 @@ bash scripts/analyze.sh confusion_matrix \
 pytest tests/test_anti_forget.py tests/test_bpf.py tests/test_ewc.py
 ```
 
-仓库结构与重构记录见 [REFACTORING.md](REFACTORING.md)；脚本目录规范见 [skills/scripts_structure_skill.md](skills/scripts_structure_skill.md)；项目设计文档与实验记录归档在 [docs/project/](docs/project/)。
+仓库结构与重构记录见 [REFACTORING.md](REFACTORING.md)；脚本目录规范见 [skills/scripts_structure_skill.md](skills/scripts_structure_skill.md)；项目设计文档与实验记录归档在 [docs/project/](docs/project/)（含 [数据集剪枝算法](docs/project/dataset_prune.md)）。
 
 ## License
 
