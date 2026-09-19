@@ -20,8 +20,9 @@
 | `--out_dir` | 输出目录 | 必填 |
 | `--splits` | 写入输出的 split | `train val test` |
 | `--random_splits` | 上述 split 中走均匀随机、不走 coreset 的集合 | `val test` |
-| `--seed` | 随机 split 的 RNG | `0` |
-| `--backbone` | 视觉特征骨干；选择器当前不使用 | `none` |
+| `--seed` | 随机 split 与 prototype k-means++ 的 RNG | `0` |
+| `--backbone` | 视觉特征骨干；`none` 则层内退回框数系统抽样 | `yoloe-26m-seg.pt` |
+| `--selector` | 层内特征规则：`pc1` / `bucket` / `kcenter` / `herding` / `prototype` | `pc1` |
 
 未列入 `--splits` 的 split **不会**出现在输出目录中。yaml 中的路径相对该 yaml，形如 `images/<split>`。
 
@@ -42,7 +43,7 @@ bash scripts/prune.sh --src_data data/VOC-YOLO/VOC.yaml --out_dir data/VOC-prune
 2. 解析对应 YOLO 标签，得到每张图的统计量。
 3. 计算 keep 数（见上）。
 4. 若该 split ∈ `--random_splits`：无放回均匀随机。
-5. 否则：`select_stratified_coreset`（最稀有类分层 + 系统抽样 + 轻度稀有上采）。
+5. 否则：提取 `--backbone` 深度特征（可缓存），再 `select_stratified_coreset`。
 6. 把选中图像与标签符号链接到 `images/<split>`、`labels/<split>`。
 7. 写出 `dataset.yaml`（`names` + 各 split 的相对路径）。
 
@@ -50,7 +51,7 @@ bash scripts/prune.sh --src_data data/VOC-YOLO/VOC.yaml --out_dir data/VOC-prune
 
 ---
 
-## 3. 每张图的标注统计
+## 3. 每张图的标注统计与深度特征
 
 每张图解析 YOLO 行 `class_id x_center y_center width height`，得到：
 
@@ -61,11 +62,23 @@ bash scripts/prune.sh --src_data data/VOC-YOLO/VOC.yaml --out_dir data/VOC-prune
 
 无标注图（背景图）\(\mathbf{c}_i=\mathbf{0}\)，后面单独成一层。面积直方图当前**不参与**打分，解析时仍计算。无效行、越界 class id 记 warning 后跳过该行。
 
+深度特征：预训练骨干（默认与训练权重相同的 `yoloe-26m-seg.pt`）在 stride-32 SPPF 上做全局平均池化，得到 \(\mathbf{v}_i\in\mathbb{R}^{D}\)。对全 split 做 PCA 到 64 维并 L2 归一化，得到用于分布匹配的 \(\mathbf{x}_i\)。特征按图像路径缓存到 `--feature_cache_dir`。
+
 ---
 
-## 4. 选择器：最稀有类分层系统抽样
+## 4. 选择器：最稀有类分层 + 特征分布匹配
 
-检测的 mAP50 是各类 AP 的**不加权平均**。均匀随机在 keep 较小时，稀有类覆盖方差大，某一类抽空或抽得极少会直接拉低 mAP。选择器把“主类”变成抽样单位，使每一层都有名额，并给稀有层略多一点位子。
+检测的 mAP50 是各类 AP 的**不加权平均**。均匀随机在 keep 较小时，稀有类覆盖方差大，某一类抽空或抽得极少会直接拉低 mAP。选择器把“主类”变成抽样单位，使每一层都有名额，并给稀有层略多一点位子。层内再用深度特征去逼近该层的经验分布，而不是只看框数。
+
+层内规则借鉴数据集剪枝 / coreset 文献中的分布覆盖与代表点思想，在类条件深度特征上做一维系统抽样（默认），并提供其它层内规则：
+
+- **pc1**（默认）：对层内 PCA 后的特征取第一主成分，与 \(\log(1+b_i)\) 各自 z-score 后相加，沿该轴等间隔取样。同时覆盖该层的主视觉变化方向和目标密度分布。
+- **herding**：Welling 核 herding / iCaRL 类均值匹配。贪心选取使子集特征均值逼近该层全体均值的原样本。
+- **prototype**：对层内特征做 k-means++（\(k=\) 配额），每个簇取距中心最近的原样本，覆盖特征分布的多个模态。
+- **kcenter**：Sener & Savarese 的 k-center greedy。从距层均值最近的点出发，反复加入当前集合中最小距离最大的点，覆盖特征支撑集。
+- **bucket**：按框数切成配额个桶，每桶取距该桶特征均值最近的原样本。
+
+`--backbone none` 时层内退回按框数排序的系统抽样。
 
 ### 4.1 给每张图指定主层
 
@@ -104,15 +117,17 @@ w_s=\max\bigl(1,\; n_s^{0.85}\bigr)
 
 若 cap 之后总数小于 \(k\)，用尚未选中的图像按框数排序补齐。
 
-### 4.3 层内系统抽样
+### 4.3 层内 pc1 系统抽样（默认）
 
-层内图像按 \((b_i,\;\text{图像下标})\) 排序，再等间隔取 \(\mathrm{quota}\) 张：
+层 \(s\) 的特征矩阵 \(X\in\mathbb{R}^{n_s\times d}\)（已 PCA + L2）。对 \(X\) 去均值后取第一主成分得分 \(p_i\)，与框数 \(b_i\) 组合成一维轴
 
 \[
-\text{下标}=\bigl\lfloor q\cdot n_s/\mathrm{quota}\bigr\rfloor,\quad q=0,1,\ldots,\mathrm{quota}-1
+a_i = \mathrm{z}(p_i) + \mathrm{z}\bigl(\log(1+b_i)\bigr)
 \]
 
-这是确定性 systematic sample：同一层里既覆盖框少的图也覆盖框多的图，避免全集中在“特别空”或“特别挤”的一端。排序含图像下标，结果与文件名排序一致，可复现。
+再按 \(a_i\) 排序后等间隔取 \(q_s\) 张。这是对该层经验分布在主视觉轴与目标密度上的系统覆盖：同一层里既有外观相近的典型图，也有沿主变化方向排开的图，同时框数不会堆在一端。
+
+其它 `--selector` 见上；全部只在原样本中选择。
 
 ### 4.4 类别覆盖修补
 
@@ -136,18 +151,35 @@ w_s=\max\bigl(1,\; n_s^{0.85}\bigr)
 
 - **为何分层**：mAP50 对“某类完全没抽到 / 抽得极少”敏感。把主类当作抽样单位后，每层都有名额。
 - **为何主层取最稀有类**：多标签图若算给所有类，常见类会吞掉稀有类图像。
-- **为何 \(n^{0.85}\)**：严格按层大小正比时，子集与均匀随机过近，短训下难以稳定超过随机；过强的稀有上采（例如典型样本 / 实例直方图匹配）会挤占常见类、并偏向多框图，短训 mAP 反而更差。
-- **为何层内按框数系统抽样**：控制每层内部的目标密度，避免整层抽成同一拥挤程度。
+- **为何 \(n^{0.85}\)**：严格按层大小正比时，类覆盖方差仍接近均匀随机；过强的稀有上采会挤占常见类。
+- **为何层内用深度特征主轴 + 框数系统抽样**：表层框数不能区分同一类下的视角与背景模态；只匹配特征均值又会挤在类中心附近。沿 PC1 与 \(\log(1+b)\) 的联合轴做系统抽样，使子集覆盖该层特征分布的主变化方向，并保持目标密度的分位覆盖。
 - **为何 val/test 默认可随机、对比实验挂回全集**：最终评估应对源测试分布；训练时的 val 若也随 train 一起被压成另一种分布，会把“选子集”和“选 checkpoint”缠在一起。
 
-在相同超参、相同轮数、原始完整 test、指标 mAP50 的协议下：
+协议：相同超参、相同轮数、原始完整 eval split（无 test 则用 val）、指标 mAP50；训练为 YOLO26m、`yoloe-26m-seg.pt` 初始化。keep 比例 0.20 与 0.25（VOC 为 0.20 与 0.30）。
 
-| 数据集 | 源 train | 通过的 keep 区间 | 对应张数 |
+VOC：
+
+| keep | random | coreset | Δ |
 |---|---|---|---|
-| VOC | 8218 | 0.20–0.25 | 1644 / 2054 |
-| ODinW-13 VehiclesOpenImages | 878 | 0.15–0.20 | 132 / 176 |
+| 0.20 / 0.30 | 0.820 / 0.830 | 0.826 / 0.841 | +0.006 / +0.010 |
 
-更低 keep（例如 VOC 5%–10%）上均匀随机更好：短训更吃“实例分布接近全集”，稀有上采会占掉常见类数据。
+ODinW-13（`bash scripts/prune_compare/odinw13/run.sh`，汇总 `runs/prune_compare/OdinW-13-family_summary.csv`）。通过 = 两个 keep 比例上 coreset mAP50 均严格高于随机。`pistols` 源数据只有 train，没有 held-out split，跳过评估。
+
+| 域 | train | 0.20 Δ | 0.25 Δ | 通过 |
+|---|---|---|---|---|
+| AerialMaritimeDrone | 52 | −0.074 | −0.025 | 否 |
+| Aquarium | 448 | +0.022 | +0.008 | 是 |
+| CottontailRabbits | 1980 | 0.000 | 0.000 | 否（双方 mAP50 均 0.995） |
+| EgoHands | 3840 | −0.001 | −0.006 | 否（双方均约 0.98） |
+| NorthAmericaMushrooms | 41 | −0.263 | −0.078 | 否 |
+| Packages | 19 | +0.108 | +0.086 | 是 |
+| PascalVOC | 13690 | +0.011 | +0.017 | 是（eval=val） |
+| Raccoon | 150 | −0.237 | −0.087 | 否 |
+| ShellfishOpenImages | 406 | +0.118 | +0.001 | 是 |
+| VehiclesOpenImages | 878 | +0.129 | +0.040 | 是 |
+| pistols | 2971 | — | — | skip |
+| pothole | 465 | −0.036 | −0.053 | 否 |
+| thermalDogsAndPeople | 142 | +0.023 | +0.285 | 是 |
 
 对比命令：
 
@@ -158,13 +190,7 @@ bash scripts/prune_compare/odinw13/run.sh
 
 ---
 
-## 7. 当前未参与选择的接口
-
-`--backbone` 仍可提取视觉特征（YOLO / torchvision / timm，可 PCA 到 64 维并缓存），但 `select_stratified_coreset` **丢弃** `visual`，默认 `none`。面积直方图同样不进入配额与抽样。
-
----
-
-## 8. 相关文件
+## 7. 相关文件
 
 | 路径 | 角色 |
 |---|---|
@@ -174,4 +200,4 @@ bash scripts/prune_compare/odinw13/run.sh
 | `tools/summarize_prune_compare.py` | 判断是否存在连续比例区间上 coreset mAP50 严格高于随机 |
 | `tools/convert_odinw13_to_yolo.py` | ODinW-13 COCO json → YOLO |
 | `scripts/prune_compare/voc/` | 对比模板（只改 `common.sh` 第一块即可迁移） |
-| `scripts/prune_compare/odinw13/` | 上述模板迁到 VehiclesOpenImages 的副本 |
+| `scripts/prune_compare/odinw13/` | 上述模板迁到 ODinW-13 全部 13 域（`DOMAINS`） |

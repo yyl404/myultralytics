@@ -4,8 +4,11 @@ Only original images and labels are kept (symlinked). No new samples are synthes
 
 Selection is independent per requested split. Splits listed in ``random_splits``
 are drawn uniformly without replacement so val/test stay on the source
-distribution. Remaining splits use a rarest-class stratified coreset with mild rare-stratum
-boost and systematic sampling within each stratum.
+distribution. Remaining splits use a rarest-class stratified coreset: keep-slots
+are allocated per class stratum, then filled by matching the stratum's deep
+feature distribution (iCaRL-style herding by default; k-means prototypes or
+k-center coverage as alternatives). Without a visual backbone the stratum is
+filled by systematic sampling on box count.
 
 Usage:
     $ python tools/prune_dataset.py \\
@@ -13,7 +16,8 @@ Usage:
         --out_dir data/VOC-pruned \\
         --ratio 0.1 \\
         --splits train val test \\
-        --random_splits val test
+        --random_splits val test \\
+        --backbone yoloe-26m-seg.pt
 """
 
 from __future__ import annotations
@@ -39,6 +43,9 @@ SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".png", ".jpeg", ".bmp")
 SIZE_BIN_EDGES = (0.0, 0.02, 0.05, 0.15, 1.01)
 VISUAL_PCA_DIM = 64
 EPS = 1e-12
+KMEANS_ITERS = 15
+SELECTORS = ("herding", "prototype", "kcenter", "pc1", "bucket")
+STRATUM_SIZE_EXPONENT = 0.85
 
 
 @dataclass(frozen=True)
@@ -250,6 +257,195 @@ def _extract_visual_features(
     return features
 
 
+def _squared_distances(points: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    """Pairwise squared L2 distances.
+
+    Args:
+        points: (N, D)
+        centers: (K, D)
+
+    Returns:
+        dist_sq: (N, K)
+    """
+    if centers.ndim != 2 or points.ndim != 2:
+        raise ValueError(f"Expected 2D matrices, got points {points.shape} centers {centers.shape}")
+    if points.shape[1] != centers.shape[1]:
+        raise ValueError(f"Feature dim mismatch: points {points.shape} vs centers {centers.shape}")
+    point_norm = np.einsum("nd,nd->n", points, points)[:, None]
+    center_norm = np.einsum("kd,kd->k", centers, centers)[None, :]
+    return np.maximum(point_norm + center_norm - 2.0 * (points @ centers.T), 0.0)
+
+
+def _select_herding(features: np.ndarray, quota: int) -> np.ndarray:
+    """Greedy moment matching of the empirical feature mean (iCaRL / Welling herding).
+
+    Args:
+        features: (N, D) L2-normalized (or otherwise comparable) vectors.
+        quota: Number of local indices to return.
+
+    Returns:
+        local_indices: (quota,) int64
+    """
+    n_samples = features.shape[0]
+    if quota < 1 or quota > n_samples:
+        raise ValueError(f"herding quota must be in [1, {n_samples}], got {quota}")
+    mean = features.mean(axis=0)
+    running = np.zeros_like(mean)
+    available = np.ones(n_samples, dtype=bool)
+    chosen = np.empty(quota, dtype=np.int64)
+    for step in range(quota):
+        residual = (step + 1) * mean - running
+        scores = features @ residual
+        scores[~available] = -np.inf
+        pick = int(np.argmax(scores))
+        if not np.isfinite(scores[pick]):
+            raise RuntimeError("Herding exhausted the candidate pool before filling the quota")
+        chosen[step] = pick
+        available[pick] = False
+        running += features[pick]
+    return chosen
+
+
+def _select_kcenter(features: np.ndarray, quota: int) -> np.ndarray:
+    """Farthest-first traversal covering the feature support (Sener & Savarese k-center).
+
+    The first point is the sample nearest the stratum mean (a moderate prototype),
+    then each new point maximizes its minimum distance to the set already chosen.
+
+    Args:
+        features: (N, D)
+        quota: Number of local indices to return.
+
+    Returns:
+        local_indices: (quota,) int64
+    """
+    n_samples = features.shape[0]
+    if quota < 1 or quota > n_samples:
+        raise ValueError(f"k-center quota must be in [1, {n_samples}], got {quota}")
+    mean = features.mean(axis=0, keepdims=True)
+    start = int(np.argmin(_squared_distances(features, mean)[:, 0]))
+    chosen = np.empty(quota, dtype=np.int64)
+    chosen[0] = start
+    min_dist = _squared_distances(features, features[start : start + 1])[:, 0]
+    min_dist[start] = -np.inf
+    for step in range(1, quota):
+        pick = int(np.argmax(min_dist))
+        chosen[step] = pick
+        d_new = _squared_distances(features, features[pick : pick + 1])[:, 0]
+        min_dist = np.minimum(min_dist, d_new)
+        min_dist[pick] = -np.inf
+    return chosen
+
+
+def _kmeans_centroids(features: np.ndarray, k: int, rng: random.Random) -> np.ndarray:
+    """k-means++ initialization followed by Lloyd iteration.
+
+    Args:
+        features: (N, D)
+        k: Number of centroids, 1 <= k <= N.
+        rng: Used only for k-means++ seeding.
+
+    Returns:
+        centroids: (k, D)
+    """
+    n_samples, n_dims = features.shape
+    if k < 1 or k > n_samples:
+        raise ValueError(f"k-means k must be in [1, {n_samples}], got {k}")
+    centroids = np.empty((k, n_dims), dtype=np.float64)
+    centroids[0] = features[int(rng.randrange(n_samples))]
+    closest_sq = np.full(n_samples, np.inf, dtype=np.float64)
+    for center_id in range(1, k):
+        d_last = _squared_distances(features, centroids[center_id - 1 : center_id])[:, 0]
+        closest_sq = np.minimum(closest_sq, d_last)
+        total = float(closest_sq.sum())
+        if total <= EPS:
+            centroids[center_id] = features[int(rng.randrange(n_samples))]
+            continue
+        threshold = rng.random() * total
+        pick = int(np.searchsorted(np.cumsum(closest_sq), threshold, side="right"))
+        pick = min(max(pick, 0), n_samples - 1)
+        centroids[center_id] = features[pick]
+    for _ in range(KMEANS_ITERS):
+        assign = _squared_distances(features, centroids).argmin(axis=1)
+        updated = np.empty_like(centroids)
+        moved = False
+        for center_id in range(k):
+            members = features[assign == center_id]
+            if members.shape[0] == 0:
+                updated[center_id] = centroids[center_id]
+                continue
+            updated[center_id] = members.mean(axis=0)
+            moved = moved or float(np.max(np.abs(updated[center_id] - centroids[center_id]))) > EPS
+        centroids = updated
+        if not moved:
+            break
+    return centroids
+
+
+def _select_prototype(features: np.ndarray, quota: int, rng: random.Random) -> np.ndarray:
+    """One original sample nearest each k-means centroid (feature-mode representatives).
+
+    Args:
+        features: (N, D)
+        quota: Number of centroids / samples.
+        rng: k-means++ RNG.
+
+    Returns:
+        local_indices: (quota,) int64
+    """
+    n_samples = features.shape[0]
+    if quota < 1 or quota > n_samples:
+        raise ValueError(f"prototype quota must be in [1, {n_samples}], got {quota}")
+    centroids = _kmeans_centroids(features, quota, rng)
+    dist_sq = _squared_distances(features, centroids)
+    used = np.zeros(n_samples, dtype=bool)
+    chosen = np.empty(quota, dtype=np.int64)
+    center_order = np.argsort(dist_sq.min(axis=0))
+    for step, center_id in enumerate(center_order):
+        ranking = np.argsort(dist_sq[:, center_id])
+        pick = next((int(local) for local in ranking if not used[local]), None)
+        if pick is None:
+            raise RuntimeError("Prototype selection ran out of unused samples")
+        used[pick] = True
+        chosen[step] = pick
+    return chosen
+
+
+def _select_systematic(order: np.ndarray, quota: int) -> np.ndarray:
+    """Evenly spaced indices along a 1-D order (fallback when no visual features)."""
+    if quota < 1 or quota > order.size:
+        raise ValueError(f"systematic quota must be in [1, {order.size}], got {quota}")
+    return order[(np.arange(quota) * order.size) // quota]
+
+
+def _primary_strata(class_counts: np.ndarray) -> np.ndarray:
+    """Assign each image to its rarest present class; unlabeled images get -1.
+
+    Args:
+        class_counts: (N, C) per-image instance counts.
+
+    Returns:
+        primary: (N,) int64 stratum ids.
+    """
+    n_samples = class_counts.shape[0]
+    presence = class_counts > 0
+    freq = presence.sum(axis=0).astype(np.float64)
+    primary = np.full(n_samples, -1, dtype=np.int64)
+    for index in range(n_samples):
+        classes = np.where(presence[index])[0]
+        if classes.size:
+            primary[index] = int(classes[np.argmin(freq[classes])])
+    return primary
+
+
+def _build_visual_matrix(visual: np.ndarray) -> np.ndarray:
+    """PCA-reduce and L2-normalize visual rows for distribution matching. (N, D')."""
+    if visual.ndim != 2:
+        raise ValueError(f"visual features must be 2D (N, D), got {visual.shape}")
+    reduced = _pca_reduce(visual.astype(np.float64, copy=False), VISUAL_PCA_DIM)
+    return _row_l2(reduced)
+
+
 def _largest_remainder_quotas(sizes: dict[int, int], keep: int) -> dict[int, int]:
     """Allocate ``keep`` integer slots across strata in proportion to stratum size."""
     total = sum(sizes.values())
@@ -275,51 +471,154 @@ def _largest_remainder_quotas(sizes: dict[int, int], keep: int) -> dict[int, int
     return quotas
 
 
+def _select_pc1(features: np.ndarray, secondary: np.ndarray, quota: int) -> np.ndarray:
+    """Systematic sample along the leading principal axis of the stratum features.
+
+    Args:
+        features: (N, D) stratum vectors.
+        secondary: (N,) tie-breaker (typically box counts).
+        quota: Number of local indices to return.
+
+    Returns:
+        local_indices: (quota,) int64 into the stratum.
+    """
+    n_samples, n_dims = features.shape
+    if quota < 1 or quota > n_samples:
+        raise ValueError(f"pc1 quota must be in [1, {n_samples}], got {quota}")
+    if secondary.shape != (n_samples,):
+        raise ValueError(f"secondary must be (N,), got {secondary.shape} vs N={n_samples}")
+    centered = features - features.mean(axis=0, keepdims=True)
+    if n_samples >= 2 and n_dims >= 1:
+        if n_dims <= n_samples:
+            covariance = centered.T @ centered
+            _, eigenvectors = np.linalg.eigh(covariance)
+            scores = centered @ eigenvectors[:, -1]
+        else:
+            _, _, vt = np.linalg.svd(centered, full_matrices=False)
+            scores = centered @ vt[0]
+    else:
+        scores = np.zeros(n_samples, dtype=np.float64)
+    z_feat = (scores - scores.mean()) / (float(scores.std()) + EPS)
+    log_boxes = np.log1p(np.clip(secondary.astype(np.float64), 0.0, None))
+    z_boxes = (log_boxes - log_boxes.mean()) / (float(log_boxes.std()) + EPS)
+    axis = z_feat + z_boxes
+    order = np.lexsort((np.arange(n_samples), axis))
+    return _select_systematic(order, quota)
+
+
+def _select_bucket(features: np.ndarray, secondary: np.ndarray, quota: int) -> np.ndarray:
+    """Pick the feature-mean prototype in each box-count systematic bucket.
+
+    Images are ordered by ``secondary`` (box count) and split into ``quota``
+    equal-size slices; each slice contributes the sample nearest that slice's
+    empirical feature mean. This covers the source density distribution while
+    matching the local appearance mean.
+
+    Args:
+        features: (N, D) stratum vectors.
+        secondary: (N,) box counts.
+        quota: Number of local indices to return.
+
+    Returns:
+        local_indices: (quota,) int64
+    """
+    n_samples = features.shape[0]
+    if quota < 1 or quota > n_samples:
+        raise ValueError(f"bucket quota must be in [1, {n_samples}], got {quota}")
+    if secondary.shape != (n_samples,):
+        raise ValueError(f"secondary must be (N,), got {secondary.shape} vs N={n_samples}")
+    order = np.lexsort((np.arange(n_samples), secondary))
+    used = np.zeros(n_samples, dtype=bool)
+    chosen = np.empty(quota, dtype=np.int64)
+    for step in range(quota):
+        start = (step * n_samples) // quota
+        end = max(((step + 1) * n_samples) // quota, start + 1)
+        bucket = [int(index) for index in order[start:end] if not used[index]]
+        if not bucket:
+            bucket = [int(index) for index in order if not used[index]]
+        if not bucket:
+            raise RuntimeError("Bucket selection exhausted the candidate pool before filling the quota")
+        feat_bucket = features[bucket]
+        center = feat_bucket.mean(axis=0, keepdims=True)
+        pick = bucket[int(np.argmin(_squared_distances(feat_bucket, center)[:, 0]))]
+        used[pick] = True
+        chosen[step] = pick
+    return chosen
+
+
 def select_stratified_coreset(
     records: list[SampleRecord],
     keep: int,
     visual: np.ndarray | None,
+    rng: random.Random,
+    selector: str = "pc1",
 ) -> list[int]:
-    """Select ``keep`` images by rarest-class stratified systematic sampling.
+    """Select ``keep`` images by rarest-class strata plus feature-distribution matching.
 
     Each image is assigned to the rarest class it contains (background images
-    form their own stratum). Strata receive keep-slots in proportion to their
-    source sizes (largest-remainder rounding). Inside a stratum, images are
-    sorted by object count and sampled at even intervals so the subset tracks
-    the source class mix with lower variance than a uniform draw.
-    ``visual`` is unused by this selector and accepted for API compatibility.
+    form their own stratum). Strata receive keep-slots in proportion to
+    ``n_s ** STRATUM_SIZE_EXPONENT`` (largest-remainder rounding, capped at
+    stratum size). Inside a stratum:
+
+    - with visual features: match that stratum's empirical feature distribution
+      via ``selector`` (``pc1`` default, or ``bucket`` / ``kcenter`` / ``herding`` /
+      ``prototype``);
+    - without visual features: systematic sample along box-count order.
+
+    Args:
+        records: Split samples in deterministic file-name order.
+        keep: Target subset size.
+        visual: (N, D) backbone features aligned with ``records``, or None.
+        rng: RNG for prototype k-means++; unused by pc1 / herding / k-center / bucket.
+        selector: Within-stratum feature rule.
+
+    Returns:
+        selected: Length-``keep`` indices into ``records``.
     """
-    del visual
+    if selector not in SELECTORS:
+        raise ValueError(f"Unknown selector {selector!r}; expected one of {SELECTORS}")
     n_samples = len(records)
+    if visual is not None and visual.shape[0] != n_samples:
+        raise ValueError(
+            f"visual rows ({visual.shape[0]}) do not match sample count ({n_samples})"
+        )
     if keep >= n_samples:
         return list(range(n_samples))
     class_counts = np.stack([record.class_counts for record in records], axis=0)
-    presence = class_counts > 0
     n_boxes = class_counts.sum(axis=1)
-    freq = presence.sum(axis=0).astype(np.float64)
-    primary = np.full(n_samples, -1, dtype=np.int64)
-    for index in range(n_samples):
-        classes = np.where(presence[index])[0]
-        if classes.size:
-            primary[index] = int(classes[np.argmin(freq[classes])])
+    primary = _primary_strata(class_counts)
     sizes = {int(stratum): int(np.sum(primary == stratum)) for stratum in np.unique(primary)}
-    # Mild rare-stratum boost: quotas follow size**0.85, then largest remainder.
-    boosted = {stratum: max(1.0, size ** 0.85) for stratum, size in sizes.items()}
+    boosted = {stratum: max(1.0, size ** STRATUM_SIZE_EXPONENT) for stratum, size in sizes.items()}
     boosted_int = {stratum: max(1, int(round(weight))) for stratum, weight in boosted.items()}
     quotas = _largest_remainder_quotas(boosted_int, keep)
     quotas = {stratum: min(quotas[stratum], sizes[stratum]) for stratum in quotas}
+
+    features = None if visual is None else _build_visual_matrix(visual)
     selected: list[int] = []
     taken = np.zeros(n_samples, dtype=bool)
     for stratum, quota in quotas.items():
         if quota <= 0:
             continue
         members = np.where(primary == stratum)[0]
-        order = members[np.lexsort((members, n_boxes[members]))]
-        if quota >= order.size:
-            chosen = order
+        if quota >= members.size:
+            chosen_global = members
+        elif features is None:
+            order = members[np.lexsort((members, n_boxes[members]))]
+            chosen_global = _select_systematic(order, quota)
         else:
-            chosen = order[(np.arange(quota) * order.size) // quota]
-        for index in chosen:
+            stratum_feat = features[members]
+            if selector == "herding":
+                local = _select_herding(stratum_feat, quota)
+            elif selector == "kcenter":
+                local = _select_kcenter(stratum_feat, quota)
+            elif selector == "pc1":
+                local = _select_pc1(stratum_feat, n_boxes[members], quota)
+            elif selector == "bucket":
+                local = _select_bucket(stratum_feat, n_boxes[members], quota)
+            else:
+                local = _select_prototype(stratum_feat, quota, rng)
+            chosen_global = members[local]
+        for index in chosen_global:
             index = int(index)
             if taken[index]:
                 continue
@@ -433,8 +732,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backbone",
         type=str,
-        default="none",
+        default="yoloe-26m-seg.pt",
         help="Visual backbone for coreset splits: local .pt, torchvision:<name>, timm:<name>, or 'none'",
+    )
+    parser.add_argument(
+        "--selector",
+        type=str,
+        default="pc1",
+        choices=list(SELECTORS),
+        help="Within-stratum feature rule: pc1 (default), bucket, kcenter, herding, or prototype",
     )
     parser.add_argument("--device", type=str, default="0", help="Device for visual feature extraction")
     parser.add_argument("--batch_size", type=int, default=32, help="Feature-extraction batch size")
@@ -514,8 +820,14 @@ def main() -> None:
                         else args.feature_cache_dir / f"{split}_{args.backbone.replace(':', '_').replace('/', '_')}.npz"
                     ),
                 )
-            indices = select_stratified_coreset(records, keep, visual)
-            method = "stratified-coreset"
+            indices = select_stratified_coreset(
+                records,
+                keep,
+                visual,
+                rng,
+                selector=args.selector,
+            )
+            method = f"stratified-{args.selector}"
         written = _materialize_split(records, indices, output_dir, split)
         output_config[split] = f"images/{split}"
         LOGGER.info(

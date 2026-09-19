@@ -137,7 +137,8 @@ Keep a ratio or an absolute count of **existing** samples (images are
 symlinked; no new samples are synthesized). Each requested split is compressed
 independently. Splits listed in `--random_splits` (default `val test`) are
 drawn uniformly so they stay on the source distribution; the rest use a
-rarest-class stratified coreset (`tools/prune_dataset.py`). Splits omitted from
+rarest-class stratified coreset whose within-stratum rule matches the deep
+feature distribution (`tools/prune_dataset.py`, default pc1 systematic sampling). Splits omitted from
 `--splits` are absent from the output dataset. YAML paths are relative to the
 written `dataset.yaml`. Algorithm: `docs/project/dataset_prune.md`.
 
@@ -155,14 +156,16 @@ full eval split (mAP50), at the same train hyperparameters and epoch budget:
 scripts/prune_compare/voc/
 ├── common.sh   # the ONLY file to edit when migrating, and only its first
 │               # block: SRC_DATA / DATA_TAG / EVAL_YAML / EVAL_SPLIT /
-│               # RATIOS / SPLITS / RANDOM_SPLITS / PREP_CMDS
+│               # RATIOS / SPLITS / RANDOM_SPLITS / ATTACH_SOURCE_SPLITS /
+│               # DOMAINS / SRC_DATA_ROOT / DATA_TAG_PREFIX / PREP_CMDS
 └── run.sh      # prune coreset + random subsets → train → eval → summarize
 ```
 
 Copy the folder, edit the first block of `common.sh`, and run
-`bash scripts/prune_compare/<copy>/run.sh`. The test passes when coreset mAP50
-is strictly higher than random on a contiguous ratio interval of length
-`MIN_INTERVAL` (default 2).
+`bash scripts/prune_compare/<copy>/run.sh`. A non-empty `DOMAINS` list runs the
+same protocol once per `<SRC_DATA_ROOT>/<domain>/dataset.yaml`. The test passes
+when coreset mAP50 is strictly higher than random on a contiguous ratio interval
+of length `MIN_INTERVAL` (default 2).
 
 ## Demo: VOC-TINY 15+5 (`scripts/voc/tiny/15+5/`)
 
@@ -302,7 +305,7 @@ of the train yamls.
 | `train.sh` | Parse `--tasks` + model/method → resolve → source `run_incremental.sh` |
 | `eval.sh` | Discover `task-*/best.pt` → per (model, yaml) convert class ids → `tools/eval.py` (class-aware + class-agnostic `object` pass) → tables + `tools/stage_task_map.py` |
 | `create.sh` | CIL only: optional subsample (voc-tiny) then `create_incremental_dataset.py` |
-| `prune.sh` | Dataset coreset prune (`tools/prune_dataset.py`): ratio or `--num_out`, per-split |
+| `prune.sh` | Dataset coreset prune (`tools/prune_dataset.py`): ratio or `--num_out`, stratified feature pc1 |
 | `feature_drift.sh` | `tools/feature_drift.py` on `TASK_DATASETS[0]` |
 | `domain_similarity.sh` | `tools/domain_similarity.py` over `--tasks` yamls or `--images` dirs: pluggable feature blocks (`tools/feature_extractors.py`) x distribution metrics (`tools/distribution_metrics.py`) |
 | `predict.sh` | Per yaml: convert class ids → `tools/predict.py --images --labels` |

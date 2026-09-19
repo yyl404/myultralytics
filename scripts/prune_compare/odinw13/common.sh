@@ -15,6 +15,9 @@
 #   DATA_TAG           tag used in output / run directory names
 #   EVAL_YAML          yaml used for the final test (usually the same as SRC_DATA)
 #   EVAL_SPLIT         split of EVAL_YAML to score (test, else val)
+#   DOMAINS            optional domain names; empty = single SRC_DATA / DATA_TAG
+#   SRC_DATA_ROOT      parent dir of <domain>/dataset.yaml (required if DOMAINS set)
+#   DATA_TAG_PREFIX    DATA_TAG becomes PREFIX + domain (required if DOMAINS set)
 #   RATIOS             keep-ratio grid; each split is pruned independently
 #   SPLITS             which source splits to compress into the subset
 #   RANDOM_SPLITS      among SPLITS, uniformly sampled (empty = coreset all of SPLITS)
@@ -28,21 +31,39 @@ SRC_DATA="data/OdinW-13-yolo/VehiclesOpenImages/dataset.yaml"
 DATA_TAG="OdinW-13-VehiclesOpenImages"
 EVAL_YAML="$SRC_DATA"
 EVAL_SPLIT="test"
-RATIOS=(0.15 0.20)
+DOMAINS=(
+    AerialMaritimeDrone
+    Aquarium
+    CottontailRabbits
+    EgoHands
+    NorthAmericaMushrooms
+    Packages
+    PascalVOC
+    Raccoon
+    ShellfishOpenImages
+    VehiclesOpenImages
+    pistols
+    pothole
+    thermalDogsAndPeople
+)
+SRC_DATA_ROOT="data/OdinW-13-yolo"
+DATA_TAG_PREFIX="OdinW-13-"
+RATIOS=(0.20 0.25)
 SPLITS=(train)
 RANDOM_SPLITS=()
 # After pruning, attach these source splits by relative path so train-time
 # validation and any extra eval splits stay on the full original data.
 ATTACH_SOURCE_SPLITS=(val test)
 PREP_CMDS=(
-    "[[ -f data/OdinW-13-yolo/VehiclesOpenImages/dataset.yaml ]] || python tools/convert_odinw13_to_yolo.py --src_dir data/OdinW-13 --out_dir data/OdinW-13-yolo --domains VehiclesOpenImages"
+    "python tools/convert_odinw13_to_yolo.py --src_dir data/OdinW-13 --out_dir data/OdinW-13-yolo"
 )
 
 # Run identity.
-MODEL="${MODEL:-yolo26n}"
-WEIGHTS="${WEIGHTS:-yoloe-26n-seg.pt}"
+MODEL="${MODEL:-yolo26m}"
+WEIGHTS="${WEIGHTS:-yoloe-26m-seg.pt}"
 METHOD="${METHOD:-naive}"
-BACKBONE="${BACKBONE:-none}"
+BACKBONE="${BACKBONE:-yoloe-26m-seg.pt}"
+SELECTOR="${SELECTOR:-pc1}"
 SEED="${SEED:-0}"
 MIN_INTERVAL="${MIN_INTERVAL:-2}"
 FEATURE_CACHE_DIR="${FEATURE_CACHE_DIR:-data/prune_subsets/${DATA_TAG}/feature_cache}"

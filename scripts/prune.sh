@@ -13,7 +13,8 @@
 #   --splits a b c           Splits to write (default: train val test)
 #   --random_splits a b      Among --splits, uniformly sampled (default: val test)
 #   --seed N                 RNG seed (default: 0)
-#   --backbone SPEC          Visual backbone or 'none' (default: none)
+#   --backbone SPEC          Visual backbone or 'none' (default: yoloe-26m-seg.pt)
+#   --selector NAME          Within-stratum rule: pc1 | bucket | kcenter | herding | prototype
 #   --feature_cache_dir DIR  Per-split visual feature cache directory
 #   --                       Extra flags forwarded to tools/prune_dataset.py
 #
@@ -39,7 +40,8 @@ Options:
   --splits a b c           Splits to write (default: train val test)
   --random_splits a b      Uniformly sampled splits (default: val test)
   --seed N                 RNG seed (default: 0)
-  --backbone SPEC          Visual backbone or 'none'
+  --backbone SPEC          Visual backbone or 'none' (default: yoloe-26m-seg.pt)
+  --selector NAME          pc1 (default) | bucket | kcenter | herding | prototype
   --                       Extra flags forwarded to tools/prune_dataset.py
 
 Env: DEVICE (default 0).
@@ -51,7 +53,8 @@ OUT_DIR=""
 RATIO=""
 NUM_OUT=""
 SEED="0"
-BACKBONE="none"
+BACKBONE="yoloe-26m-seg.pt"
+SELECTOR="pc1"
 SPLITS=()
 RANDOM_SPLITS=()
 RANDOM_SPLITS_SET=0
@@ -102,6 +105,10 @@ while [[ $# -gt 0 ]]; do
             BACKBONE="${2:?}"
             shift 2
             ;;
+        --selector)
+            SELECTOR="${2:?}"
+            shift 2
+            ;;
         --feature_cache_dir)
             FEATURE_CACHE_DIR="${2:?}"
             shift 2
@@ -135,7 +142,7 @@ done
     exit 1
 }
 
-cmd=(python tools/prune_dataset.py --src_data "$SRC_DATA" --out_dir "$OUT_DIR" --seed "$SEED" --backbone "$BACKBONE" --device "${DEVICE:-0}")
+cmd=(python tools/prune_dataset.py --src_data "$SRC_DATA" --out_dir "$OUT_DIR" --seed "$SEED" --backbone "$BACKBONE" --selector "$SELECTOR" --device "${DEVICE:-0}")
 if [[ -n "${FEATURE_CACHE_DIR:-}" ]]; then
     cmd+=(--feature_cache_dir "$FEATURE_CACHE_DIR")
 fi
