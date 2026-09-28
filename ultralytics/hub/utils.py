@@ -36,8 +36,7 @@ HELP_MSG = "If this issue persists please visit https://github.com/ultralytics/h
 
 
 def request_with_credentials(url: str) -> Any:
-    """
-    Make an AJAX request with cookies attached in a Google Colab environment.
+    """Make an AJAX request with cookies attached in a Google Colab environment.
 
     Args:
         url (str): The URL to make the request to.
@@ -50,8 +49,8 @@ def request_with_credentials(url: str) -> Any:
     """
     if not IS_COLAB:
         raise OSError("request_with_credentials() must run in a Colab environment")
-    from google.colab import output  # noqa
-    from IPython import display  # noqa
+    from google.colab import output
+    from IPython import display
 
     display.display(
         display.Javascript(
@@ -77,8 +76,7 @@ def request_with_credentials(url: str) -> Any:
 
 
 def requests_with_progress(method: str, url: str, **kwargs):
-    """
-    Make an HTTP request using the specified method and URL, with an optional progress bar.
+    """Make an HTTP request using the specified method and URL, with an optional progress bar.
 
     Args:
         method (str): The HTTP method to use (e.g. 'GET', 'POST').
@@ -121,8 +119,7 @@ def smart_request(
     progress: bool = False,
     **kwargs,
 ):
-    """
-    Make an HTTP request using the 'requests' library, with exponential backoff retries up to a specified timeout.
+    """Make an HTTP request using the 'requests' library, with exponential backoff retries up to a specified timeout.
 
     Args:
         method (str): The HTTP method to use for the request. Choices are 'post' and 'get'.
@@ -181,8 +178,7 @@ def smart_request(
 
 
 class Events:
-    """
-    A class for collecting anonymous event analytics.
+    """A class for collecting anonymous event analytics.
 
     Event analytics are enabled when sync=True in settings and disabled when sync=False. Run 'yolo settings' to see and
     update settings.
@@ -223,8 +219,7 @@ class Events:
         )
 
     def __call__(self, cfg, device=None):
-        """
-        Attempt to add a new event to the events list and send events if the rate limit is reached.
+        """Attempt to add a new event to the events list and send events if the rate limit is reached.
 
         Args:
             cfg (IterableSimpleNamespace): The configuration object containing mode and task information.
