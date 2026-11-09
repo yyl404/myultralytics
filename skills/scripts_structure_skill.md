@@ -30,6 +30,7 @@ scripts/
 ├── eval.sh                        # run dir × explicit eval yaml sequences
 ├── create.sh                      # CIL split builder (the ONLY --dataset/--split entry)
 ├── prune.sh                       # dataset coreset prune (ratio or absolute count)
+├── estimate_keep.sh               # i.i.d. keep-ratio knee from backbone features (no training)
 ├── feature_drift.sh               # task-1 feature drift between two ckpts
 ├── domain_similarity.sh           # N x N image-domain distribution similarity (pluggable features x metrics)
 ├── predict.sh                     # per-dataset inference over yaml sequences
@@ -145,6 +146,17 @@ written `dataset.yaml`. Algorithm: `docs/project/dataset_prune.md`.
 ```bash
 bash scripts/prune.sh --src_data data/VOC-YOLO/VOC.yaml --out_dir data/VOC-pruned --ratio 0.1
 bash scripts/prune.sh --src_data data/VOC-YOLO/VOC.yaml --out_dir data/VOC-pruned-500 --num_out 500
+```
+
+## i.i.d. keep-ratio knee (`scripts/estimate_keep.sh`)
+
+Estimate the lowest keep ratio at which extra i.i.d. training images stop
+moving mAP50, from the pretrained backbone's feature distribution. No
+subset training. Algorithm: `docs/project/keep_ratio.md`. Migrate by changing
+`--src_data` (and `--backbone` when the fine-tune weights differ).
+
+```bash
+bash scripts/estimate_keep.sh --src_data data/VOC-YOLO/VOC.yaml
 ```
 
 ## Prune-vs-random comparison (`scripts/prune_compare/voc/`)

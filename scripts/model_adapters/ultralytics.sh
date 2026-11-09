@@ -97,6 +97,43 @@ model_adapter_regenerate_missing_artifacts() {
     fi
 }
 
+# Rebuild a finished task's replay dataset when a resumed run finds it missing.
+# A task's replay data is cumulative (this task's samples + the previous task's
+# history), so regeneration walks back to task 1 when the history is missing too.
+model_adapter_regenerate_replay_dataset() {
+    local task_id="$1"
+    local task_dir="${OUTPUT_DIR}/task-${task_id}"
+    local replay_dir="${task_dir}/replay_dataset"
+    [[ -f "${replay_dir}/dataset.yaml" ]] && return 0
+
+    local dataset_path
+    if (( task_id == 1 )); then
+        dataset_path="${TASK_DATASETS[0]}"
+    else
+        dataset_path="${task_dir}/task_${task_id}_id_converted/dataset.yaml"
+        if [[ ! -f "$dataset_path" ]]; then
+            echo "Converted training data for task ${task_id} not found: $dataset_path" >&2
+            echo "Cannot regenerate replay dataset: ${replay_dir}" >&2
+            exit 1
+        fi
+    fi
+
+    local -a history_args=()
+    if (( task_id > 1 )); then
+        model_adapter_regenerate_replay_dataset $((task_id - 1))
+        history_args=(--load_hist "${OUTPUT_DIR}/task-$((task_id - 1))/replay_dataset")
+    fi
+
+    echo "Regenerating missing replay dataset: ${replay_dir}"
+    python tools/select_replay_samples.py \
+        --dataset "$dataset_path" \
+        --output_dir "$replay_dir" \
+        --num "$REPLAY_SAMPLE_NUM" \
+        --strategy "$REPLAY_STRATEGY" \
+        --seed "$REPLAY_SEED" \
+        "${history_args[@]}"
+}
+
 model_adapter_initialize() {
     EPOCHS="${EPOCHS:-100}"
     BATCH_SIZE="${BATCH_SIZE:-16}"
@@ -167,11 +204,9 @@ model_adapter_initialize() {
             echo "Previous task RePRE artifact not found: $PREVIOUS_PROTOTYPES" >&2
             exit 1
         fi
-        # Replay data is cumulative, so it cannot be regenerated for a single task; require the
-        # previous task's replay dataset (which embeds its own history) to exist.
-        if method_needs_replay && [[ ! -f "$PREVIOUS_REPLAY/dataset.yaml" ]]; then
-            echo "Previous task replay dataset not found: $PREVIOUS_REPLAY" >&2
-            exit 1
+        # Replay data is cumulative: rebuild it (and any missing history) when resuming.
+        if method_needs_replay; then
+            model_adapter_regenerate_replay_dataset $((START_TASK - 1))
         fi
     fi
 }
@@ -342,10 +377,8 @@ model_adapter_prepare_task() {
         fi
 
         if method_has replay; then
-            if [[ ! -f "$PREVIOUS_REPLAY/dataset.yaml" ]]; then
-                echo "Previous task replay dataset not found: $PREVIOUS_REPLAY" >&2
-                exit 1
-            fi
+            # A resumed run may find the previous task's replay dataset missing.
+            model_adapter_regenerate_replay_dataset $((TASK_ID - 1))
             # Replay labels live in the previous task's class-id space. Head expansion keeps
             # existing class ids and appends unseen classes after them; remap the replay
             # dataset into the expanded model's class-id space, same as the task dataset above.

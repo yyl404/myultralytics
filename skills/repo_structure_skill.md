@@ -34,6 +34,7 @@ scripts/
 ├── eval.sh                        # run dir × explicit eval yaml sequences
 ├── create.sh                      # CIL splits only (the only --dataset/--split entry)
 ├── prune.sh                       # dataset coreset prune (ratio or absolute count)
+├── estimate_keep.sh               # i.i.d. keep-ratio knee from backbone features
 ├── feature_drift.sh
 ├── domain_similarity.sh             # pluggable feature x distribution-metric similarity over yamls or image dirs
 ├── predict.sh                     # per-dataset inference dumps

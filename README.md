@@ -112,6 +112,12 @@ bash scripts/prune_compare/odinw13/run.sh
 
 ODinW-13 源数据为 COCO json 时，先转为 YOLO：`python tools/convert_odinw13_to_yolo.py --src_dir data/OdinW-13 --out_dir data/OdinW-13-yolo`。
 
+在不训练的前提下估计 i.i.d. 学习曲线拐点（精度提升明显变慢的最低保留比例）：输入完整数据集和预训练权重，用骨干特征的邻域覆盖曲线取 Kneedle 拐点。拐点之后的实测 mAP50 见 [docs/project/keep_ratio.md](docs/project/keep_ratio.md)。换数据集只改 `--src_data`。
+
+```bash
+bash scripts/estimate_keep.sh --src_data data/VOC-YOLO/VOC.yaml
+```
+
 ---
 
 ## 3. 训练与评估
