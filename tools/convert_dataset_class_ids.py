@@ -20,7 +20,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER, YAML
 
-from utils import convert_class_ids, normalize_names
+from utils import convert_class_ids, normalize_names, resolve_split_roots
 
 
 _T = TypeVar("_T")
@@ -94,44 +94,6 @@ def _build_class_mapping(
         else:
             LOGGER.warning(f"Class '{class_name}' was not found in model classes and will be skipped")
     return class_id_map, output_names
-
-
-def _resolve_split_roots(
-    dataset_path: Path,
-    dataset_config: Mapping,
-    split: str,
-) -> tuple[list[Path], list[Path]]:
-    """Resolve image and corresponding label roots for one split."""
-    split_value = dataset_config[split]
-    split_entries = [split_value] if isinstance(split_value, str) else split_value
-    if not isinstance(split_entries, Sequence) or not split_entries:
-        raise TypeError(f"Dataset split '{split}' must be a path or non-empty list of paths")
-
-    configured_root = dataset_config.get("path")
-    if configured_root is None:
-        dataset_root = dataset_path.parent
-    else:
-        dataset_root = Path(configured_root)
-        if not dataset_root.is_absolute():
-            dataset_root = dataset_path.parent / dataset_root
-
-    image_roots = []
-    label_roots = []
-    for entry in split_entries:
-        if not isinstance(entry, str):
-            raise TypeError(f"Dataset split '{split}' contains a non-path entry: {entry!r}")
-        image_root = Path(entry)
-        if not image_root.is_absolute():
-            image_root = dataset_root / image_root
-        image_root = image_root.resolve()
-        label_root = Path(str(image_root).replace("images", "labels"))
-        if not image_root.is_dir():
-            raise FileNotFoundError(f"Image directory for split '{split}' does not exist: {image_root}")
-        if not label_root.is_dir():
-            raise FileNotFoundError(f"Label directory for split '{split}' does not exist: {label_root}")
-        image_roots.append(image_root)
-        label_roots.append(label_root)
-    return image_roots, label_roots
 
 
 def _collect_mirrored_jobs(
@@ -291,7 +253,7 @@ def main() -> None:
             LOGGER.warning(f"Split '{split}' was not found in '{args.dataset}'; skipping")
             continue
 
-        image_roots, label_roots = _resolve_split_roots(
+        image_roots, label_roots = resolve_split_roots(
             dataset_path=args.dataset,
             dataset_config=dataset_config,
             split=split,

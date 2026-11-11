@@ -39,7 +39,7 @@ CUMULATIVE_YAMLS=(
 
 # Run identity.
 MODEL="${MODEL:-yolo26m}"
-WEIGHTS="${WEIGHTS:-yoloe-26m-seg.pt}"
+WEIGHTS="${WEIGHTS:-yolo26m-cls.pt}"
 METHOD="${METHOD:-naive}"
 # Default output dir is composed from the identity above (same naming rule as
 # scripts/train.sh); override RUN_DIR to use a fixed location instead.
@@ -79,7 +79,7 @@ DECODE_ARGS="--end2end $END2END --agnostic_nms $AGNOSTIC_NMS --max_det $MAX_DET"
 # (everything after `--`). Overriding an EXTRA_*_ARGS env var replaces the
 # whole string, decode knobs included.
 if [[ -z "${EXTRA_TRAIN_ARGS:-}" ]]; then
-    EXTRA_TRAIN_ARGS="--optimizer AdamW --lr0 0.001 --warmup_bias_lr 0.0 --mosaic 0.5 --freeze 10 $DECODE_ARGS"
+    EXTRA_TRAIN_ARGS="--optimizer AdamW --lr0 0.001 --warmup_bias_lr 0.0 --mosaic 0.5 $DECODE_ARGS"
 fi
 read -ra EXTRA_TRAIN_ARGS <<< "$EXTRA_TRAIN_ARGS"
 EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS:-$DECODE_ARGS}"
@@ -94,5 +94,5 @@ read -ra EXTRA_PREDICT_ARGS <<< "$EXTRA_PREDICT_ARGS"
 export CLASS_AGNOSTIC_EVAL="${CLASS_AGNOSTIC_EVAL:-1}"
 
 # Train knobs (read from the environment by scripts/train.sh).
-export EPOCHS="${EPOCHS:-10}"
+export EPOCHS="${EPOCHS:-100}"
 export DEVICE="${DEVICE:-0}"

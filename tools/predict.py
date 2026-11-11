@@ -79,6 +79,8 @@ from ultralytics.utils import LOGGER, TQDM
 from ultralytics.utils.ops import xywhn2xyxy
 from ultralytics.utils.plotting import Annotator
 
+from utils import pairwise_iou_xyxy
+
 COLOR_TP = (46, 184, 64)
 COLOR_FP = (0, 0, 255)
 COLOR_FN = (0, 200, 255)
@@ -282,21 +284,6 @@ def extract_predictions(result, class_ids: Optional[list[int]]):
         keep = np.isin(classes, class_ids)
         xyxy, xywhn, classes, confs = xyxy[keep], xywhn[keep], classes[keep], confs[keep]
     return xyxy, xywhn, classes, confs
-
-
-def pairwise_iou_xyxy(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
-    """Compute pairwise IoU between two sets of xyxy boxes."""
-    if len(boxes_a) == 0 or len(boxes_b) == 0:
-        return np.zeros((len(boxes_a), len(boxes_b)), dtype=np.float32)
-    a = boxes_a.astype(np.float32, copy=False)
-    b = boxes_b.astype(np.float32, copy=False)
-    left_top = np.maximum(a[:, None, :2], b[None, :, :2])
-    right_bottom = np.minimum(a[:, None, 2:], b[None, :, 2:])
-    wh = np.clip(right_bottom - left_top, 0, None)
-    inter = wh[..., 0] * wh[..., 1]
-    area_a = np.clip(a[:, 2] - a[:, 0], 0, None) * np.clip(a[:, 3] - a[:, 1], 0, None)
-    area_b = np.clip(b[:, 2] - b[:, 0], 0, None) * np.clip(b[:, 3] - b[:, 1], 0, None)
-    return inter / (area_a[:, None] + area_b[None, :] - inter + 1e-6)
 
 
 def match_predictions(
