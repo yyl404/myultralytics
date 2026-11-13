@@ -16,7 +16,7 @@ experiment_known_model_families() {
 }
 
 experiment_known_method_components() {
-    echo "naive bpf pseudo_label ewc l2 dist espreg nsgp repre replay"
+    echo "naive bpf pseudo_label ewc l2 dist lwf espreg nsgp repre replay"
 }
 
 experiment_die() {

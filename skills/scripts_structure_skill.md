@@ -237,7 +237,8 @@ one fails when its artifacts are used.
 | `pseudo_label` | Pseudo-label baseline |
 | `ewc` | + EWC (importance artifact) |
 | `l2` | + L2 |
-| `dist` | + distillation |
+| `dist` | + distillation (KL on top-k teacher channels) |
+| `lwf` | + YOLO LwF self-distillation (teacher = previous task model) |
 | `espreg` | + EspReg (PCA artifact) |
 | `nsgp` | + NSGP (implies EWC + PCA artifacts) |
 | `repre` | + RePRE (prototypes artifact) |

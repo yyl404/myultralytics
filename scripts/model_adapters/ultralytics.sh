@@ -39,7 +39,7 @@ model_adapter_check_method_components() {
     local component
     for component in ${METHOD//+/ }; do
         case "$component" in
-            naive|bpf|pseudo_label|ewc|l2|dist|espreg|nsgp|repre|replay)
+            naive|bpf|pseudo_label|ewc|l2|dist|lwf|espreg|nsgp|repre|replay)
                 ;;
             *)
                 echo "Unimplemented Ultralytics method component: '$component' (METHOD='$METHOD')" >&2
@@ -113,6 +113,14 @@ model_adapter_initialize() {
     ESPREG_LOSS_WEIGHT="${ESPREG_LOSS_WEIGHT:-100.0}"
     DIST_LOSS_WEIGHT="${DIST_LOSS_WEIGHT:-100.0}"
     DIST_TOPK="${DIST_TOPK:-1}"
+    LWF_MODE="${LWF_MODE:-yolo_lwf}"
+    LWF_CLS_LOSS_WEIGHT="${LWF_CLS_LOSS_WEIGHT:-4000.0}"
+    LWF_REG_LOSS_WEIGHT="${LWF_REG_LOSS_WEIGHT:-500.0}"
+    LWF_FEATURE_LOSS_WEIGHT="${LWF_FEATURE_LOSS_WEIGHT:-1.0}"
+    LWF_TEMPERATURE="${LWF_TEMPERATURE:-2.0}"
+    LWF_WCE="${LWF_WCE:-True}"
+    LWF_CLS_IOU="${LWF_CLS_IOU:-True}"
+    LWF_MASK_OLD="${LWF_MASK_OLD:-True}"
     RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
     BPF_INTERIM_EPOCHS="${BPF_INTERIM_EPOCHS:-$EPOCHS}"
     BPF_SCORE_THRESHOLD="${BPF_SCORE_THRESHOLD:-0.75}"
@@ -127,6 +135,10 @@ model_adapter_initialize() {
     BPF_DWF_WEIGHT="${BPF_DWF_WEIGHT:-0.15}"
     REPLAY_SAMPLE_NUM="${REPLAY_SAMPLE_NUM:-100}"
     REPLAY_STRATEGY="${REPLAY_STRATEGY:-random}"
+    REPLAY_MODE="${REPLAY_MODE:-supervised}"
+    OCDM_STATS="${OCDM_STATS:-model}"
+    OCDM_CONF="${OCDM_CONF:-0.5}"
+    OCDM_BATCH_SIZE="${OCDM_BATCH_SIZE:-1000}"
     REPLAY_LOSS_WEIGHT="${REPLAY_LOSS_WEIGHT:-1.0}"
     REPLAY_SEED="${REPLAY_SEED:-0}"
     if ! declare -p EXTRA_TRAIN_ARGS >/dev/null 2>&1; then
@@ -314,6 +326,21 @@ model_adapter_prepare_task() {
             )
         fi
 
+        if method_has lwf; then
+            TRAINER_ARGS+=(
+                --lwf True
+                --lwf_mode "$LWF_MODE"
+                --lwf_teacher_model "$PREVIOUS_MODEL"
+                --lwf_cls_loss_weight "$LWF_CLS_LOSS_WEIGHT"
+                --lwf_reg_loss_weight "$LWF_REG_LOSS_WEIGHT"
+                --lwf_feature_loss_weight "$LWF_FEATURE_LOSS_WEIGHT"
+                --lwf_temperature "$LWF_TEMPERATURE"
+                --lwf_wce "$LWF_WCE"
+                --lwf_cls_iou "$LWF_CLS_IOU"
+                --lwf_mask_old "$LWF_MASK_OLD"
+            )
+        fi
+
         if method_has espreg; then
             TRAINER_ARGS+=(
                 --espreg True
@@ -357,6 +384,7 @@ model_adapter_prepare_task() {
                 --workers "$WORKERS"
             TRAINER_ARGS+=(
                 --replay True
+                --replay_mode "$REPLAY_MODE"
                 --replay_data "$converted_replay/dataset.yaml"
                 --replay_loss_weight "$REPLAY_LOSS_WEIGHT"
             )
@@ -487,13 +515,27 @@ model_adapter_finalize_task() {
         # into the same space by class name, so each task's replay_dataset stays self-consistent.
         # The next task's prepare step remaps the replay dataset into the expanded model's
         # class-id space before training (see model_adapter_prepare_task).
+        # Pool strategies (ocdm) keep the memory at --num samples and annotate the
+        # pool with the model of the task that just finished.
+        ocdm_args=()
+        if [[ "$REPLAY_STRATEGY" == "ocdm" ]]; then
+            ocdm_args=(
+                --ocdm_stats "$OCDM_STATS"
+                --ocdm_model "$PREVIOUS_MODEL"
+                --ocdm_conf "$OCDM_CONF"
+                --ocdm_imgsz "$IMGSZ"
+                --ocdm_device "$TOOL_DEVICE"
+                --ocdm_batch_size "$OCDM_BATCH_SIZE"
+            )
+        fi
         python tools/select_replay_samples.py \
             --dataset "$TRAIN_DATA" \
             --output_dir "${TASK_DIR}/replay_dataset" \
             --num "$REPLAY_SAMPLE_NUM" \
             --strategy "$REPLAY_STRATEGY" \
             --seed "$REPLAY_SEED" \
-            "${history_args[@]}"
+            "${history_args[@]}" \
+            "${ocdm_args[@]}"
         PREVIOUS_REPLAY="${TASK_DIR}/replay_dataset"
     fi
 }

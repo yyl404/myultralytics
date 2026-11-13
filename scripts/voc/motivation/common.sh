@@ -45,19 +45,22 @@ FOUR_STAGE_SPLIT_ID="5_5_5_5"
 MODEL="${MODEL:-yolo26m}"
 WEIGHTS="${WEIGHTS:-yolo26m-cls.pt}"
 METHOD="${METHOD:-naive}"
-if [[ -z "${RUN_DIR_TWO:-}" ]]; then
+# Run directory of one protocol and one method, matching the naming of
+# scripts/train.sh so every stage script resolves the same checkpoint.
+motivation_run_dir() {
+    local tag="$1" method="$2"
     if [[ -n "$WEIGHTS" ]]; then
-        RUN_DIR_TWO="runs/${MODEL}_${TWO_STAGE_TAG}_pretrained-from-${WEIGHTS%.pt}_${METHOD}"
+        echo "runs/${MODEL}_${tag}_pretrained-from-${WEIGHTS%.pt}_${method}"
     else
-        RUN_DIR_TWO="runs/${MODEL}_${TWO_STAGE_TAG}_fromscratch_${METHOD}"
+        echo "runs/${MODEL}_${tag}_fromscratch_${method}"
     fi
+}
+
+if [[ -z "${RUN_DIR_TWO:-}" ]]; then
+    RUN_DIR_TWO="$(motivation_run_dir "$TWO_STAGE_TAG" "$METHOD")"
 fi
 if [[ -z "${RUN_DIR_FOUR:-}" ]]; then
-    if [[ -n "$WEIGHTS" ]]; then
-        RUN_DIR_FOUR="runs/${MODEL}_${FOUR_STAGE_TAG}_pretrained-from-${WEIGHTS%.pt}_${METHOD}"
-    else
-        RUN_DIR_FOUR="runs/${MODEL}_${FOUR_STAGE_TAG}_fromscratch_${METHOD}"
-    fi
+    RUN_DIR_FOUR="$(motivation_run_dir "$FOUR_STAGE_TAG" "$METHOD")"
 fi
 
 # ============================================================================
@@ -92,6 +95,16 @@ VIS_CONF="${VIS_CONF:-0.25}"
 # Predictions are dumped below the lowest swept threshold so every threshold
 # in the sweep is backed by the same dump.
 PREDICT_CONF="${PREDICT_CONF:-0.01}"
+
+# Incremental-model analysis: each method below is trained on the protocol and
+# then run on the history-stage images (two-stage protocol only).
+INCREMENTAL_METHODS=("naive" "lwf")
+# Stage whose checkpoint is analyzed, and the stages whose classes count as history.
+INCREMENTAL_STAGE="${INCREMENTAL_STAGE:-2}"
+INCREMENTAL_HISTORY_STAGES="${INCREMENTAL_HISTORY_STAGES:-1}"
+# Stage whose images the model is run on: the first history stage by default.
+INCREMENTAL_IMAGES_STAGE="${INCREMENTAL_IMAGES_STAGE:-${INCREMENTAL_HISTORY_STAGES%% *}}"
+INCREMENTAL_SPLIT="${INCREMENTAL_SPLIT:-test}"
 
 # Train knobs (read from the environment by scripts/train.sh).
 export EPOCHS="${EPOCHS:-100}"

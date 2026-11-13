@@ -469,6 +469,18 @@ class v8DetectionLoss:
         bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
         if self.class_weights is not None:
             bce_loss *= self.class_weights
+        keep_classes = batch.get("cls_keep_classes")
+        if keep_classes is not None:
+            # Supervise a subset of class channels only: labels provided for the current
+            # task do not annotate the history classes, so those channels are masked.
+            keep_classes = keep_classes.to(device=self.device, dtype=torch.long)
+            if keep_classes.numel() == 0:
+                raise ValueError("cls_keep_classes must hold at least one class id")
+            if int(keep_classes.max()) >= bce_loss.shape[-1]:
+                raise ValueError(
+                    f"cls_keep_classes ids must be below {bce_loss.shape[-1]}, got {int(keep_classes.max())}"
+                )
+            bce_loss = bce_loss[..., keep_classes]
         loss[1] = (bce_loss.sum(dim=-1) * cls_anchor_weights).sum() / target_scores_sum  # BCE
 
         # Bbox loss

@@ -45,6 +45,7 @@ from ultralytics.engine.bpf import (
 )
 from ultralytics.engine.ewc import EWCLoss, load_ewc_state
 from ultralytics.engine.l2 import L2Loss
+from ultralytics.engine.lwf import YOLOLwFLoss, detect_branch_output, feature_l2_loss
 from ultralytics.engine.nsgp import NSGP
 from ultralytics.engine.repre import RegionalPrototypeReplay
 from ultralytics.nn.tasks import load_checkpoint
@@ -423,6 +424,20 @@ def _cycle_batches(loader):
         yield from loader
 
 
+def _mean_lwf_terms(first, second):
+    """Average two ``(classification, regression)`` LwF term pairs.
+
+    ``None`` marks a term the configured LwF mode does not produce (the plain LwF
+    baseline has no classification term), and averaging it in keeps the mean over
+    the current-task and replay images identical to a single concatenated batch.
+    """
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return tuple(None if a is None else 0.5 * (a + b) for a, b in zip(first, second))
+
+
 class AntiForgetTrainer(BaseTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         """
@@ -454,9 +469,35 @@ class AntiForgetTrainer(BaseTrainer):
             loss_names.append("l2_loss")
         if self.args.repre:
             loss_names.append("repre_loss")
-        if self.args.replay:
+        if self.args.replay and self.args.replay_mode in {"supervised", "both"}:
             loss_names.append("replay_loss")
+        if self.args.lwf:
+            if self.args.lwf_mode == "lwf":
+                loss_names.append("lwf_loss")
+            else:
+                loss_names.extend(("lwf_cls_loss", "lwf_reg_loss"))
         return tuple(loss_names)
+
+    def _lwf_teacher_output(self, batch):
+        """Run the frozen LwF teacher on a batch and return its output plus head input features.
+
+        The head input features are captured only for the plain LwF baseline, which
+        distills features instead of head outputs.
+        """
+        with torch.no_grad():
+            if self.args.lwf_mode == "lwf":
+                return get_model_raw_output_and_features(batch, self.lwf_teacher, self.device)
+            return get_model_raw_output(batch, self.lwf_teacher, self.device), None
+
+    def _lwf_terms(self, student_output, student_feats, teacher_output, teacher_feats):
+        """Return the (classification, regression) LwF terms of one student/teacher output pair."""
+        if self.args.lwf_mode == "lwf":
+            return None, feature_l2_loss(student_feats, teacher_feats, self.lwf_feature_channels)
+        return self.lwf_loss(
+            detect_branch_output(student_output),
+            detect_branch_output(teacher_output),
+            _get_detect_head(self.model).stride,
+        )
 
     def _setup_train(self, world_size):
         """Build dataloaders and optimizer on correct rank process."""
@@ -560,6 +601,56 @@ class AntiForgetTrainer(BaseTrainer):
             )
         # ============================== END: set up RePRE ===============================================
 
+        # ============================== MODIFIED: validate replay mode =================================
+        if self.args.replay_mode not in {"supervised", "distill", "both"}:
+            raise ValueError(
+                f"replay_mode must be 'supervised', 'distill' or 'both', got {self.args.replay_mode!r}"
+            )
+        if self.args.replay_mode in {"distill", "both"} and not self.args.lwf:
+            raise ValueError(f"replay_mode '{self.args.replay_mode}' needs lwf to distill the replay samples")
+        # ============================== END: validate replay mode =======================================
+
+        # ============================== MODIFIED: set up YOLO LwF ========================================
+        self.lwf_keep_classes = None
+        if self.args.lwf:
+            if not self.args.lwf_teacher_model:
+                raise ValueError("lwf_teacher_model (the previous-task checkpoint) is required when lwf is enabled")
+            if self.args.lwf_mode not in {"yolo_lwf", "lwf"}:
+                raise ValueError(f"lwf_mode must be 'yolo_lwf' or 'lwf', got {self.args.lwf_mode!r}")
+            self.lwf_teacher, _ = load_checkpoint(self.args.lwf_teacher_model, device=self.device)
+            self.lwf_teacher = self.lwf_teacher.eval()
+            self.lwf_teacher.requires_grad_(False)
+            _apply_train_head_args(self.lwf_teacher, self.args)
+            _check_teacher_decode_alignment(self.lwf_teacher, self.model, "lwf_teacher_model")
+            student_head = _get_detect_head(self.model)
+            teacher_head = _get_detect_head(self.lwf_teacher)
+            self.lwf_history_nc = teacher_head.nc
+            if teacher_head.reg_max != student_head.reg_max:
+                raise ValueError(
+                    f"LwF teacher reg_max {teacher_head.reg_max} differs from the student reg_max "
+                    f"{student_head.reg_max}; the box head layout must match"
+                )
+            if not 0 < self.lwf_history_nc < student_head.nc:
+                raise ValueError(
+                    f"LwF needs history class channels below the student class count, got teacher nc "
+                    f"{self.lwf_history_nc} and student nc {student_head.nc}"
+                )
+            self.lwf_loss = YOLOLwFLoss(
+                reg_max=student_head.reg_max,
+                history_nc=self.lwf_history_nc,
+                temperature=self.args.lwf_temperature,
+                wce=self.args.lwf_wce,
+                cls_iou=self.args.lwf_cls_iou,
+            )
+            self.lwf_feature_channels = 4 * student_head.reg_max + self.lwf_history_nc
+            if self.args.lwf_mask_old:
+                self.lwf_keep_classes = torch.arange(self.lwf_history_nc, student_head.nc, device=self.device)
+            LOGGER.info(
+                f"YOLO LwF ({self.args.lwf_mode}) teacher '{self.args.lwf_teacher_model}' with "
+                f"{self.lwf_history_nc} history classes, student with {student_head.nc} class channels"
+            )
+        # ============================== END: set up YOLO LwF =============================================
+
         # Freeze layers
         freeze_list = (
             self.args.freeze
@@ -635,6 +726,18 @@ class AntiForgetTrainer(BaseTrainer):
                 str(replay_train_path), batch_size=batch_size, rank=LOCAL_RANK, mode="train"
             )
         # ============================== END: set up replay dataloader ==========================================
+        # ============================== MODIFIED: validate LwF label coverage ============================
+        if self.lwf_keep_classes is not None:
+            annotated = sorted(
+                {int(cls) for label in self.train_loader.dataset.labels for cls in np.asarray(label["cls"]).reshape(-1)}
+            )
+            unsupervised = sorted(set(annotated) - set(self.lwf_keep_classes.tolist()))
+            if unsupervised:
+                raise ValueError(
+                    f"The current-task labels annotate history class ids {unsupervised}, which lwf_mask_old "
+                    f"would drop from supervision; disable lwf_mask_old or fix the task split"
+                )
+        # ============================== END: validate LwF label coverage =================================
         # ============================== MODIFIED: DDP-safe validation setup (all ranks) ==================
         # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
         self.test_loader = self.get_dataloader(
@@ -769,12 +872,15 @@ class AntiForgetTrainer(BaseTrainer):
                     if self.args.bpf and self.args.bpf_dwf:
                         with torch.no_grad():
                             bpf_interim_pred = get_model_raw_output(batch, self.bpf_interim_model, self.device)
-                    if self.args.bpf and self.args.bpf_future:
-                        model_pred, bpf_head_features = get_model_raw_output_and_features(
+                    if self.args.lwf:
+                        lwf_teacher_pred, lwf_teacher_feats = self._lwf_teacher_output(batch)
+                    if (self.args.bpf and self.args.bpf_future) or (self.args.lwf and self.args.lwf_mode == "lwf"):
+                        model_pred, head_features = get_model_raw_output_and_features(
                             batch, self.model, self.device
                         )
                     else:
                         model_pred = get_model_raw_output(batch, self.model, self.device)
+                        head_features = None
                     # ============================== END: get raw preds =======================================
 
                     # ============================== MODIFIED: generate pseudo labels ===============================
@@ -812,7 +918,7 @@ class AntiForgetTrainer(BaseTrainer):
                         batch["bpf_ignore_mask"] = select_future_ignore_mask(
                             head=_get_detect_head(self.model),
                             raw_output=_raw_detect_levels(model_pred),
-                            head_features=bpf_head_features,
+                            head_features=head_features,
                             batch=batch,
                             object_topk=self.args.bpf_object_topk,
                             attention_topk=self.args.bpf_attention_topk,
@@ -822,6 +928,8 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== END: BPF labels and future mask ==============================
                     
                     # ============================== MODIFIED: get det loss ===============================
+                    if self.lwf_keep_classes is not None:
+                        batch["cls_keep_classes"] = self.lwf_keep_classes
                     loss, self.loss_items = self.model(batch, preds=model_pred)
                     # ============================== END: get det loss ====================================
 
@@ -830,6 +938,12 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== END: make a copy of loss items ====================================
                     
                     self.loss = loss.sum()
+
+                    # ============================== MODIFIED: YOLO LwF terms on the current batch ================
+                    lwf_current = None
+                    if self.args.lwf:
+                        lwf_current = self._lwf_terms(model_pred, head_features, lwf_teacher_pred, lwf_teacher_feats)
+                    # ============================== END: YOLO LwF terms on the current batch =====================
 
                     # ============================== MODIFIED: calculate KLD distillation loss ==========================
                     if self.args.distillation:
@@ -886,15 +1000,47 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== END: replay regional prototypes ====================================
 
                     # ============================== MODIFIED: calculate replay loss ====================================
+                    lwf_replay = None
                     if self.args.replay:
-                        # Replay samples carry old-class GT only, so the plain detection loss on a
-                        # replay batch supervises exactly the historical classes.
                         replay_batch = self.preprocess_batch(next(replay_iter))
-                        replay_loss_vec, _ = self.model(replay_batch)  # (box, cls, dfl|l1) * batch size
-                        _replay_loss = replay_loss_vec.sum()
-                        self.loss += _replay_loss * self.args.replay_loss_weight
-                        loss_items["replay_loss"] = _replay_loss.detach()
+                        replay_teacher_pred = replay_teacher_feats = None
+                        replay_pred = replay_feats = None
+                        if self.args.lwf and self.args.replay_mode in {"distill", "both"}:
+                            # Replay images are distilled only; no replay label takes part in it.
+                            replay_teacher_pred, replay_teacher_feats = self._lwf_teacher_output(replay_batch)
+                            if self.args.lwf_mode == "lwf":
+                                replay_pred, replay_feats = get_model_raw_output_and_features(
+                                    replay_batch, self.model, self.device
+                                )
+                            else:
+                                replay_pred = get_model_raw_output(replay_batch, self.model, self.device)
+                        if self.args.replay_mode in {"supervised", "both"}:
+                            # Replay samples carry old-class GT only, so the plain detection loss on a
+                            # replay batch supervises exactly the historical classes.
+                            replay_loss_vec, _ = self.model(replay_batch, preds=replay_pred)
+                            _replay_loss = replay_loss_vec.sum()
+                            self.loss += _replay_loss * self.args.replay_loss_weight
+                            loss_items["replay_loss"] = _replay_loss.detach()
+                        if replay_pred is not None:
+                            lwf_replay = self._lwf_terms(
+                                replay_pred, replay_feats, replay_teacher_pred, replay_teacher_feats
+                            )
                     # ============================== END: calculate replay loss =========================================
+
+                    # ============================== MODIFIED: compose YOLO LwF loss ===================================
+                    if lwf_current is not None:
+                        lwf_cls, lwf_reg = _mean_lwf_terms(lwf_current, lwf_replay)
+                        if lwf_cls is None:
+                            lwf_total = lwf_reg * self.args.lwf_feature_loss_weight
+                            loss_items["lwf_loss"] = lwf_reg.detach()
+                        else:
+                            lwf_total = (
+                                lwf_cls * self.args.lwf_cls_loss_weight + lwf_reg * self.args.lwf_reg_loss_weight
+                            )
+                            loss_items["lwf_cls_loss"] = lwf_cls.detach()
+                            loss_items["lwf_reg_loss"] = lwf_reg.detach()
+                        self.loss += lwf_total * batch["img"].shape[0]
+                    # ============================== END: compose YOLO LwF loss ========================================
 
                     if RANK != -1:
                         self.loss *= world_size                   

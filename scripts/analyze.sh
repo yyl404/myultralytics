@@ -12,6 +12,7 @@
 #   confusion_matrix  Old/new/background confusion matrix aggregation (tools/parse_confusion_matrix.py)
 #   stage_stats       Per-stage class counts and sample overlap (tools/stage_dataset_stats.py)
 #   teacher_errors    Teacher high-confidence error rates vs threshold (tools/teacher_error_analysis.py)
+#   incremental_errors Incremental-model high-confidence error rates vs threshold (tools/incremental_error_analysis.py)
 #
 # Example:
 #   bash scripts/analyze.sh pca_projection \
@@ -54,12 +55,15 @@ case "$ANALYSIS" in
     teacher_errors)
         exec python tools/teacher_error_analysis.py "$@"
         ;;
+    incremental_errors)
+        exec python tools/incremental_error_analysis.py "$@"
+        ;;
     -h|--help|help)
         sed -n '2,20p' "$0"
         ;;
     *)
         echo "Unknown analysis: $ANALYSIS" >&2
-        echo "Expected one of: pca_projection, kernel_projection, eigen_adjust, prototypes, confusion_matrix, stage_stats, teacher_errors" >&2
+        echo "Expected one of: pca_projection, kernel_projection, eigen_adjust, prototypes, confusion_matrix, stage_stats, teacher_errors, incremental_errors" >&2
         exit 1
         ;;
 esac

@@ -196,6 +196,19 @@ repre_prototypes: None # (str) density-aware prototype artifact generated after 
 repre_loss_weight: 1.0 # (float) contribution of classification-only regional replay
 
 # Replay (experience replay) settings ------------------------------------------------------------------------------
-replay: False # (bool) replay old-task samples with their ground truth alongside current-task training
+replay: False # (bool) draw replay samples alongside current-task training
 replay_data: None # (str, optional) replay dataset YAML accumulated from the previous tasks
+replay_mode: supervised # (str) how replay samples are used: supervised (detection loss), distill (self-distillation only), both
 replay_loss_weight: 1.0 # (float) contribution weight of the replay detection loss
+
+# YOLO LwF (self-distillation) settings -----------------------------------------------------------------------------
+lwf: False # (bool) use the LwF training path (requires lwf_teacher_model)
+lwf_mode: yolo_lwf # (str) yolo_lwf (output distillation) or lwf (feature-L2 baseline)
+lwf_teacher_model: None # (str) frozen previous-task model providing the distillation target
+lwf_cls_loss_weight: 4000.0 # (float) classification distillation weight
+lwf_reg_loss_weight: 500.0 # (float) regression distillation weight
+lwf_feature_loss_weight: 1.0 # (float) feature-L2 weight of the lwf baseline mode
+lwf_temperature: 2.0 # (float) regression distillation temperature
+lwf_wce: True # (bool) weight each regression loss by the teacher objectness
+lwf_cls_iou: True # (bool) weight each classification loss by the teacher/student box agreement
+lwf_mask_old: True # (bool) drop history class channels from the supervised classification loss
