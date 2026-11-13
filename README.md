@@ -55,6 +55,9 @@ bash scripts/create.sh voc-tiny 15_5
 
 bash scripts/create.sh voc 15_5
 bash scripts/create.sh coco 70_10
+
+# VOC LoCo 10+10：Low Co-occurrence 划分（共现频繁的类别聚到同一阶段，每张图只进入一个阶段）
+bash scripts/create.sh voc-loco 10_10
 ```
 
 `--split` 为下划线连接的每任务类别数，对应 `data/` 下的 `+` 目录名（`15_5` → `VOC_15+5`）。任意正整数序列均可，不必再加脚本。
@@ -64,6 +67,7 @@ bash scripts/create.sh coco 70_10
 | VOC | `voc` | `10_10` / `15_5` / `19_1` / `10_5_5` / `5_5_5_5` / `10_2_2_2_2_2` | `data/VOC-YOLO/VOC.yaml` |
 | VOC-TINY | `voc-tiny` | `15_5` | 先 subsample 到 `data/VOC-TINY-YOLO/` |
 | COCO | `coco` | `40_40` / `70_10` | `data/coco-yolo/coco.yaml` |
+| VOC-LoCo | `voc-loco` | `10_10` / `5_5_5_5` | `data/VOC-YOLO/VOC.yaml`（Low Co-occurrence 划分） |
 
 ### 2.2 任务增量数据集（OdinW-13）
 

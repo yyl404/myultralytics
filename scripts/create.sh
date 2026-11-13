@@ -3,10 +3,13 @@
 #
 # Usage:
 #   bash scripts/create.sh --dataset voc --split 15_5
+#   bash scripts/create.sh voc-loco 10_10
 #   bash scripts/create.sh voc-tiny 15_5
 #
+# voc-loco builds the Low Co-occurrence (LoCo) split: co-occurring classes are
+# clustered into stages and each image belongs to exactly one stage.
 # voc-tiny first writes a seeded subsample under data/VOC-TINY-YOLO, then the incremental split.
-# Env: WORKERS, TINY_FRACTION (default 0.25), SEED (default 0).
+# Env: WORKERS, SEED (default 0), TINY_FRACTION (default 0.25).
 
 set -euo pipefail
 
@@ -20,10 +23,12 @@ usage() {
 Unified CIL split creation. TIL datasets (odinw-13) are pre-bundled.
 
   bash scripts/create.sh --dataset voc --split 15_5
+  bash scripts/create.sh voc-loco 10_10
   bash scripts/create.sh voc-tiny 15_5
 
+voc-loco builds the Low Co-occurrence (LoCo) split.
 voc-tiny first writes a seeded subsample under data/VOC-TINY-YOLO.
-Env: WORKERS, TINY_FRACTION (default 0.25), SEED (default 0).
+Env: WORKERS, SEED (default 0), TINY_FRACTION (default 0.25).
 EOF
 }
 
@@ -82,6 +87,8 @@ create_args=(
     --source_cfg "$SOURCE_CFG"
     --output_dir "$DATA_ROOT"
     --n_classes "${CLASS_COUNTS[@]}"
+    --mode "$CREATE_MODE"
+    --seed "${SEED:-0}"
     --workers "${WORKERS:-8}"
 )
 if [[ -n "$OVERWRITE" || -n "$CREATE_OVERWRITE_DEFAULT" ]]; then

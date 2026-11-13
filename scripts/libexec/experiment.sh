@@ -8,7 +8,7 @@
 # and predict take explicit yaml sequences.
 
 experiment_known_datasets() {
-    echo "voc voc-tiny coco odinw-13"
+    echo "voc voc-loco voc-tiny coco odinw-13"
 }
 
 experiment_known_model_families() {
@@ -99,6 +99,7 @@ experiment_load_dataset() {
     SPLIT="$split"
     CREATE_PREREQ_CMDS=()
     SOURCE_CFG=""
+    CREATE_MODE="sample-filter"
     CREATE_OVERWRITE_DEFAULT=""
 
     case "$dataset" in
@@ -107,6 +108,13 @@ experiment_load_dataset() {
             DATA_TAG="VOC_${split//_/+}"
             DATA_ROOT="data/${DATA_TAG}"
             SOURCE_CFG="data/VOC-YOLO/VOC.yaml"
+            ;;
+        voc-loco)
+            INCREMENTAL_SETTING="cil"
+            DATA_TAG="VOC_LoCo_${split//_/+}"
+            DATA_ROOT="data/${DATA_TAG}"
+            SOURCE_CFG="data/VOC-YOLO/VOC.yaml"
+            CREATE_MODE="loco"
             ;;
         voc-tiny)
             INCREMENTAL_SETTING="cil"

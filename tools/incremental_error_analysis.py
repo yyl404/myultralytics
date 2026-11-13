@@ -219,8 +219,41 @@ def _classify_boxes(pred_names, pred_confs, gt_groups, iou_matrix, threshold, io
     return reported, kinds, gt_refs
 
 
+def _classify_gt_objects(pred_names, pred_confs, gt_groups, iou_matrix, threshold, iou_threshold, class_groups):
+    """Classify every GT object by its highest-IoU reported box at a threshold.
+
+    A GT object with no reported box above the IoU threshold is missed; otherwise
+    its outcome is ``correct`` when the best box names a class of the GT's group,
+    or ``<gt_group>_to_<pred_group>`` when it names another group. These counts
+    therefore sum to the number of GT objects, unlike the box-level ``type*``
+    counts where several boxes may match the same object.
+    """
+    counts = defaultdict(int)
+    if not gt_groups:
+        return counts
+    reported = np.where(pred_confs >= threshold)[0]
+    if len(reported) == 0:
+        for group in gt_groups:
+            counts[f"obj_miss_{group}"] += 1
+        return counts
+
+    ious = iou_matrix[reported]  # (num_reported, num_gt)
+    best_reported = ious.argmax(axis=0)  # (num_gt,)
+    best_iou = ious[best_reported, np.arange(len(gt_groups))]
+    for gt_index, gt_group in enumerate(gt_groups):
+        if best_iou[gt_index] <= iou_threshold:
+            counts[f"obj_miss_{gt_group}"] += 1
+            continue
+        pred_group = class_groups[pred_names[reported[best_reported[gt_index]]]]
+        if pred_group == gt_group:
+            counts[f"obj_correct_{gt_group}"] += 1
+        else:
+            counts[f"obj_{gt_group}_to_{pred_group}"] += 1
+    return counts
+
+
 def _count_image(pred_names, pred_confs, gt_groups, iou_matrix, threshold, iou_threshold, class_groups):
-    """Count reported boxes by error type and missed GT objects of one image."""
+    """Count reported boxes by error type and classify the GT objects of one image."""
     counts = defaultdict(int)
     reported, kinds, _ = _classify_boxes(
         pred_names, pred_confs, gt_groups, iou_matrix, threshold, iou_threshold, class_groups
@@ -228,6 +261,10 @@ def _count_image(pred_names, pred_confs, gt_groups, iou_matrix, threshold, iou_t
     counts["pred"] = len(reported)
     for kind in kinds:
         counts[kind] += 1
+    for key, count in _classify_gt_objects(
+        pred_names, pred_confs, gt_groups, iou_matrix, threshold, iou_threshold, class_groups
+    ).items():
+        counts[key] += count
     if len(reported) == 0:
         missed = np.ones(len(gt_groups), dtype=bool)
     else:
@@ -733,6 +770,18 @@ def main() -> None:
                 "n_miss_history": counts["miss_history"],
                 "n_miss_incremental": counts["miss_incremental"],
                 "n_miss_future": counts["miss_future"],
+                "n_obj_correct_history": counts["obj_correct_history"],
+                "n_obj_history_to_incremental": counts["obj_history_to_incremental"],
+                "n_obj_history_to_future": counts["obj_history_to_future"],
+                "n_obj_miss_history": counts["obj_miss_history"],
+                "n_obj_correct_incremental": counts["obj_correct_incremental"],
+                "n_obj_incremental_to_history": counts["obj_incremental_to_history"],
+                "n_obj_incremental_to_future": counts["obj_incremental_to_future"],
+                "n_obj_miss_incremental": counts["obj_miss_incremental"],
+                "n_obj_correct_future": counts["obj_correct_future"],
+                "n_obj_future_to_history": counts["obj_future_to_history"],
+                "n_obj_future_to_incremental": counts["obj_future_to_incremental"],
+                "n_obj_miss_future": counts["obj_miss_future"],
                 "type1_rate": _safe_rate(counts["type1"], counts["pred"]),
                 "type2_rate": _safe_rate(counts["type2"], counts["pred"]),
                 "type3_rate": _safe_rate(counts["type3"], counts["pred"]),

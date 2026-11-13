@@ -1,21 +1,44 @@
-"""Create class-incremental YOLO datasets with parallel file processing."""
+"""Create class-incremental YOLO datasets with parallel file processing.
+
+Splitting modes:
+    sample-filter: every stage absorbs every image containing one of its classes,
+        so one image can be copied into several stages (the classic protocol).
+    full-split: like sample-filter, but each image is copied into exactly one
+        stage, chosen to balance the per-stage image counts.
+    label-filter: every image is copied into every stage with its labels
+        filtered to that stage's classes.
+    loco: Low Co-occurrence (LoCo). Classes that frequently co-occur are
+        clustered into the same stage, and every image is assigned to exactly
+        one of its candidate stages. This limits cross-stage image overlap and
+        removes the pseudo-label leakage that comes from reusing training images.
+
+The LoCo stage partition is built from a category co-occurrence matrix
+``A[i, j]`` = number of images in which classes ``i`` and ``j`` co-occur. The
+matrix defines a weighted undirected graph whose nodes are classes; a balanced
+spectral bisection clusters the nodes into the requested per-stage class counts.
+Images whose classes span several stages are assigned to one candidate stage by
+a seeded pseudo-random rule, so each image appears in exactly one stage.
+"""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
+import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from typing import TypeVar
 
+import numpy as np
 from tqdm import tqdm
 
 from ultralytics.utils import LOGGER, YAML
-
 
 SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".png", ".jpeg", ".bmp")
 SUPPORTED_LABEL_EXTENSIONS = (".txt",)
@@ -132,6 +155,22 @@ def _validate_unique_label_stems(label_files: Sequence[Path]) -> None:
             )
 
 
+def _resolve_split_dirs(
+    split_config: str | Sequence[str],
+    source_config: Path,
+) -> tuple[list[Path], list[Path]]:
+    """Resolve one split's image and label directories relative to its YAML."""
+    image_entries = [split_config] if isinstance(split_config, str) else list(split_config)
+    if not image_entries or not all(isinstance(entry, str) for entry in image_entries):
+        raise TypeError(f"Split must be a path or list of paths, got {split_config!r}")
+    image_dirs = [_resolve_dataset_path(entry, source_config) for entry in image_entries]
+    label_dirs = [
+        _resolve_dataset_path(entry.replace("images", "labels"), source_config)
+        for entry in image_entries
+    ]
+    return image_dirs, label_dirs
+
+
 def _parse_label(label_path: Path, image_index: Mapping[str, Path]) -> ParseResult:
     """Parse one YOLO label file without mutating shared state."""
     image_path = image_index.get(label_path.stem)
@@ -167,6 +206,217 @@ def _parse_label(label_path: Path, image_index: Mapping[str, Path]) -> ParseResu
     )
 
 
+def _read_label_class_ids(
+    label_path: Path,
+    image_index: Mapping[str, Path],
+    used_class_ids: frozenset[int],
+) -> frozenset[int] | None:
+    """Return the used class ids of one label, or ``None`` when it has no image."""
+    if label_path.stem not in image_index:
+        return None
+    class_ids = set()
+    try:
+        with label_path.open(encoding="utf-8") as label_file:
+            for line in label_file:
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                class_id = int(parts[0])
+                if class_id in used_class_ids:
+                    class_ids.add(class_id)
+    except (OSError, ValueError) as error:
+        LOGGER.warning(
+            f"Skipping label '{label_path}' in the LoCo co-occurrence estimate: "
+            f"{type(error).__name__}: {error}"
+        )
+        return None
+    return frozenset(class_ids)
+
+
+def _build_cooccurrence_matrix(
+    class_sets: Iterable[frozenset[int]],
+    class_ids: Sequence[int],
+) -> tuple[np.ndarray, int]:
+    """Build the LoCo category co-occurrence matrix ``A`` over the given images.
+
+    ``A[i, j]`` counts the images in which classes ``i`` and ``j`` co-occur and
+    ``A[i, i]`` counts the images holding class ``i``.
+    """
+    positions = {class_id: index for index, class_id in enumerate(class_ids)}
+    matrix = np.zeros((len(class_ids), len(class_ids)), dtype=np.float64)
+    image_count = 0
+    for class_set in class_sets:
+        present = sorted(positions[class_id] for class_id in class_set if class_id in positions)
+        if not present:
+            continue
+        image_count += 1
+        for position in present:
+            matrix[position, position] += 1.0
+        for left, right in combinations(present, 2):
+            matrix[left, right] += 1.0
+            matrix[right, left] += 1.0
+    return matrix, image_count
+
+
+def _estimate_class_cooccurrence(
+    split_config: str | Sequence[str],
+    source_config: Path,
+    used_class_ids: frozenset[int],
+    split: str,
+) -> tuple[np.ndarray, int]:
+    """Estimate the LoCo co-occurrence matrix from one source split."""
+    image_dirs, label_dirs = _resolve_split_dirs(split_config, source_config)
+    image_files = _discover_files(image_dirs, SUPPORTED_IMAGE_EXTENSIONS)
+    label_files = _discover_files(label_dirs, SUPPORTED_LABEL_EXTENSIONS)
+    _validate_unique_label_stems(label_files)
+    image_index = _build_image_index(image_files)
+
+    class_sets = []
+    for label_path in tqdm(label_files, desc=f"LoCo co-occurrence ({split})"):
+        class_set = _read_label_class_ids(label_path, image_index, used_class_ids)
+        if class_set is not None:
+            class_sets.append(class_set)
+    return _build_cooccurrence_matrix(class_sets, sorted(used_class_ids))
+
+
+def _cut_weight(weights: np.ndarray, left: Sequence[int], right: Sequence[int]) -> float:
+    """Return the total edge weight between two disjoint node sets."""
+    return float(weights[np.ix_(left, right)].sum())
+
+
+def _refine_bisection(
+    weights: np.ndarray,
+    left: Sequence[int],
+    right: Sequence[int],
+    class_ids: Sequence[int],
+) -> tuple[list[int], list[int]]:
+    """Reduce the cut by single-class swaps while keeping both side sizes fixed.
+
+    Each iteration applies the best negative-delta swap; ties are broken by class
+    id so the partition is deterministic.
+    """
+    left = list(left)
+    right = list(right)
+    while True:
+        best_delta = 0.0
+        best_key: tuple[float, int, int] | None = None
+        best_pair: tuple[int, int] | None = None
+        for left_position in left:
+            for right_position in right:
+                # Moving left_position to the right and right_position to the left
+                # changes the cut by this amount (weights[i, i] is zero).
+                delta = (
+                    weights[left_position, left].sum()
+                    - weights[left_position, right].sum()
+                    + weights[right_position, right].sum()
+                    - weights[right_position, left].sum()
+                    + 2.0 * weights[left_position, right_position]
+                )
+                key = (float(delta), class_ids[left_position], class_ids[right_position])
+                if key[0] < best_delta - 1e-9:
+                    best_delta, best_key, best_pair = key[0], key, (left_position, right_position)
+                elif best_key is not None and abs(key[0] - best_delta) <= 1e-9 and key < best_key:
+                    best_key, best_pair = key, (left_position, right_position)
+        if best_pair is None:
+            return sorted(left), sorted(right)
+        left_position, right_position = best_pair
+        left.remove(left_position)
+        right.remove(right_position)
+        left.append(right_position)
+        right.append(left_position)
+
+
+def _spectral_bisect(
+    weights: np.ndarray,
+    nodes: Sequence[int],
+    left_size: int,
+    class_ids: Sequence[int],
+) -> tuple[list[int], list[int]]:
+    """Split nodes into fixed-size sides along the Fiedler vector, then refine."""
+    node_count = len(nodes)
+    if left_size <= 0 or left_size >= node_count:
+        return sorted(nodes[:left_size]), sorted(nodes[left_size:])
+
+    submatrix = weights[np.ix_(nodes, nodes)]  # (node_count, node_count)
+    degree = submatrix.sum(axis=1)  # (node_count,)
+    inv_sqrt = np.zeros_like(degree)
+    np.divide(1.0, np.sqrt(degree), out=inv_sqrt, where=degree > 0)
+    normalized = inv_sqrt[:, None] * submatrix * inv_sqrt[None, :]
+    laplacian = np.eye(node_count) - normalized
+    laplacian = (laplacian + laplacian.T) / 2.0
+    _, eigenvectors = np.linalg.eigh(laplacian)
+    fiedler = eigenvectors[:, 1] if node_count > 1 else np.zeros(node_count)  # (node_count,)
+
+    order = sorted(
+        range(node_count),
+        key=lambda index: (float(fiedler[index]), class_ids[nodes[index]]),
+    )
+    # The Fiedler vector sign is arbitrary across LAPACK builds, so evaluate both
+    # orientations and keep the lower cut; class ids break exact ties.
+    candidates = []
+    for selected in (order[:left_size], order[-left_size:]):
+        selected_set = set(selected)
+        left = [nodes[index] for index in selected]
+        right = [nodes[index] for index in range(node_count) if index not in selected_set]
+        left, right = _refine_bisection(weights, left, right, class_ids)
+        candidates.append((_cut_weight(weights, left, right), tuple(sorted(left)), left, right))
+    _, _, left, right = min(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+    return left, right
+
+
+def _split_position(stage_sizes: Sequence[int]) -> int:
+    """Return the stage index that bisects the requested class counts most evenly."""
+    total = sum(stage_sizes)
+    split = 1
+    best_gap = abs(2 * stage_sizes[0] - total)
+    for index in range(1, len(stage_sizes)):
+        gap = abs(2 * sum(stage_sizes[:index]) - total)
+        if gap < best_gap:
+            split, best_gap = index, gap
+    return split
+
+
+def _cluster_classes(
+    weights: np.ndarray,
+    class_ids: Sequence[int],
+    classes_per_task: Sequence[int],
+) -> list[list[int]]:
+    """Partition classes into the requested stage sizes by recursive spectral bisection.
+
+    ``weights`` is the off-diagonal LoCo co-occurrence graph (shape ``N x N``);
+    ``class_ids`` maps graph positions to source class ids. The returned groups
+    contain source class ids and follow stage order.
+    """
+    if sum(classes_per_task) != len(class_ids):
+        raise ValueError(
+            f"LoCo partition covers {sum(classes_per_task)} classes, but {len(class_ids)} are used"
+        )
+    if any(class_count < 1 for class_count in classes_per_task):
+        raise ValueError(f"Every stage needs at least one class, got {list(classes_per_task)}")
+
+    def recurse(nodes: Sequence[int], stage_sizes: Sequence[int]) -> list[list[int]]:
+        if len(stage_sizes) == 1:
+            return [sorted(nodes)]
+        split = _split_position(stage_sizes)
+        left_size = sum(stage_sizes[:split])
+        left, right = _spectral_bisect(weights, nodes, left_size, class_ids)
+        return recurse(left, stage_sizes[:split]) + recurse(right, stage_sizes[split:])
+
+    groups = recurse(list(range(len(class_ids))), list(classes_per_task))
+    if [len(group) for group in groups] != list(classes_per_task):
+        raise RuntimeError(
+            f"LoCo clustering produced group sizes {[len(group) for group in groups]}, "
+            f"expected {list(classes_per_task)}"
+        )
+    return [[class_ids[position] for position in group] for group in groups]
+
+
+def _loco_assign_task(candidate_tasks: Sequence[int], image_stem: str, seed: int) -> int:
+    """Assign an image to one candidate stage (seeded, order-independent pseudo-random)."""
+    digest = zlib.crc32(f"{seed}:{image_stem}".encode())
+    return candidate_tasks[digest % len(candidate_tasks)]
+
+
 def _task_dir(output_dir: Path, task_id: int, num_classes: int) -> Path:
     return output_dir / f"task_{task_id + 1}_cls_{num_classes}"
 
@@ -198,6 +448,8 @@ def _plan_record(
     task_class_maps: Sequence[Mapping[int, int]],
     cumulative_class_maps: Sequence[Mapping[int, int]],
     task_image_counts: list[int],
+    loco_seed: int,
+    loco_stats: dict[str, dict[int, int]] | None,
 ) -> RecordPlan:
     """Plan destinations while preserving sequential full-split balancing."""
     jobs = []
@@ -233,6 +485,41 @@ def _plan_record(
                             cumulative_map,
                         )
                     )
+    elif mode == "loco":
+        # Low Co-occurrence: every image is written to exactly one candidate stage,
+        # so no training image is shared between stages. An image enters the
+        # cumulative dataset of a stage only from its assigned stage onwards,
+        # which keeps it out of every earlier-stage cumulative split as well.
+        candidate_tasks = [
+            task_id
+            for task_id, class_map in enumerate(task_class_maps)
+            if record.class_ids.intersection(class_map)
+        ]
+        if candidate_tasks:
+            if loco_stats is None:
+                raise ValueError("LoCo planning requires the assignment statistics container")
+            assigned_task = _loco_assign_task(candidate_tasks, record.image_path.stem, loco_seed)
+            jobs.append(
+                _make_job(
+                    record,
+                    _task_dir(output_dir, assigned_task, len(task_class_maps[assigned_task])),
+                    split,
+                    task_class_maps[assigned_task],
+                )
+            )
+            task_image_counts[assigned_task] += 1
+            loco_stats[split][len(candidate_tasks)] = loco_stats[split].get(len(candidate_tasks), 0) + 1
+
+            for end_task in range(max(assigned_task, 1), len(cumulative_class_maps)):
+                cumulative_map = cumulative_class_maps[end_task]
+                jobs.append(
+                    _make_job(
+                        record,
+                        _cumulative_task_dir(output_dir, end_task, len(cumulative_map)),
+                        split,
+                        cumulative_map,
+                    )
+                )
     elif mode == "sample-filter":
         for task_id, class_map in enumerate(task_class_maps):
             if record.class_ids.intersection(class_map):
@@ -313,8 +600,14 @@ def _materialize_plan(plan_and_record: tuple[RecordPlan, LabelRecord]) -> None:
 def _build_class_splits(
     source_classes: Mapping[int, str],
     classes_per_task: Sequence[int],
+    source_id_groups: Sequence[Sequence[int]] | None = None,
 ) -> tuple[list[dict[int, str]], list[dict[int, int]], list[dict[int, str]], list[dict[int, int]]]:
-    """Build task-local and cumulative class dictionaries."""
+    """Build task-local and cumulative class dictionaries.
+
+    ``source_id_groups`` overrides the sequential source-id order, e.g. with the
+    LoCo partition; every group must match the corresponding ``classes_per_task``
+    entry and the groups must cover the used classes exactly once.
+    """
     sorted_source_ids = sorted(source_classes)
     requested_class_count = sum(classes_per_task)
     if requested_class_count > len(sorted_source_ids):
@@ -328,15 +621,46 @@ def _build_class_splits(
         )
     if any(class_count < 1 for class_count in classes_per_task):
         raise ValueError(f"Every task must contain at least one class, got {list(classes_per_task)}")
+    used_source_ids = sorted_source_ids[:requested_class_count]
+
+    if source_id_groups is None:
+        groups = []
+        offset = 0
+        for class_count in classes_per_task:
+            groups.append(used_source_ids[offset : offset + class_count])
+            offset += class_count
+    else:
+        if len(source_id_groups) != len(classes_per_task):
+            raise ValueError(
+                f"Class grouping has {len(source_id_groups)} stages, expected {len(classes_per_task)}"
+            )
+        groups = []
+        seen_ids: set[int] = set()
+        for stage_index, (group, class_count) in enumerate(zip(source_id_groups, classes_per_task), start=1):
+            group_ids = sorted(group)
+            if len(group_ids) != class_count:
+                raise ValueError(
+                    f"Stage {stage_index} group holds {len(group_ids)} classes, expected {class_count}"
+                )
+            for source_id in group_ids:
+                if source_id not in source_classes:
+                    raise ValueError(f"Stage {stage_index} class id {source_id} is outside the source dataset")
+                if source_id in seen_ids:
+                    raise ValueError(f"Source class id {source_id} is assigned to more than one stage")
+                seen_ids.add(source_id)
+            groups.append(group_ids)
+        if seen_ids != set(used_source_ids):
+            raise ValueError(
+                f"Stage classes {sorted(seen_ids)} do not match the used source classes {used_source_ids}"
+            )
 
     task_classes = []
     task_class_maps = []
-    offset = 0
-    for class_count in classes_per_task:
-        source_ids = sorted_source_ids[offset : offset + class_count]
-        task_classes.append({task_id: source_classes[source_id] for task_id, source_id in enumerate(source_ids)})
-        task_class_maps.append({source_id: task_id for task_id, source_id in enumerate(source_ids)})
-        offset += class_count
+    for group_ids in groups:
+        task_classes.append(
+            {task_id: source_classes[source_id] for task_id, source_id in enumerate(group_ids)}
+        )
+        task_class_maps.append({source_id: task_id for task_id, source_id in enumerate(group_ids)})
 
     cumulative_classes = []
     cumulative_class_maps = []
@@ -400,17 +724,11 @@ def _process_split(
     cumulative_class_maps: Sequence[Mapping[int, int]],
     task_image_counts: list[int],
     workers: int,
+    loco_seed: int,
+    loco_stats: dict[str, dict[int, int]],
 ) -> None:
     """Parse, plan, and materialize one dataset split."""
-    image_entries = [split_config] if isinstance(split_config, str) else list(split_config)
-    if not image_entries or not all(isinstance(entry, str) for entry in image_entries):
-        raise TypeError(f"Split '{split}' must be a path or list of paths, got {split_config!r}")
-
-    image_dirs = [_resolve_dataset_path(entry, source_config) for entry in image_entries]
-    label_dirs = [
-        _resolve_dataset_path(entry.replace("images", "labels"), source_config)
-        for entry in image_entries
-    ]
+    image_dirs, label_dirs = _resolve_split_dirs(split_config, source_config)
     image_files = _discover_files(image_dirs, SUPPORTED_IMAGE_EXTENSIONS)
     label_files = _discover_files(label_dirs, SUPPORTED_LABEL_EXTENSIONS)
     _validate_unique_label_stems(label_files)
@@ -419,10 +737,9 @@ def _process_split(
     parser = lambda label_path: _parse_label(label_path, image_index)
     max_pending = workers * 4
     pending_writes: list[Future[None]] = []
-    with (
-        ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dataset-io") as executor,
-        tqdm(total=len(label_files), desc=f"Processing {split} split") as progress,
-    ):
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="dataset-io"
+    ) as executor, tqdm(total=len(label_files), desc=f"Processing {split} split") as progress:
         parse_results = _bounded_map(executor, parser, label_files, max_pending=workers * 4)
         for result in parse_results:
             if result.error is not None:
@@ -445,6 +762,8 @@ def _process_split(
                 task_class_maps=task_class_maps,
                 cumulative_class_maps=cumulative_class_maps,
                 task_image_counts=task_image_counts,
+                loco_seed=loco_seed,
+                loco_stats=loco_stats,
             )
             pending_writes.append(executor.submit(_materialize_plan, (plan, record)))
             if len(pending_writes) >= max_pending:
@@ -477,6 +796,46 @@ def _save_configs(
             YAML().save(cumulative_dir / "dataset.yaml", cumulative_config)
 
 
+def _save_loco_partition(
+    output_dir: Path,
+    source_classes: Mapping[int, str],
+    class_ids: Sequence[int],
+    cooccurrence: np.ndarray,
+    groups: Sequence[Sequence[int]],
+    classes_per_task: Sequence[int],
+    seed: int,
+    cluster_split: str,
+    splits: Sequence[str],
+    loco_stats: Mapping[str, Mapping[int, int]],
+) -> None:
+    """Write the LoCo class partition and image-assignment statistics as JSON."""
+    payload = {
+        "mode": "loco",
+        "description": (
+            "Low Co-occurrence (LoCo): classes that frequently co-occur are clustered into one "
+            "stage, and every image is assigned to exactly one candidate stage."
+        ),
+        "seed": seed,
+        "cluster_split": cluster_split,
+        "classes_per_task": list(classes_per_task),
+        "class_order": [source_classes[class_id] for class_id in class_ids],
+        "stages": [
+            {"stage": stage, "classes": [source_classes[class_id] for class_id in group]}
+            for stage, group in enumerate(groups, start=1)
+        ],
+        "cooccurrence": cooccurrence.astype(int).tolist(),
+        "image_assignment": {
+            split: {str(candidate_count): image_count for candidate_count, image_count in sorted(counts.items())}
+            for split, counts in loco_stats.items()
+            if split in splits
+        },
+    }
+    (output_dir / "loco_partition.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -486,8 +845,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", nargs="+", default=["train", "val", "test"])
     parser.add_argument(
         "--mode",
-        choices=["full-split", "sample-filter", "label-filter"],
+        choices=["full-split", "sample-filter", "label-filter", "loco"],
         default="sample-filter",
+        help=(
+            "Split strategy. 'loco' is the Low Co-occurrence protocol: cluster co-occurring "
+            "classes into stages and assign each image to exactly one stage."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed for the LoCo pseudo-random image-to-stage assignment.",
+    )
+    parser.add_argument(
+        "--loco_cluster_split",
+        default="train",
+        help="Source split used to estimate the LoCo category co-occurrence matrix.",
     )
     parser.add_argument(
         "--workers",
@@ -529,9 +903,44 @@ def main() -> None:
     if not splits:
         raise ValueError(f"None of the requested splits exist in '{source_config}'")
 
+    requested_class_count = sum(args.n_classes)
+    if requested_class_count > len(source_classes):
+        raise ValueError(
+            f"n_classes sums to {requested_class_count}, but source dataset has only "
+            f"{len(source_classes)} classes"
+        )
+
+    source_id_groups = None
+    cooccurrence_matrix = None
+    used_class_ids: list[int] = []
+    cluster_split = ""
+    if args.mode == "loco":
+        cluster_split = args.loco_cluster_split
+        if cluster_split not in splits:
+            raise ValueError(
+                f"LoCo cluster split '{cluster_split}' is not one of the processed splits {splits}"
+            )
+        used_class_ids = sorted(source_classes)[:requested_class_count]
+        cooccurrence_matrix, image_count = _estimate_class_cooccurrence(
+            split_config=source_dataset[cluster_split],
+            source_config=source_config,
+            used_class_ids=frozenset(used_class_ids),
+            split=cluster_split,
+        )
+        graph = cooccurrence_matrix.copy()
+        np.fill_diagonal(graph, 0.0)
+        source_id_groups = _cluster_classes(graph, used_class_ids, args.n_classes)
+        LOGGER.info(
+            f"LoCo (Low Co-occurrence) partition from {image_count} '{cluster_split}' images:"
+        )
+        for stage_index, group in enumerate(source_id_groups, start=1):
+            names = ", ".join(source_classes[class_id] for class_id in group)
+            LOGGER.info(f"  stage {stage_index} ({len(group)} classes): {names}")
+
     task_classes, task_maps, cumulative_classes, cumulative_maps = _build_class_splits(
         source_classes=source_classes,
         classes_per_task=args.n_classes,
+        source_id_groups=source_id_groups,
     )
     _prepare_output_directory(args.output_dir, overwrite=args.overwrite)
     _create_task_directories(
@@ -541,6 +950,7 @@ def main() -> None:
         cumulative_classes=cumulative_classes,
     )
 
+    loco_stats: dict[str, dict[int, int]] = {split: {} for split in splits}
     image_counts = {task_id: {split: 0 for split in splits} for task_id in range(len(task_classes))}
     for split in splits:
         split_counts = [image_counts[task_id][split] for task_id in range(len(task_classes))]
@@ -554,6 +964,8 @@ def main() -> None:
             cumulative_class_maps=cumulative_maps,
             task_image_counts=split_counts,
             workers=args.workers,
+            loco_seed=args.seed,
+            loco_stats=loco_stats,
         )
         for task_id, count in enumerate(split_counts):
             image_counts[task_id][split] = count
@@ -564,6 +976,27 @@ def main() -> None:
         task_classes=task_classes,
         cumulative_classes=cumulative_classes,
     )
+    if args.mode == "loco":
+        _save_loco_partition(
+            output_dir=args.output_dir,
+            source_classes=source_classes,
+            class_ids=used_class_ids,
+            cooccurrence=cooccurrence_matrix,
+            groups=source_id_groups,
+            classes_per_task=args.n_classes,
+            seed=args.seed,
+            cluster_split=cluster_split,
+            splits=splits,
+            loco_stats=loco_stats,
+        )
+        for split, counts in loco_stats.items():
+            parts = ", ".join(
+                f"{candidate_count} candidate stage(s): {image_count} images"
+                for candidate_count, image_count in sorted(counts.items())
+            )
+            LOGGER.info(f"LoCo image assignment ({split}): {parts if parts else 'no images'}")
+        LOGGER.info(f"LoCo partition saved to: {args.output_dir / 'loco_partition.json'}")
+
     for task_id, classes in enumerate(task_classes):
         task_dir = _task_dir(args.output_dir, task_id, len(classes))
         LOGGER.info(f"Task {task_id + 1} completed: {len(classes)} classes")
