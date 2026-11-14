@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 from copy import copy
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -15,8 +16,9 @@ from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.anti_forget import AntiForgetTrainer
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
+from ultralytics.models.yolo.detect.stage_val import StageAwareDetectionValidator
 from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
+from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, RANK, YAML
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model
@@ -270,6 +272,58 @@ class AntiForgetDetectionTrainer(AntiForgetTrainer, DetectionTrainer):
         self.loss_names = self._anti_forget_loss_names()
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )
+
+    def run_stage_eval(self, final_epoch: bool) -> None:
+        """Evaluate the cumulative test split and print per-stage mAP.
+
+        This is a read-only diagnostic pass: it does not update ``self.metrics``,
+        ``self.fitness``, ``best_fitness`` or the regular validation loader.
+        """
+        if not self.stage_classes or not self.args.stage_test_data:
+            return
+        if self.stage_validator is None:
+            self._setup_stage_eval()
+        if RANK in {-1, 0}:
+            LOGGER.info(f"\nStage-wise cumulative test evaluation (epoch {self.epoch + 1}):")
+        self.stage_validator(trainer=self)
+
+    def _setup_stage_eval(self) -> None:
+        """Build the cumulative-test loader and the stage-aware validator once."""
+        yaml_path = Path(self.args.stage_test_data)
+        data = YAML().load(yaml_path)
+        split = "test" if data.get("test") else ("val" if data.get("val") else None)
+        if split is None:
+            raise KeyError(f"stage_test_data has no 'test' or 'val' split: {yaml_path}")
+        image_path = Path(data[split])
+        if not image_path.is_absolute():
+            image_path = (yaml_path.parent / image_path).resolve()
+        data["channels"] = int(data.get("channels", 3))
+        dataset = build_yolo_dataset(self.args, str(image_path), self.args.batch, data, mode="val", stride=self.stride)
+        loader = build_dataloader(
+            dataset,
+            self.args.batch,
+            self.args.workers,
+            shuffle=False,
+            rank=LOCAL_RANK,
+            drop_last=False,
+            pin_memory=False,
+            device=self.device,
+        )
+        stage_args = copy(self.args)
+        stage_args.verbose = False
+        stage_args.plots = False
+        stage_args.save_json = False
+        stage_args.augment = False
+        stage_args.split = split
+        save_dir = self.save_dir / "stage_eval"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        self.stage_validator = StageAwareDetectionValidator(
+            loader,
+            save_dir=save_dir,
+            args=stage_args,
+            _callbacks=None,
+            stage_classes=self.stage_classes,
         )
 
     def progress_string(self):

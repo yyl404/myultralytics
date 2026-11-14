@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import warnings
 from copy import deepcopy
@@ -449,6 +450,23 @@ def _mean_lwf_terms(first, second):
     return tuple(None if a is None else 0.5 * (a + b) for a, b in zip(first, second))
 
 
+def _load_stage_classes(path):
+    """Load the per-stage class-name lists written by tools/stage_class_map.py."""
+    if not path:
+        return None
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"stage_classes_path not found: {path}")
+    with open(path, encoding="utf-8") as file:
+        stages = json.load(file)
+    if not isinstance(stages, list) or not stages:
+        raise ValueError(f"stage_classes_path must hold a non-empty list of class-name lists, got {path}")
+    for index, stage in enumerate(stages):
+        if not isinstance(stage, list) or not stage or not all(isinstance(name, str) for name in stage):
+            raise ValueError(f"Stage {index + 1} in '{path}' must be a non-empty list of class names")
+    return [list(stage) for stage in stages]
+
+
 class AntiForgetTrainer(BaseTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         """
@@ -460,6 +478,11 @@ class AntiForgetTrainer(BaseTrainer):
             _callbacks (list, optional): List of callback functions.
         """
         super().__init__(cfg, overrides, _callbacks)
+        self.stage_classes = _load_stage_classes(getattr(self.args, "stage_classes_path", None))
+        self.stage_validator = None
+
+    def run_stage_eval(self, final_epoch: bool) -> None:
+        """Hook for the periodic cumulative stage-wise test evaluation (trainer-specific)."""
 
     def _anti_forget_loss_names(self):
         """Return training loss names extended with the enabled anti-forgetting loss terms.
@@ -1274,6 +1297,17 @@ class AntiForgetTrainer(BaseTrainer):
                 self._clear_memory(threshold=0.5)  # prevent VRAM spike
                 self.metrics, self.fitness = self.validate()
             # ============================== END: validate on all ranks ==================================
+
+            # ============================== MODIFIED: periodic stage-wise test eval =====================
+            stage_eval_period = int(getattr(self.args, "stage_eval_period", 0) or 0)
+            if (
+                stage_eval_period > 0
+                and getattr(self.args, "stage_test_data", None)
+                and self.stage_classes
+                and ((epoch + 1) % stage_eval_period == 0 or final_epoch)
+            ):
+                self.run_stage_eval(final_epoch)
+            # ============================== END: periodic stage-wise test eval =========================
 
             if RANK in {-1, 0}:
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})

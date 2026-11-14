@@ -191,6 +191,7 @@ model_adapter_initialize() {
     PCA_SEED="${PCA_SEED:-42}"
     PCA_SPLIT="${PCA_SPLIT:-val}"
     PCA_MODE="${PCA_MODE:-incremental}"
+    STAGE_EVAL_PERIOD="${STAGE_EVAL_PERIOD:-10}"
     PCA_SAMPLE_NUM="${PCA_SAMPLE_NUM:-500}"
     if ! declare -p EXTRA_TRAIN_ARGS >/dev/null 2>&1; then
         EXTRA_TRAIN_ARGS=()
@@ -497,6 +498,46 @@ model_adapter_prepare_task() {
         freeze_index=$((TASK_ID - 1))
         if (( freeze_index < ${#TASK_FREEZE_LAYERS[@]} )) && [[ -n "${TASK_FREEZE_LAYERS[$freeze_index]}" ]]; then
             FREEZE_ARGS=(--freeze "${TASK_FREEZE_LAYERS[$freeze_index]}")
+        fi
+    fi
+
+    # Periodic stage-wise cumulative test evaluation: incremental stages only.
+    # Stage-1 training keeps exactly its previous behavior (no extra artifacts/args).
+    if (( TASK_ID > 1 )); then
+        local stage_classes_json="${TASK_DIR}/stage_classes.json"
+        python tools/stage_class_map.py \
+            --datasets "${TASK_DATASETS[@]:0:TASK_ID}" \
+            --output "$stage_classes_json"
+
+        local stage_test_data=""
+        local data_root
+        data_root="$(cd "$(dirname "$DATASET_PATH")/.." && pwd)"
+        local cumulative_yaml=""
+        for candidate in "$data_root/task_1-${TASK_ID}_cls_"*/dataset.yaml; do
+            if [[ -f "$candidate" ]]; then
+                cumulative_yaml="$candidate"
+                break
+            fi
+        done
+        if [[ -n "$cumulative_yaml" ]]; then
+            local stage_test_dir="${TASK_DIR}/stage_test"
+            python tools/convert_dataset_class_ids.py \
+                --model "$expanded_model" \
+                --dataset "$cumulative_yaml" \
+                --splits test \
+                --output_dir "$stage_test_dir" \
+                --workers "$WORKERS"
+            stage_test_data="${stage_test_dir}/dataset.yaml"
+        else
+            echo "Cumulative test dataset not found; stage-wise test evaluation disabled"
+        fi
+
+        TRAINER_ARGS+=(
+            --stage_classes_path "$stage_classes_json"
+            --stage_eval_period "$STAGE_EVAL_PERIOD"
+        )
+        if [[ -n "$stage_test_data" ]]; then
+            TRAINER_ARGS+=(--stage_test_data "$stage_test_data")
         fi
     fi
 }

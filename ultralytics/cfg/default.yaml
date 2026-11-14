@@ -170,6 +170,11 @@ bpf_proposal_samples: 64 # (int) candidates randomly sampled by DwF
 bpf_split_iou: 0.5 # (float) DwF old/new proposal split threshold
 bpf_dwf_weight: 0.5 # (float) joint DwF classification and box loss weight
 
+# periodic stage-wise cumulative test evaluation
+stage_classes_path: None # (str) JSON list of per-stage class-name lists (tools/stage_class_map.py)
+stage_test_data: None # (str) dataset YAML whose test split covers all classes seen so far
+stage_eval_period: 10 # (int) run the cumulative stage-wise test evaluation every N epochs (0 disables)
+
 # ewc settings
 ewc: False
 ewc_loss_weight: 100.0
