@@ -14,7 +14,7 @@ method_has() {
 }
 
 method_needs_importance() {
-    method_has ewc || method_has nsgp
+    method_has ewc
 }
 
 method_needs_pca() {
@@ -58,9 +58,6 @@ model_adapter_regenerate_missing_artifacts() {
 
     if method_needs_importance && [[ ! -f "$PREVIOUS_IMPORTANCE" ]]; then
         local -a importance_args=()
-        if method_has nsgp; then
-            importance_args=(--scope normalization)
-        fi
         echo "Regenerating missing importance artifact: $PREVIOUS_IMPORTANCE"
         python tools/compute_importance.py \
             --model "$PREVIOUS_MODEL" \
@@ -90,9 +87,9 @@ model_adapter_regenerate_missing_artifacts() {
     fi
 
     if method_needs_pca && [[ ! -f "$PREVIOUS_PCA" ]]; then
-        local -a covariance_args=()
-        if method_has nsgp; then
-            covariance_args=(--uncentered --sample_num 0 --batch_size "$BATCH_SIZE")
+        local -a bbox_args=()
+        if method_has espreg; then
+            bbox_args=(--use_bbox)
         fi
         echo "Regenerating missing PCA artifact: $PREVIOUS_PCA"
         python tools/pca.py \
@@ -100,8 +97,15 @@ model_adapter_regenerate_missing_artifacts() {
             --dataset "$previous_dataset" \
             --save_path "$PREVIOUS_PCA" \
             --device "$TOOL_DEVICE" \
+            --pca_mode "$PCA_MODE" \
+            --sample_num "$PCA_SAMPLE_NUM" \
+            --batch_size "$BATCH_SIZE" \
+            --imgsz "$IMGSZ" \
+            --workers "$WORKERS" \
+            --seed "$PCA_SEED" \
+            --split "$PCA_SPLIT" \
             --exclude_head \
-            "${covariance_args[@]}"
+            "${bbox_args[@]}"
     fi
 
     if method_needs_prototypes && [[ ! -f "$PREVIOUS_PROTOTYPES" ]]; then
@@ -184,6 +188,10 @@ model_adapter_initialize() {
     PATCH_PROTO_SPLIT_RATIO="${PATCH_PROTO_SPLIT_RATIO:-0.2}"
     PATCH_PROTO_MAX_SAMPLES="${PATCH_PROTO_MAX_SAMPLES:-256}"
     PATCH_PROTO_SEED="${PATCH_PROTO_SEED:-0}"
+    PCA_SEED="${PCA_SEED:-42}"
+    PCA_SPLIT="${PCA_SPLIT:-val}"
+    PCA_MODE="${PCA_MODE:-incremental}"
+    PCA_SAMPLE_NUM="${PCA_SAMPLE_NUM:-500}"
     if ! declare -p EXTRA_TRAIN_ARGS >/dev/null 2>&1; then
         EXTRA_TRAIN_ARGS=()
     fi
@@ -303,7 +311,7 @@ model_adapter_prepare_task() {
         TRAIN_DATA="${converted_data}/dataset.yaml"
         TRAINER_ARGS=(--trainer antiforget)
 
-        if method_has ewc && ! method_has nsgp; then
+        if method_has ewc; then
             expanded_importance="${TASK_DIR}/task-$((TASK_ID - 1))-importance-expanded.pth"
             python tools/expand_importance.py \
                 --old_importance "$PREVIOUS_IMPORTANCE" \
@@ -362,7 +370,7 @@ model_adapter_prepare_task() {
             )
         fi
 
-        if method_has ewc && ! method_has nsgp; then
+        if method_has ewc; then
             TRAINER_ARGS+=(
                 --ewc True
                 --importance_path "$PREVIOUS_IMPORTANCE"
@@ -451,9 +459,6 @@ model_adapter_prepare_task() {
                 --nsgp True
                 --nsgp_flexibility 1.0
                 --pca_cache_path "$PREVIOUS_PCA"
-                --ewc True
-                --importance_path "$PREVIOUS_IMPORTANCE"
-                --ewc_loss_weight 2000.0
             )
         fi
 
@@ -538,9 +543,6 @@ model_adapter_finalize_task() {
         importance_args=()
         history_args=()
         reference_args=()
-        if method_has nsgp; then
-            importance_args=(--scope normalization)
-        fi
         if [[ -n "$PREVIOUS_IMPORTANCE" ]]; then
             history_args=(--load_hist "$PREVIOUS_IMPORTANCE")
         fi
@@ -566,20 +568,27 @@ model_adapter_finalize_task() {
 
     if method_needs_pca; then
         history_args=()
-        covariance_args=()
+        local -a bbox_args=()
         if [[ -n "$PREVIOUS_PCA" ]]; then
             history_args=(--load_hist "$PREVIOUS_PCA")
         fi
-        if method_has nsgp; then
-            covariance_args=(--uncentered --sample_num 0 --batch_size "$BATCH_SIZE")
+        if method_has espreg; then
+            bbox_args=(--use_bbox)
         fi
         python tools/pca.py \
             --model "$PREVIOUS_MODEL" \
             --dataset "$DATASET_PATH" \
             --save_path "${TASK_DIR}/pca_cache.pkl" \
             --device "$TOOL_DEVICE" \
+            --pca_mode "$PCA_MODE" \
+            --sample_num "$PCA_SAMPLE_NUM" \
+            --batch_size "$BATCH_SIZE" \
+            --imgsz "$IMGSZ" \
+            --workers "$WORKERS" \
+            --seed "$PCA_SEED" \
+            --split "$PCA_SPLIT" \
             --exclude_head \
-            "${covariance_args[@]}" \
+            "${bbox_args[@]}" \
             "${history_args[@]}"
         PREVIOUS_PCA="${TASK_DIR}/pca_cache.pkl"
     fi

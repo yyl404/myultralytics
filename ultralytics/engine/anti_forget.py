@@ -176,12 +176,14 @@ def _extract_pca_spectra(pca_cache):
         pca_cache (dict): module name -> list of serialized per-group operator entries.
 
     Returns:
-        tuple[dict, dict]: module name -> (groups, n_components) components tensor,
-            and module name -> (groups, n_components) explained-variance tensor.
+        tuple[dict, dict, dict]: module name -> (groups, n_components) components
+            tensor, module name -> (groups, n_components) explained-variance tensor,
+            and module name -> governed parameter name (``weight`` by default).
     """
-    components, eigen_values = {}, {}
+    components, eigen_values, param_names = {}, {}, {}
     for name, entries in pca_cache.items():
         group_components, group_eigen_values = [], []
+        param_names[name] = entries[0].get("param", "weight") if entries else "weight"
         for ig, entry in enumerate(entries):
             if not isinstance(entry, dict) or "state" not in entry:
                 raise TypeError(
@@ -193,7 +195,7 @@ def _extract_pca_spectra(pca_cache):
             group_eigen_values.append(entry["state"]["explained_variance_"])
         components[name] = torch.stack(group_components)
         eigen_values[name] = torch.stack(group_eigen_values)
-    return components, eigen_values
+    return components, eigen_values, param_names
 
 
 def _head_raw_output_to_list(head, raw_output, img_h, img_w, conf_threshold, agnostic_nms=False):
@@ -638,13 +640,6 @@ class AntiForgetTrainer(BaseTrainer):
                 raise ValueError("BPF DwF and the KL distillation loss are mutually exclusive")
         # ============================== END: set up BPF ========================================================
 
-        # ============================== MODIFIED: set up EWC loss ============================================
-        if self.args.ewc:
-            self.ewc_loss_weight = self.args.ewc_loss_weight
-            ewc_state = load_ewc_state(self.args.importance_path, map_location=self.device)
-            self.ewc_loss = EWCLoss(model=self.model, state=ewc_state)
-        # ============================== END: set up EWC loss =================================================
-
         # ============================== MODIFIED: set up L2 regularization loss ==============================
         if self.args.l2:
             self.l2_loss_weight = self.args.l2_loss_weight
@@ -655,7 +650,7 @@ class AntiForgetTrainer(BaseTrainer):
         if self.args.espreg:
             self.espreg_loss_weight = self.args.espreg_loss_weight
             self.pca_cache = joblib.load(self.args.pca_cache_path)
-            components, eigen_values = _extract_pca_spectra(self.pca_cache)
+            components, eigen_values, param_names = _extract_pca_spectra(self.pca_cache)
             espreg_modules = tuple(self.pca_cache)
             if self.args.espreg_scope == "backbone":
                 espreg_modules = tuple(_get_nsgp_backbone_names(self.model, espreg_modules))
@@ -667,9 +662,11 @@ class AntiForgetTrainer(BaseTrainer):
                 module_names=espreg_modules,
                 components={name: components[name] for name in espreg_modules},
                 eigen_values={name: eigen_values[name] for name in espreg_modules},
+                param_names={name: param_names[name] for name in espreg_modules},
                 weight_mode=self.args.espreg_weight_mode,
                 form=self.args.espreg_form,
             )
+            self.governed_modules = tuple(espreg_modules)
             LOGGER.info(
                 f"ESPReg over {len(espreg_modules)} modules ({self.args.espreg_scope}), "
                 f"weight_mode={self.args.espreg_weight_mode}, form={self.args.espreg_form}"
@@ -678,21 +675,34 @@ class AntiForgetTrainer(BaseTrainer):
 
         # ============================== MODIFIED: set up NSGP ============================================
         if self.args.nsgp:
-            # Reuse pca_cache if already loaded for ESPReg, otherwise load it
-            if hasattr(self, 'pca_cache'):
-                pca_cache_nsgp = self.pca_cache
-            else:
-                pca_cache_nsgp = joblib.load(self.args.pca_cache_path)
-            components, eigen_values = _extract_pca_spectra(pca_cache_nsgp)
+            if not hasattr(self, "pca_cache"):
+                self.pca_cache = joblib.load(self.args.pca_cache_path)
+            components, eigen_values, param_names = _extract_pca_spectra(self.pca_cache)
             self.nsgp_flexibility = getattr(self.args, 'nsgp_flexibility', 1.0)
-            module_names = tuple(pca_cache_nsgp)
+            module_names = tuple(self.pca_cache)
+            governed = set(getattr(self, "governed_modules", ()))
+            governed.update(module_names)
+            self.governed_modules = tuple(sorted(governed))
             self.nsgp_operator = NSGP(
                 module_names=module_names,
                 components=components,
                 eigen_values=eigen_values,
+                param_names=param_names,
                 normalized_module_names=_get_nsgp_backbone_names(self.model, module_names),
             )
         # ============================== END: set up NSGP =================================================
+
+        # ============================== MODIFIED: set up EWC loss ============================================
+        if self.args.ewc:
+            self.ewc_loss_weight = self.args.ewc_loss_weight
+            exclude_prefixes = tuple(f"{name}." for name in getattr(self, "governed_modules", ()))
+            ewc_state = load_ewc_state(self.args.importance_path, map_location=self.device)
+            self.ewc_loss = EWCLoss(model=self.model, state=ewc_state, exclude_prefixes=exclude_prefixes)
+            LOGGER.info(
+                f"EWC over {len(self.ewc_loss.importance)} parameters, "
+                f"excluding {len(exclude_prefixes)} NSGP/ESPReg modules"
+            )
+        # ============================== END: set up EWC loss =================================================
 
         # ============================== MODIFIED: set up RePRE ===========================================
         if self.args.repre:
@@ -1322,21 +1332,14 @@ class AntiForgetTrainer(BaseTrainer):
         self.scaler.unscale_(self.optimizer)  # unscale gradients
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
         # ============================== MODIFIED: capture NSGP parameters ============================
-        nsgp_params = None
-        parameters_before_step = None
         if self.args.nsgp:
             model_to_use = self.model.module if hasattr(self.model, 'module') else self.model
-            nsgp_params = {name: param for name, param in model_to_use.named_parameters()}
-            parameters_before_step = self.nsgp_operator.capture_parameters(nsgp_params)
+            self.nsgp_operator.capture_parameters(dict(model_to_use.named_parameters()))
         # ============================== END: capture NSGP parameters ================================
         self.scaler.step(self.optimizer)
         # ============================== MODIFIED: apply NSGP update projection ======================
         if self.args.nsgp:
-            self.nsgp_operator.apply_parameter_projection(
-                params_dict=nsgp_params,
-                parameters_before_step=parameters_before_step,
-                flexibility=self.nsgp_flexibility,
-            )
+            self.nsgp_operator.apply_parameter_projection(flexibility=self.nsgp_flexibility)
         # ============================== END: apply NSGP update projection ===========================
         self.scaler.update()
         self.optimizer.zero_grad()

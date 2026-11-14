@@ -8,6 +8,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from ultralytics.utils import LOGGER
+
 EWC_STATE_VERSION = 2
 
 
@@ -75,12 +77,27 @@ def load_ewc_state(path: str | Path, map_location: str | torch.device = "cpu") -
 class EWCLoss:
     """Compute ``0.5 * sum_t sum_i F[t,i] * (theta[i] - theta_star[t,i])**2``."""
 
-    def __init__(self, model: nn.Module, state: dict[str, Any]):
-        """Bind validated EWC history to current model parameters."""
+    def __init__(self, model: nn.Module, state: dict[str, Any], exclude_prefixes: tuple[str, ...] = ()):
+        """Bind validated EWC history to the current model parameters.
+
+        Args:
+            model: Model being trained.
+            state: Validated EWC artifact.
+            exclude_prefixes: Parameter-name prefixes already governed by another
+                regularizer (NSGP/ESPReg exclude their conv weights), so EWC only
+                covers the remaining parameters.
+        """
         validate_ewc_state(state)
         self.model = model
         model_params = dict(model.named_parameters())
-        tracked_names = state["importance"].keys()
+        tracked_names = {
+            name for name in state["importance"] if not any(name.startswith(prefix) for prefix in exclude_prefixes)
+        }
+        if not tracked_names:
+            LOGGER.warning(
+                "EWC has no parameters left after excluding the NSGP/ESPReg-governed weights; "
+                "the EWC term is inactive for this stage"
+            )
         missing = tracked_names - model_params.keys()
         if missing:
             raise KeyError(f"EWC parameters are missing from the current model: {sorted(missing)}")
@@ -109,6 +126,8 @@ class EWCLoss:
     def get_loss(self) -> Tensor:
         """Return the scalar paper EWC penalty, including its explicit one-half factor."""
         model_params = dict(self.model.named_parameters())
+        if not self.importance:
+            return next(iter(model_params.values())).new_zeros(())
         first_param = model_params[next(iter(self.importance))]
         loss = first_param.new_zeros(())
         for name, fisher_history in self.importance.items():
