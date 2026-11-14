@@ -183,6 +183,9 @@ l2_loss_weight: 1.0 # (float) L2 regularization loss weight
 # ESPReg (Eigen-value Scaled Projection Regularization) settings -----------------------------------------------
 espreg: False # (bool) whether to use ESPReg
 espreg_loss_weight: 100.0 # (float) the contribution weight of ESPReg loss in total loss
+espreg_weight_mode: nt # (str) spectrum weighting: raw (eigenvalues as-is) or nt (elbow-normalized, truncated at 1)
+espreg_form: original # (str) reduction: original (channel-norm mean) or frobenius (squared eigeweighted projection)
+espreg_scope: all # (str) constrained layers: all (backbone + neck) or backbone only
 pca_cache_path: None # (str, optional)
 
 # NSGP settings ----------------------------------------------------------------------------------------------------
@@ -200,6 +203,28 @@ replay: False # (bool) draw replay samples alongside current-task training
 replay_data: None # (str, optional) replay dataset YAML accumulated from the previous tasks
 replay_mode: supervised # (str) how replay samples are used: supervised (detection loss), distill (self-distillation only), both
 replay_loss_weight: 1.0 # (float) contribution weight of the replay detection loss
+
+# Patch-prototype artifact (shared by prad / prd) ---------------------------------------------------------------
+patch_prototypes: None # (str) patch PCA + multi-centre prototypes generated after the previous task
+
+# PRAD (prototype-reliability-aware YOLO LwF, lwf_mode=prad) -------------------------------------------------------
+prad_fg_threshold: 0.5 # (float) tau_F on the teacher maximum old-class probability
+prad_bg_threshold: 0.1 # (float) tau_B on the same quantity, must stay below tau_F
+prad_conf_power: 1.0 # (float) gamma on the teacher confidence weight
+prad_proto_threshold: 0.5 # (float) prototype cosine similarity used as the reliability center
+prad_proto_temperature: 0.1 # (float) prototype reliability sigmoid width
+prad_bg_weight: 1.0 # (float) eta_B on the background distillation term
+prad_cls_loss_weight: 4.0 # (float) lambda_KD on the foreground + eta_B * background classification term
+prad_reg_loss_weight: 0.5 # (float) lambda_KD * lambda_reg on the foreground regression term
+prad_split_normalize: True # (bool) normalize foreground and background separately
+prad_max_fg: 512 # (int) per-step cap on foreground candidates (highest confidence kept)
+
+# PRD (patch replay distillation) ---------------------------------------------------------------------------------
+prd: False # (bool) distill all-class head outputs on historical prototype patches
+prd_samples: 64 # (int) patch draws per level per iteration
+prd_std_scale: 1.0 # (float) multiplier on the local diagonal standard deviation
+prd_loss_weight: 1.0 # (float) lambda_PRD on the all-class classification term
+prd_reg_loss_weight: 0.5 # (float) lambda_PRD * lambda_PRD-reg on the regression term
 
 # YOLO LwF (self-distillation) settings -----------------------------------------------------------------------------
 lwf: False # (bool) use the LwF training path (requires lwf_teacher_model)

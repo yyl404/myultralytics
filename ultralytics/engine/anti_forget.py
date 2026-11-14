@@ -28,15 +28,14 @@ from ultralytics.utils.torch_utils import (
     EarlyStopping,
     ModelEMA,
     autocast,
+    unwrap_model,
     unset_deterministic,
 )
 
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.ops import xyxy2xywhn, xywh2xyxy
 from ultralytics.utils.metrics import bbox_iou, batch_probiou
-from ultralytics.engine.espreg import (
-    EWPRegLoss,
-)
+from ultralytics.engine.espreg import ESPRegLoss
 from ultralytics.engine.bpf import (
     bpf_pseudo_detections,
     compute_dwf_loss,
@@ -47,6 +46,16 @@ from ultralytics.engine.ewc import EWCLoss, load_ewc_state
 from ultralytics.engine.l2 import L2Loss
 from ultralytics.engine.lwf import YOLOLwFLoss, detect_branch_output, feature_l2_loss
 from ultralytics.engine.nsgp import NSGP
+from ultralytics.engine.patch_proto import (
+    RecordingDetectionLoss,
+    get_assignment,
+    head_input_channels,
+    head_patch_radius,
+    load_patch_artifact,
+    new_class_mask,
+)
+from ultralytics.engine.prad import PrototypeReliabilityLwFLoss
+from ultralytics.engine.prd import PatchReplayDistillation
 from ultralytics.engine.repre import RegionalPrototypeReplay
 from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.nn.modules.head import Detect, OBB
@@ -474,8 +483,12 @@ class AntiForgetTrainer(BaseTrainer):
         if self.args.lwf:
             if self.args.lwf_mode == "lwf":
                 loss_names.append("lwf_loss")
+            elif self.args.lwf_mode == "prad":
+                loss_names.extend(("prad_cls_loss", "prad_bg_loss", "prad_reg_loss"))
             else:
                 loss_names.extend(("lwf_cls_loss", "lwf_reg_loss"))
+        if self.args.prd:
+            loss_names.extend(("prd_cls_loss", "prd_reg_loss"))
         return tuple(loss_names)
 
     def _lwf_teacher_output(self, batch):
@@ -498,6 +511,82 @@ class AntiForgetTrainer(BaseTrainer):
             detect_branch_output(teacher_output),
             _get_detect_head(self.model).stride,
         )
+
+    def _setup_patch_prototypes(self, student_head, teacher_head, prad_enabled):
+        """Load the patch prototype artifact and build the prad / prd losses.
+
+        Args:
+            student_head (Detect): Student detection head.
+            teacher_head (Detect): Frozen previous-task detection head.
+            prad_enabled (bool): Whether the prototype-reliability distillation is active.
+        """
+        if not self.args.patch_prototypes:
+            raise ValueError("patch_prototypes is required when prad or prd is enabled")
+        if student_head.reg_max != 1 or teacher_head.reg_max != 1:
+            raise ValueError(
+                f"Patch prototype distillation targets direct-regression heads (reg_max=1), got student "
+                f"{student_head.reg_max} and teacher {teacher_head.reg_max}"
+            )
+        if prad_enabled:
+            if getattr(unwrap_model(self.model), "end2end", False):
+                raise ValueError("prad requires end2end training to be disabled (dense one2many branch)")
+            if self.args.replay_mode in {"distill", "both"}:
+                raise ValueError(
+                    "prad is incompatible with replay_mode 'distill'/'both': it distills the current batch only. "
+                    "Use prd for prototype replay, or replay_mode 'supervised'."
+                )
+        subspace, bank, meta = load_patch_artifact(self.args.patch_prototypes)
+        radius = head_patch_radius(student_head)
+        if int(meta["patch_radius"]) != radius:
+            raise ValueError(
+                f"Patch artifact '{self.args.patch_prototypes}' stores radius {meta['patch_radius']} but the "
+                f"current detection head needs radius {radius}"
+            )
+        channels = head_input_channels(student_head)
+        if list(subspace.channels) != channels:
+            raise ValueError(
+                f"Patch artifact head channels {list(subspace.channels)} differ from the model {channels}"
+            )
+        if int(meta["history_nc"]) != teacher_head.nc:
+            raise ValueError(
+                f"Patch artifact was built for {meta['history_nc']} old classes but the teacher exposes "
+                f"{teacher_head.nc}; regenerate the artifact for this stage"
+            )
+        bank.bind_nc(student_head.nc)
+        subspace.to(self.device)
+        bank.to(self.device)
+        self.patch_subspace, self.patch_bank = subspace, bank
+        LOGGER.info(
+            f"Patch prototypes '{self.args.patch_prototypes}': {bank.num_components} components, "
+            f"dims {subspace.dims}, radius {radius}"
+        )
+        if prad_enabled:
+            self.prad_loss = PrototypeReliabilityLwFLoss(
+                subspace=subspace,
+                bank=bank,
+                history_nc=teacher_head.nc,
+                fg_threshold=self.args.prad_fg_threshold,
+                bg_threshold=self.args.prad_bg_threshold,
+                conf_power=self.args.prad_conf_power,
+                proto_threshold=self.args.prad_proto_threshold,
+                proto_temperature=self.args.prad_proto_temperature,
+                bg_weight=self.args.prad_bg_weight,
+                split_normalize=self.args.prad_split_normalize,
+                max_fg=self.args.prad_max_fg,
+            )
+            criterion = RecordingDetectionLoss(unwrap_model(self.model))
+            unwrap_model(self.model).criterion = criterion
+        if self.args.prd:
+            self.prd_loss = PatchReplayDistillation(
+                student_head=student_head,
+                teacher_head=teacher_head,
+                subspace=subspace,
+                bank=bank,
+                samples=self.args.prd_samples,
+                std_scale=self.args.prd_std_scale,
+                smooth_l1_beta=1.0,
+                seed=RANK if RANK > -1 else 0,
+            )
 
     def _setup_train(self, world_size):
         """Build dataloaders and optimizer on correct rank process."""
@@ -567,8 +656,24 @@ class AntiForgetTrainer(BaseTrainer):
             self.espreg_loss_weight = self.args.espreg_loss_weight
             self.pca_cache = joblib.load(self.args.pca_cache_path)
             components, eigen_values = _extract_pca_spectra(self.pca_cache)
-            self.espreg_loss = EWPRegLoss(self.model, self.base_model, module_names=self.pca_cache.keys(),
-                                         components=components, eigen_values=eigen_values)
+            espreg_modules = tuple(self.pca_cache)
+            if self.args.espreg_scope == "backbone":
+                espreg_modules = tuple(_get_nsgp_backbone_names(self.model, espreg_modules))
+            elif self.args.espreg_scope != "all":
+                raise ValueError(f"espreg_scope must be 'all' or 'backbone', got {self.args.espreg_scope!r}")
+            self.espreg_loss = ESPRegLoss(
+                self.model,
+                self.base_model,
+                module_names=espreg_modules,
+                components={name: components[name] for name in espreg_modules},
+                eigen_values={name: eigen_values[name] for name in espreg_modules},
+                weight_mode=self.args.espreg_weight_mode,
+                form=self.args.espreg_form,
+            )
+            LOGGER.info(
+                f"ESPReg over {len(espreg_modules)} modules ({self.args.espreg_scope}), "
+                f"weight_mode={self.args.espreg_weight_mode}, form={self.args.espreg_form}"
+            )
         # ============================== END: set up ESPReg loss =================================================
 
         # ============================== MODIFIED: set up NSGP ============================================
@@ -610,13 +715,20 @@ class AntiForgetTrainer(BaseTrainer):
             raise ValueError(f"replay_mode '{self.args.replay_mode}' needs lwf to distill the replay samples")
         # ============================== END: validate replay mode =======================================
 
-        # ============================== MODIFIED: set up YOLO LwF ========================================
+        # ============================== MODIFIED: set up distillation teacher =============================
         self.lwf_keep_classes = None
-        if self.args.lwf:
+        self.patch_subspace = None
+        self.prad_loss = None
+        self.prd_loss = None
+        self.prad_teacher_feats = False
+        prad_enabled = self.args.lwf and self.args.lwf_mode == "prad"
+        if self.args.lwf or self.args.prd:
             if not self.args.lwf_teacher_model:
-                raise ValueError("lwf_teacher_model (the previous-task checkpoint) is required when lwf is enabled")
-            if self.args.lwf_mode not in {"yolo_lwf", "lwf"}:
-                raise ValueError(f"lwf_mode must be 'yolo_lwf' or 'lwf', got {self.args.lwf_mode!r}")
+                raise ValueError(
+                    "lwf_teacher_model (the previous-task checkpoint) is required when lwf or prd is enabled"
+                )
+            if self.args.lwf and self.args.lwf_mode not in {"yolo_lwf", "lwf", "prad"}:
+                raise ValueError(f"lwf_mode must be 'yolo_lwf', 'lwf' or 'prad', got {self.args.lwf_mode!r}")
             self.lwf_teacher, _ = load_checkpoint(self.args.lwf_teacher_model, device=self.device)
             self.lwf_teacher = self.lwf_teacher.eval()
             self.lwf_teacher.requires_grad_(False)
@@ -635,21 +747,27 @@ class AntiForgetTrainer(BaseTrainer):
                     f"LwF needs history class channels below the student class count, got teacher nc "
                     f"{self.lwf_history_nc} and student nc {student_head.nc}"
                 )
-            self.lwf_loss = YOLOLwFLoss(
-                reg_max=student_head.reg_max,
-                history_nc=self.lwf_history_nc,
-                temperature=self.args.lwf_temperature,
-                wce=self.args.lwf_wce,
-                cls_iou=self.args.lwf_cls_iou,
-            )
-            self.lwf_feature_channels = 4 * student_head.reg_max + self.lwf_history_nc
-            if self.args.lwf_mask_old:
+            if self.args.lwf and self.args.lwf_mode in {"yolo_lwf", "lwf"}:
+                self.lwf_loss = YOLOLwFLoss(
+                    reg_max=student_head.reg_max,
+                    history_nc=self.lwf_history_nc,
+                    temperature=self.args.lwf_temperature,
+                    wce=self.args.lwf_wce,
+                    cls_iou=self.args.lwf_cls_iou,
+                )
+                self.lwf_feature_channels = 4 * student_head.reg_max + self.lwf_history_nc
+            if self.args.lwf and self.args.lwf_mask_old:
+                # Current-task labels do not annotate the history classes; masking keeps the
+                # detection loss on the new-class channels for every lwf-based mode.
                 self.lwf_keep_classes = torch.arange(self.lwf_history_nc, student_head.nc, device=self.device)
+            if prad_enabled or self.args.prd:
+                self._setup_patch_prototypes(student_head, teacher_head, prad_enabled)
             LOGGER.info(
-                f"YOLO LwF ({self.args.lwf_mode}) teacher '{self.args.lwf_teacher_model}' with "
-                f"{self.lwf_history_nc} history classes, student with {student_head.nc} class channels"
+                f"Distillation ({self.args.lwf_mode if self.args.lwf else 'prd'}) teacher "
+                f"'{self.args.lwf_teacher_model}' with {self.lwf_history_nc} history classes, "
+                f"student with {student_head.nc} class channels"
             )
-        # ============================== END: set up YOLO LwF =============================================
+        # ============================== END: set up distillation teacher ==================================
 
         # Freeze layers
         freeze_list = (
@@ -872,7 +990,7 @@ class AntiForgetTrainer(BaseTrainer):
                     if self.args.bpf and self.args.bpf_dwf:
                         with torch.no_grad():
                             bpf_interim_pred = get_model_raw_output(batch, self.bpf_interim_model, self.device)
-                    if self.args.lwf:
+                    if self.args.lwf or self.args.prd:
                         lwf_teacher_pred, lwf_teacher_feats = self._lwf_teacher_output(batch)
                     if (self.args.bpf and self.args.bpf_future) or (self.args.lwf and self.args.lwf_mode == "lwf"):
                         model_pred, head_features = get_model_raw_output_and_features(
@@ -936,12 +1054,19 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== MODIFIED: make a copy of loss items ===============================
                     loss_items = dict(self.loss_items)  # criterion returns a dict of detached per-term scalars
                     # ============================== END: make a copy of loss items ====================================
+
+                    # ============================== MODIFIED: snapshot the current-batch assignment ==================
+                    # Later forwards (replay) overwrite the recorded assignment, so read it here.
+                    prad_assignment = None
+                    if self.prad_loss is not None:
+                        prad_assignment = get_assignment(unwrap_model(self.model).criterion)
+                    # ============================== END: snapshot the current-batch assignment =======================
                     
                     self.loss = loss.sum()
 
                     # ============================== MODIFIED: YOLO LwF terms on the current batch ================
                     lwf_current = None
-                    if self.args.lwf:
+                    if self.args.lwf and self.args.lwf_mode != "prad":
                         lwf_current = self._lwf_terms(model_pred, head_features, lwf_teacher_pred, lwf_teacher_feats)
                     # ============================== END: YOLO LwF terms on the current batch =====================
 
@@ -1041,6 +1166,34 @@ class AntiForgetTrainer(BaseTrainer):
                             loss_items["lwf_reg_loss"] = lwf_reg.detach()
                         self.loss += lwf_total * batch["img"].shape[0]
                     # ============================== END: compose YOLO LwF loss ========================================
+
+                    # ============================== MODIFIED: prototype reliability distillation ====================
+                    if self.prad_loss is not None:
+                        prad_terms = self.prad_loss(
+                            detect_branch_output(model_pred),
+                            detect_branch_output(lwf_teacher_pred),
+                            new_class_mask(prad_assignment, self.lwf_history_nc),
+                            _get_detect_head(self.model).stride,
+                        )
+                        self.loss += (
+                            prad_terms.cls * self.args.prad_cls_loss_weight
+                            + prad_terms.reg * self.args.prad_reg_loss_weight
+                        )
+                        loss_items["prad_cls_loss"] = prad_terms.cls_fg.detach()
+                        loss_items["prad_bg_loss"] = prad_terms.cls_bg.detach()
+                        loss_items["prad_reg_loss"] = prad_terms.reg.detach()
+                    # ============================== END: prototype reliability distillation =======================
+
+                    # ============================== MODIFIED: patch replay distillation =============================
+                    if self.prd_loss is not None:
+                        prd_terms = self.prd_loss.compute_loss()
+                        self.loss += (
+                            prd_terms.cls * self.args.prd_loss_weight
+                            + prd_terms.reg * self.args.prd_reg_loss_weight
+                        )
+                        loss_items["prd_cls_loss"] = prd_terms.cls.detach()
+                        loss_items["prd_reg_loss"] = prd_terms.reg.detach()
+                    # ============================== END: patch replay distillation =================================
 
                     if RANK != -1:
                         self.loss *= world_size                   

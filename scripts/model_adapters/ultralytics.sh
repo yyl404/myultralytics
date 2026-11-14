@@ -25,6 +25,10 @@ method_needs_prototypes() {
     method_has repre
 }
 
+method_needs_patch_prototypes() {
+    method_has prad || method_has prd
+}
+
 method_needs_replay() {
     method_has replay
 }
@@ -39,7 +43,7 @@ model_adapter_check_method_components() {
     local component
     for component in ${METHOD//+/ }; do
         case "$component" in
-            naive|bpf|pseudo_label|ewc|l2|dist|lwf|espreg|nsgp|repre|replay)
+            naive|bpf|pseudo_label|ewc|l2|dist|lwf|espreg|nsgp|repre|replay|prad|prd)
                 ;;
             *)
                 echo "Unimplemented Ultralytics method component: '$component' (METHOD='$METHOD')" >&2
@@ -66,6 +70,23 @@ model_adapter_regenerate_missing_artifacts() {
             --workers "$WORKERS" \
             --device "$TOOL_DEVICE" \
             "${importance_args[@]}"
+    fi
+
+    if method_needs_patch_prototypes && [[ ! -f "$PREVIOUS_PATCH_PROTOTYPES" ]]; then
+        echo "Regenerating missing patch prototype artifact: $PREVIOUS_PATCH_PROTOTYPES"
+        python tools/generate_patch_prototypes.py \
+            --model "$PREVIOUS_MODEL" \
+            --data "$previous_dataset" \
+            --output "$PREVIOUS_PATCH_PROTOTYPES" \
+            --device "$TOOL_DEVICE" \
+            --imgsz "$IMGSZ" \
+            --batch_size "$BATCH_SIZE" \
+            --workers "$WORKERS" \
+            --pca_dims "$PATCH_PCA_DIMS" \
+            --max_centers "$PATCH_PROTO_MAX_CENTERS" \
+            --split_ratio "$PATCH_PROTO_SPLIT_RATIO" \
+            --max_samples_per_class "$PATCH_PROTO_MAX_SAMPLES" \
+            --seed "$PATCH_PROTO_SEED"
     fi
 
     if method_needs_pca && [[ ! -f "$PREVIOUS_PCA" ]]; then
@@ -141,6 +162,28 @@ model_adapter_initialize() {
     OCDM_BATCH_SIZE="${OCDM_BATCH_SIZE:-1000}"
     REPLAY_LOSS_WEIGHT="${REPLAY_LOSS_WEIGHT:-1.0}"
     REPLAY_SEED="${REPLAY_SEED:-0}"
+    ESPREG_WEIGHT_MODE="${ESPREG_WEIGHT_MODE:-nt}"
+    ESPREG_FORM="${ESPREG_FORM:-original}"
+    ESPREG_SCOPE="${ESPREG_SCOPE:-all}"
+    PRAD_FG_THRESHOLD="${PRAD_FG_THRESHOLD:-0.5}"
+    PRAD_BG_THRESHOLD="${PRAD_BG_THRESHOLD:-0.1}"
+    PRAD_CONF_POWER="${PRAD_CONF_POWER:-1.0}"
+    PRAD_PROTO_THRESHOLD="${PRAD_PROTO_THRESHOLD:-0.5}"
+    PRAD_PROTO_TEMPERATURE="${PRAD_PROTO_TEMPERATURE:-0.1}"
+    PRAD_BG_WEIGHT="${PRAD_BG_WEIGHT:-1.0}"
+    PRAD_SPLIT_NORMALIZE="${PRAD_SPLIT_NORMALIZE:-True}"
+    PRAD_MAX_FG="${PRAD_MAX_FG:-512}"
+    PRAD_CLS_LOSS_WEIGHT="${PRAD_CLS_LOSS_WEIGHT:-30.0}"
+    PRAD_REG_LOSS_WEIGHT="${PRAD_REG_LOSS_WEIGHT:-1.5}"
+    PRD_SAMPLES="${PRD_SAMPLES:-64}"
+    PRD_STD_SCALE="${PRD_STD_SCALE:-1.0}"
+    PRD_LOSS_WEIGHT="${PRD_LOSS_WEIGHT:-30.0}"
+    PRD_REG_LOSS_WEIGHT="${PRD_REG_LOSS_WEIGHT:-5.0}"
+    PATCH_PCA_DIMS="${PATCH_PCA_DIMS:-128}"
+    PATCH_PROTO_MAX_CENTERS="${PATCH_PROTO_MAX_CENTERS:-8}"
+    PATCH_PROTO_SPLIT_RATIO="${PATCH_PROTO_SPLIT_RATIO:-0.2}"
+    PATCH_PROTO_MAX_SAMPLES="${PATCH_PROTO_MAX_SAMPLES:-256}"
+    PATCH_PROTO_SEED="${PATCH_PROTO_SEED:-0}"
     if ! declare -p EXTRA_TRAIN_ARGS >/dev/null 2>&1; then
         EXTRA_TRAIN_ARGS=()
     fi
@@ -150,6 +193,7 @@ model_adapter_initialize() {
     PREVIOUS_PROTOTYPES=""
     PREVIOUS_IMPORTANCE=""
     PREVIOUS_REPLAY=""
+    PREVIOUS_PATCH_PROTOTYPES=""
     if (( START_TASK > 1 )); then
         previous_task_dir="${OUTPUT_DIR}/task-$((START_TASK - 1))"
         PREVIOUS_MODEL="${previous_task_dir}/best.pt"
@@ -157,6 +201,7 @@ model_adapter_initialize() {
         PREVIOUS_PROTOTYPES="${previous_task_dir}/repre_prototypes.pt"
         PREVIOUS_IMPORTANCE="${previous_task_dir}/importance.pth"
         PREVIOUS_REPLAY="${previous_task_dir}/replay_dataset"
+        PREVIOUS_PATCH_PROTOTYPES="${previous_task_dir}/patch_prototypes.pt"
         if [[ ! -f "$PREVIOUS_MODEL" ]]; then
             echo "Previous task model not found: $PREVIOUS_MODEL" >&2
             exit 1
@@ -171,12 +216,26 @@ model_adapter_initialize() {
             echo "Previous task importance artifact not found: $PREVIOUS_IMPORTANCE" >&2
             exit 1
         fi
+        # The fixed shared PCA inside the patch artifact is fitted at the base stage: the adapter can
+        # rebuild it only when the previous task is that stage (START_TASK=2), never from a later one.
+        if method_needs_patch_prototypes && [[ ! -f "$PREVIOUS_PATCH_PROTOTYPES" ]] && (( START_TASK > 2 )); then
+            echo "Previous task patch prototype artifact not found: $PREVIOUS_PATCH_PROTOTYPES" >&2
+            echo "The fixed shared PCA is fitted at the base stage; rerun from START_TASK=2" >&2
+            exit 1
+        fi
         if method_needs_pca && [[ ! -f "$PREVIOUS_PCA" ]]; then
             echo "Previous task PCA artifact not found: $PREVIOUS_PCA" >&2
             exit 1
         fi
         if method_needs_prototypes && [[ ! -f "$PREVIOUS_PROTOTYPES" ]]; then
             echo "Previous task RePRE artifact not found: $PREVIOUS_PROTOTYPES" >&2
+            exit 1
+        fi
+        # The fixed shared PCA inside the patch artifact is fitted at the base stage: it can be rebuilt
+        # only when the previous task is that stage (START_TASK=2), never from a later stage.
+        if method_needs_patch_prototypes && [[ ! -f "$PREVIOUS_PATCH_PROTOTYPES" ]] && (( START_TASK > 2 )); then
+            echo "Previous task patch prototype artifact not found: $PREVIOUS_PATCH_PROTOTYPES" >&2
+            echo "The fixed shared PCA is fitted at the base stage; rerun from START_TASK=2" >&2
             exit 1
         fi
         # Replay data is cumulative, so it cannot be regenerated for a single task; require the
@@ -346,6 +405,44 @@ model_adapter_prepare_task() {
                 --espreg True
                 --pca_cache_path "$PREVIOUS_PCA"
                 --espreg_loss_weight "$ESPREG_LOSS_WEIGHT"
+                --espreg_weight_mode "$ESPREG_WEIGHT_MODE"
+                --espreg_form "$ESPREG_FORM"
+                --espreg_scope "$ESPREG_SCOPE"
+            )
+        fi
+
+        if method_has prad || method_has prd; then
+            TRAINER_ARGS+=(
+                --lwf_teacher_model "$PREVIOUS_MODEL"
+                --patch_prototypes "$PREVIOUS_PATCH_PROTOTYPES"
+            )
+        fi
+
+        if method_has prad; then
+            TRAINER_ARGS+=(
+                --lwf True
+                --lwf_mode prad
+                --lwf_mask_old "$LWF_MASK_OLD"
+                --prad_fg_threshold "$PRAD_FG_THRESHOLD"
+                --prad_bg_threshold "$PRAD_BG_THRESHOLD"
+                --prad_conf_power "$PRAD_CONF_POWER"
+                --prad_proto_threshold "$PRAD_PROTO_THRESHOLD"
+                --prad_proto_temperature "$PRAD_PROTO_TEMPERATURE"
+                --prad_bg_weight "$PRAD_BG_WEIGHT"
+                --prad_split_normalize "$PRAD_SPLIT_NORMALIZE"
+                --prad_max_fg "$PRAD_MAX_FG"
+                --prad_cls_loss_weight "$PRAD_CLS_LOSS_WEIGHT"
+                --prad_reg_loss_weight "$PRAD_REG_LOSS_WEIGHT"
+            )
+        fi
+
+        if method_has prd; then
+            TRAINER_ARGS+=(
+                --prd True
+                --prd_samples "$PRD_SAMPLES"
+                --prd_std_scale "$PRD_STD_SCALE"
+                --prd_loss_weight "$PRD_LOSS_WEIGHT"
+                --prd_reg_loss_weight "$PRD_REG_LOSS_WEIGHT"
             )
         fi
 
@@ -503,6 +600,28 @@ model_adapter_finalize_task() {
             --radius 0.6 \
             "${history_args[@]}"
         PREVIOUS_PROTOTYPES="${TASK_DIR}/repre_prototypes.pt"
+    fi
+
+    if method_needs_patch_prototypes; then
+        history_args=()
+        if [[ -n "$PREVIOUS_PATCH_PROTOTYPES" ]]; then
+            history_args=(--load_hist "$PREVIOUS_PATCH_PROTOTYPES")
+        fi
+        python tools/generate_patch_prototypes.py \
+            --model "$PREVIOUS_MODEL" \
+            --data "$TRAIN_DATA" \
+            --output "${TASK_DIR}/patch_prototypes.pt" \
+            --device "$TOOL_DEVICE" \
+            --imgsz "$IMGSZ" \
+            --batch_size "$BATCH_SIZE" \
+            --workers "$WORKERS" \
+            --pca_dims "$PATCH_PCA_DIMS" \
+            --max_centers "$PATCH_PROTO_MAX_CENTERS" \
+            --split_ratio "$PATCH_PROTO_SPLIT_RATIO" \
+            --max_samples_per_class "$PATCH_PROTO_MAX_SAMPLES" \
+            --seed "$PATCH_PROTO_SEED" \
+            "${history_args[@]}"
+        PREVIOUS_PATCH_PROTOTYPES="${TASK_DIR}/patch_prototypes.pt"
     fi
 
     if method_needs_replay; then

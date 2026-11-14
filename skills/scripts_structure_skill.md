@@ -33,6 +33,7 @@ scripts/
 ├── predict.sh                     # per-dataset inference over yaml sequences
 ├── analyze.sh                     # vis / confusion-matrix tools
 ├── run_incremental.sh             # shared task loop (model-agnostic)
+├── offline_experiment.sh          # one-command run: reuse base model -> train -> eval -> PCA report -> txt summary
 ├── libexec/
 │   └── experiment.sh              # dataset / model / output resolution
 ├── model_adapters/
@@ -243,6 +244,8 @@ one fails when its artifacts are used.
 | `nsgp` | + NSGP (implies EWC + PCA artifacts) |
 | `repre` | + RePRE (prototypes artifact) |
 | `replay` | + experience replay |
+| `prad` | + prototype-reliability-aware YOLO LwF (`lwf_mode=prad`, patch-prototype artifact) |
+| `prd` | + all-class patch replay distillation (patch-prototype artifact) |
 
 Output dir (override with `--output`):
 
@@ -267,7 +270,8 @@ of the train yamls.
 | `analyze.sh` | Dispatch to vis / confusion-matrix tools |
 | `libexec/experiment.sh` | create recipe, model/output resolution, yaml/split/model helpers |
 | `run_incremental.sh` | Validate adapter + loop tasks |
-| `model_adapters/<framework>.sh` | Framework-specific train / artifact hooks |
+| `offline_experiment.sh` | Reuse a trained base model, run the incremental stages, evaluate, measure the patch-PCA reconstruction and write one txt summary |
+| `model_adapters/<framework>.sh` | Framework-specific train / artifact hooks (importance, pca_cache, repre prototypes, `patch_prototypes.pt`, replay dataset) |
 
 Eval always writes the individual matrix table; it adds the cumulative matrix
 table whenever a cumulative sequence is given. Every cell is additionally
@@ -299,6 +303,14 @@ set); final artifacts (`best.pt`, CSVs) are overwritten in place.
 | `BATCH_SIZE` / `IMGSZ` / `WORKERS` / `DEVICE` | Train/eval device and loader | 16 / 640 / 8 / 0 |
 | `START_TASK` / `END_TASK` | Partial incremental run | 1 / last task |
 | `DIST_LOSS_WEIGHT` / `DIST_TOPK` / `ESPREG_LOSS_WEIGHT` | Method weights | adapter defaults (100 / 1 / 100) |
+| `ESPREG_WEIGHT_MODE` / `ESPREG_FORM` / `ESPREG_SCOPE` | ESPReg spectrum (`raw`/`nt`), reduction (`original`/`frobenius`) and layer scope (`all`/`backbone`) | nt / original / all |
+| `PRAD_FG_THRESHOLD` / `PRAD_BG_THRESHOLD` / `PRAD_CONF_POWER` | prad teacher confidence thresholds and exponent | 0.5 / 0.1 / 1.0 |
+| `PRAD_PROTO_THRESHOLD` / `PRAD_PROTO_TEMPERATURE` | prad prototype-reliability sigmoid center and width | 0.5 / 0.1 |
+| `PRAD_BG_WEIGHT` / `PRAD_SPLIT_NORMALIZE` / `PRAD_MAX_FG` | prad background weight, foreground/background normalization, candidate cap | 1.0 / True / 512 |
+| `PRAD_CLS_LOSS_WEIGHT` / `PRAD_REG_LOSS_WEIGHT` | prad classification and regression weights | 4.0 / 0.5 |
+| `PRD_SAMPLES` / `PRD_STD_SCALE` / `PRD_LOSS_WEIGHT` / `PRD_REG_LOSS_WEIGHT` | prd patch draws, sampling spread, classification and regression weights | 64 / 1.0 / 1.0 / 0.5 |
+| `PATCH_PCA_DIMS` / `PATCH_PROTO_MAX_CENTERS` / `PATCH_PROTO_SPLIT_RATIO` | patch-prototype artifact PCA dims, centre budget, DP-Means split ratio | 128 / 8 / 0.2 |
+| `PATCH_PROTO_MAX_SAMPLES` / `PATCH_PROTO_SEED` | patches kept per class for clustering, artifact seed | 256 / 0 |
 | `YOLO26_DEFAULT_HYPS` | Set `0` to skip yolo26 extras | 1 |
 | `TINY_FRACTION` / `SEED` | voc-tiny subsample (create.sh) | 0.1 / 0 |
 | `CLASS_AGNOSTIC_EVAL` | Set `0` to skip the class-agnostic eval pass | 1 |

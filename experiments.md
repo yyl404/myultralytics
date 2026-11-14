@@ -710,3 +710,105 @@ Joint 的四阶段评测在独立目录 `runs/yolo26m_VOC_joint4_pretrained-from
 
 结果目录：`runs/yolo26m_VOC_5+5+5+5_pretrained-from-yolo26m-cls_{naive,lwf}/`（`task-{3,4}/best.pt`、`evaluation_results/*_stage_mAP.csv`）；历史类误报分析在各自 `history_errors/on-*/`。
 
+
+# 2026-11-13 → 2026-11-14：原型可靠性感知蒸馏（prad + prd + ESPReg 二分实现）
+
+按 `method_plan.md` 实现并跑通第一版方法：`prad`（原型可靠性感知 YOLO-LwF 蒸馏）+ `prd`（历史 patch 原型全类别回放蒸馏）+ `espreg`（新增 `raw/nt` 特征值权重与 `original/frobenius` 两种约束形式）。
+
+## 1. 实现要点
+
+| 组件 | 内容 |
+|---|---|
+| `ultralytics/engine/patch_proto.py` | 检测头输入 patch 半径推导、按位置取 patch、`RecordingDetectionLoss`（子类化官方 `v8DetectionLoss` 截获 TAL 分配结果，官方文件零改动）、固定共享 PCA `HeadPatchSubspace`（含无压缩回退）、多中心原型 `MultiCenterBank`（DP-Means + 对角协方差 + π + 采样 + 余弦匹配）、工件读写 |
+| `ultralytics/engine/prad.py` | 前景/背景分离、原型可靠性门控 `g_k = sigmoid((r_k - τ_proto)/T_proto)`、`BKL`、前景回归蒸馏；`prad_split_normalize` 支持消融 |
+| `ultralytics/engine/prd.py` | 每步采样 → PCA 重建 patch → 师生检测头前向（BN 临时 eval 后恢复）→ 全类别蒸馏（旧类软目标、新类概率 0）+ 回归 SmoothL1 |
+| `ultralytics/engine/espreg.py` | `EWPRegLoss` → **`ESPRegLoss`**；`weight_mode ∈ {raw, nt}`、`form ∈ {original, frobenius}`、`scope ∈ {all, backbone}`。`original+nt` 与旧实现数值完全一致（回归检查：43.6557312012 vs 43.6557312012，相对差 0.0） |
+| `tools/generate_patch_prototypes.py` | 工件生成（TAL 代表性位置 + GT 中心区域）与 §8.5/§14.1 报告：`--report_dims`（E_feat/E_cls/E_reg 按尺度/维度/类别）、`--report_similarity`、`--report_only`、`--split` |
+| `tools/summarize_run.py` | 单个 run → 单 txt 汇总（协议、per-task/cumulative 矩阵、Old/New/All、分阶段 mAP、PCA 重建偏差、相似度、CSV 清单） |
+| `scripts/offline_experiment.sh` | 离线一条命令：自动从 `VOC-YOLO` 切分数据 → 复用基础模型 → 训练增量阶段 → 评估 → PCA 报告 → txt 汇总；`--prepare-only` / `--train-base` / `--skip-eval` / `--skip-report` |
+| `run_lwf_espreg_10+10.sh` | 离线单实验脚本（LwF + ESPReg，2×2 因子设计的补格） |
+| `default.yaml` / 适配器 / `experiment.sh` | 新增 `patch_prototypes`、`prad_*`(10)、`prd_*`(5)、`espreg_weight_mode/espreg_form/espreg_scope`；`prad`/`prd` 组件；基础阶段工件可按需重建 |
+
+## 2. 实验协议
+
+- 数据集：VOC 10+10（CIL）；基础阶段 task-1 **复用** `runs/yolo26m_VOC_10+10_pretrained-from-yolo26m-cls_naive/task-1/best.pt`，只训练 task-2（`START_TASK=2`）。
+- 训练：yolo26m（init `yolo26m-cls.pt`），100 epoch，batch 16，imgsz 640，AdamW / lr0 0.001 / lrf 0.01 / wd 0.0005 / warmup_bias_lr 0.0 / mosaic 0.5，`end2end False`。
+- 方法超参（v2 = 主结果）：ESPReg `raw` 原始特征值 + `frobenius` 约束 + `scope=all` + λ_ESP=0.01；`λ_KD=30`、`λ_reg=1.5`、`λ_PRD=30`、`λ_PRD-reg=5`、`τ_F=0.5`、`τ_B=0.1`、`η_B=1`、`τ_proto=0.3`、`T_proto=0.1`、`prd_samples=64/尺度`、patch PCA d=128、patch 半径 r=2（5×5）。
+- 评估：`scripts/eval.sh` 的 per-task + cumulative 序列，class-aware 与 class-agnostic 两种协议，指标 mAP50-95。
+
+## 3. 主结果（VOC 10+10，最终模型）
+
+class-aware：
+
+| Method | T1 (Old) mAP50 | T2 (New) mAP50 | All mAP50 | T1 mAP50-95 | T2 mAP50-95 | All mAP50-95 |
+|---|---|---|---|---|---|---|
+| naive | 0.0 | 80.99 | 38.41 | 0.0 | 59.41 | 28.27 |
+| YOLO-LwF | 78.79 | 78.41 | 76.34 | 57.56 | 56.89 | 55.82 |
+| Joint（上界） | 84.67 | 82.98 | 82.44 | 62.55 | 61.03 | 60.89 |
+| 本方法 v1（λ_KD=4, λ_ESP=0.03） | 55.32 | 79.50 | 62.19 | 35.21 | 56.70 | 42.54 |
+| **本方法 v2（λ_KD=30, λ_ESP=0.01）** | **69.50** | **81.00** | **71.14** | **47.97** | **58.06** | **50.29** |
+| 本方法 prad+prd（去掉 ESPReg） | 59.54 | 80.82 | 65.93 | 40.47 | 59.06 | 46.92 |
+
+class-agnostic（object 协议，只看定位/objectness）：
+
+| Method | T1 mAP50-95 | T2 mAP50-95 |
+|---|---|---|
+| YOLO-LwF | 44.27 | 47.87 |
+| Joint | 49.29 | 49.41 |
+| 本方法 v1 | 29.13 | 20.98 |
+| 本方法 v2 | 40.62 | 35.38 |
+| 本方法 prad+prd | 32.18 | 40.98 |
+
+## 4. 结论与诊断
+
+1. **静默失效已修复**：v1 的蒸馏权重标定过弱（蒸馏合计仅 13% L_det），旧类通道只由蒸馏监督却几乎不受约束，导致旧类 precision 崩塌（bicycle 0.96→0.33）与全图过火（object 协议 T2 仅 21.0）。把 λ_KD 从 4 提到 30 后，Old +12.8、New +1.4、All +7.8，object 协议 T1 +11.5 / T2 +14.4。
+2. **ESPReg 起作用（原假设被证伪）**：同一蒸馏配置下，加 ESPReg 使 Old +7.5（40.5→48.0）、All +3.4，代价 New −1.0。`raw+frobenius` 在 λ=0.01 时加权量为 L_det 的约 4.3~4.8 倍且会自限（原始值 65→380 后回落）。
+3. **与 LwF 的剩余差距在蒸馏覆盖而非正则项**：本方法 Old 48.0 vs LwF 57.6（New 反而更高 58.1 vs 56.9）。原因是**按损失值标定权重的方法有缺陷**——梯度强度取决于参与元素数量：LwF 的分类蒸馏覆盖全锚点×全旧类（每图 84k 元素），而 prad 的前景项只覆盖教师置信的少数前景锚点（每图 10–20 个），即使按权重归一化后损失值更大，总梯度仍小 2–3 个数量级。v2 的旧类 precision 已恢复到 0.5–0.8 但 recall 下滑（0.65→0.42）正是"局部保住、全局未锚定"的表现。
+4. 已登记但**未完成**的修正方向：把背景阈值设为 `τ_B=0.49`（全图稠密覆盖，等同于补齐 LwF 的全局锚定）并把 λ_KD 提到 500（按梯度规模而非损失值对齐）；该配置因实验终止未开始。
+
+## 5. 分阶段 PCA 降维可行性（方案 §8.5，基础工件 d=128）
+
+重建偏差（检测头中心输出，`E_cls` = 全类 |Δp| 之和，`E_reg` = SmoothL1，stride 单位）：
+
+| 阶段（样本来源） | 尺度 | d=16 E_cls / E_reg | d=32 | d=64 | **d=128** |
+|---|---|---|---|---|---|
+| task-1（分布内） | P3 | 0.182 / 0.087 | 0.098 / 0.043 | 0.056 / 0.017 | **0.044 / 0.009** |
+| task-1 | P4 | 0.583 / 0.055 | 0.251 / 0.034 | 0.086 / 0.017 | **0.047 / 0.008** |
+| task-1 | P5 | 0.799 / 0.080 | 0.413 / 0.047 | 0.078 / 0.025 | **0.042 / 0.010** |
+| task-2（域外） | P3 | 0.183 / 0.074 | 0.105 / 0.040 | 0.057 / 0.015 | **0.047 / 0.007** |
+| task-2 | P4 | 0.449 / 0.063 | 0.234 / 0.037 | 0.097 / 0.019 | **0.055 / 0.006** |
+| task-2 | P5 | 0.588 / 0.091 | 0.388 / 0.056 | 0.139 / 0.025 | **0.067 / 0.008** |
+
+结论：d=128 时 `E_cls ≤ 0.067`（10 类合计，单类 ≤0.007）、`E_reg ≤ 0.010`（stride 8 下约 0.08 px），比回放需要纠正的师生漂移（E_reg 0.14–1.0、每类 BKL 0.1–1）小 1–2 个数量级 → **PCA 128 维近似可行**，无需回退无压缩方案；维度 64→128 使 E_cls/E_reg 约减半。
+
+原型相似度（同一工件，按锚点）：分布内 task-1 patch 中位 0.40/0.29/0.51（P3/P4/P5），域外 task-2 教师高置信锚点中位 0.38/0.22/0.41，L1 明显下移（p25 0.06–0.12）→ `τ_proto=0.3` 落在两组之间。
+
+## 6. 训练开销（VOC 10+10 task-2，bs16，328 iter/epoch）
+
+| 方法 | 平均每 epoch | 相对 naive |
+|---|---|---|
+| naive | 94.1 s | 1.00× |
+| YOLO-LwF | 109.4 s | 1.16× |
+| 本方法（prad+prd+espreg, raw+frobenius） | 233.4 s | 2.48× |
+
+开销来自每步多一次教师前向、prad 的全锚点逐类 BKL、prd 的 3×64 patch 头前向、ESPReg 对 88 个模块的全谱投影与反传。推理阶段零额外开销。
+
+## 7. 关键超参数溯源
+
+- **λ_ESP=0.01（raw+frobenius）**：同一 ΔW 下四种组合的损失为 original/nt 43.7、original/raw 710、frobenius/nt 10566、frobenius/raw 138244；按"同一 ΔW 下加权损失相同"换算，0.03 与历史 100 等价，实测在 0.03 下 ESPReg 加权为 L_det 的 4.3–4.8 倍后改用 0.01。
+- **原始特征值 vs NT 截断**：88 模块、70491 个主方向的 λ 跨度 3.2e-6 ~ 299（约 8 个数量级），每模块 top-10 方向平均占谱 44.6%；`nt` 把最前上百个方向截断为同一权重 1，`raw` 保留其 1e5 量级差异（对应方案 §9.3 的严格二次型）。
+- **τ_proto=0.3**：由上述相似度分布确定（0.5 会门控掉 40–75% 的分布内 patch）。
+- **λ_KD=30 / λ_reg=1.5 / λ_PRD=30 / λ_PRD-reg=5**：按损失值占比对齐 LwF 基线的 20–39%，实测 v2 蒸馏合计 28–33% L_det（该标定口径的缺陷见 §4.3）。
+
+## 8. 工件与结果位置
+
+- 工件：`runs/..._prad+prd+espreg-raw/task-{1,2}/patch_prototypes.pt`（16.6 MB，40 组件，dims 128×3）、`task-1/pca_cache.pkl`（ESPReg 缓存）。
+- 汇总：各 run 下 `summary.txt`（含 per-task/cumulative 矩阵、分阶段 mAP、PCA 表、相似度、CSV 清单）；`evaluation_results/*.csv`；`pca_reconstruction/*.csv` 与 `similarity.txt`。
+
+## 9. 进行中 / 待补充
+
+| 实验 | 配置 | 状态 | 结果 |
+|---|---|---|---|
+| VOC 10+10 `lwf+espreg`（2×2 补格） | LwF（λ_cls=4000/λ_reg=500/mask_old）+ ESPReg raw+frobenius λ=0.01 | 本地跑到第 13 epoch 后按要求终止；同配置脚本 `run_lwf_espreg_10+10.sh` 已交付离线机器 | （待补） |
+| VOC 10+10 `prad+prd+espreg` dense-KD 修正版 | `τ_B=0.49`（全图稠密覆盖）+ `λ_KD=500`，其余同 v2 | 已排队，未开始 | （待补） |
+| VOC 5+5+5+5 `prad+prd+espreg`（v2 权重） | 4 阶段，其余同 v2 | 已交付离线机器（`scripts/offline_experiment.sh --dataset voc --split 5_5_5_5`） | （待补） |
