@@ -2,7 +2,7 @@
 
 from .predict import DetectionPredictor
 from .train import AntiForgetDetectionTrainer, BPFDetectionTrainer, DetectionTrainer
-from .val import ClassAgnosticDetectionValidator, DetectionValidator
+from .val import DetectionValidator
 
 
 __all__ = (
@@ -11,5 +11,4 @@ __all__ = (
     "AntiForgetDetectionTrainer",
     "BPFDetectionTrainer",
     "DetectionValidator",
-    "ClassAgnosticDetectionValidator",
 )

@@ -2,7 +2,7 @@
 # Offline incremental-experiment driver for one run directory.
 #
 # Reuses an already trained base-stage model (task 1), trains only the incremental stages of
-# one method, evaluates every stage (per-task and cumulative, class-aware and class-agnostic),
+# one method, evaluates every stage (per-task and cumulative, class-aware),
 # measures the patch-prototype PCA reconstruction fidelity on every stage sample set, and
 # writes a single plain-text summary of the whole run.
 #

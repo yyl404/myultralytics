@@ -2,7 +2,7 @@
 name: myultralytics-scripts-structure
 description: >-
   Documents the unified scripts/ experiment entry points (train / eval / create /
-  feature_drift / predict / analyze), the decoupled yaml-sequence contract
+  feature_drift / analyze), the decoupled yaml-sequence contract
   (explicit train sequence; independent eval sequences; full model × dataset
   matrices), dataset and model resolution, the incremental task loop, and the
   scripts/voc/tiny/15+5 demo. Use when adding a dataset family, model family,
@@ -15,11 +15,17 @@ description: >-
 and `ultralytics/`. Entry points `cd` to the repo root, so they can be launched
 from anywhere; relative paths like `data/...` and `tools/...` are repo-relative.
 
+The IOD pipeline ends at evaluation: there is no predict entry and no
+class-agnostic (`object`) eval pass. `eval.sh` writes class-aware cells only.
+Dataset class-id alignment happens at load time (see below), never by writing a
+converted dataset tree.
+
 Do **not** add per-dataset, per-split, per-model, or per-method launcher copies.
-One train/eval/create/feature_drift script covers every combination. The single
-sanctioned exception is the demo under `scripts/voc/tiny/15+5/` (see below),
+One train/eval/create/feature_drift script covers every combination. The
+sanctioned exceptions are the demo under `scripts/voc/tiny/15+5/` (see below),
 which only composes the unified entry points and holds its tunables in
-`common.sh`.
+`common.sh`, and the fixed CVPR-27 revision bundle under `scripts/cvpr27/`
+(one shared driver + three machine queues; it composes the same entry points).
 
 ## Layout
 
@@ -30,7 +36,6 @@ scripts/
 ├── create.sh                      # CIL split builder (the ONLY --dataset/--split entry)
 ├── feature_drift.sh               # task-1 feature drift between two ckpts
 ├── dataset_similarity.sh          # N x N image-domain feature similarity over a yaml sequence
-├── predict.sh                     # per-dataset inference over yaml sequences
 ├── analyze.sh                     # vis / confusion-matrix tools
 ├── run_incremental.sh             # shared task loop (model-agnostic)
 ├── offline_experiment.sh          # one-command run: reuse base model -> train -> eval -> PCA report -> txt summary
@@ -38,7 +43,8 @@ scripts/
 │   └── experiment.sh              # dataset / model / output resolution
 ├── model_adapters/
 │   └── ultralytics.sh             # train + artifact hooks
-└── voc/tiny/15+5/                 # VOC-TINY 15+5 demo (common.sh + train/eval/predict/similarity/pipeline)
+├── voc/tiny/15+5/                 # VOC-TINY 15+5 demo (common.sh + train/eval/similarity/pipeline)
+└── cvpr27/                        # fixed 3-machine revision queues (common.sh + machine1/2/3 + README)
 ```
 
 ## The yaml-sequence contract (train / eval decoupled)
@@ -51,7 +57,6 @@ and nothing else:
 | `train.sh` | `--tasks` (required) | Incremental train data, one yaml per task |
 | `eval.sh` | `--tasks` (required) | Per-task eval data, any yaml sequence |
 | `eval.sh` | `--cumulative` (optional) | Cumulative eval data, any yaml sequence |
-| `predict.sh` | `--tasks` / `--cumulative` | Datasets to run inference on |
 
 - Training never receives eval datasets. It produces `task-1`, `task-2`, …
   under the run directory and stops there.
@@ -64,19 +69,21 @@ and nothing else:
   first and pass everything after it as `--flags` (e.g.
   `--tasks t1.yaml t2.yaml --model yolo26 --method naive`). A single
   comma-separated argument also works (`--tasks a.yaml,b.yaml`).
-- Each yaml is evaluated/predicted on its `test` split by default, falling
+- Each yaml is evaluated on its `test` split by default, falling
   back to `val` when no `test:` key exists (`--split` overrides).
 - `--dataset/--split` (registered dataset families) is accepted **only** by
   `create.sh`, for slicing a full single-stage dataset into class-incremental
-  task datasets. It is not a train/eval/predict entry.
+  task datasets. It is not a train/eval entry.
 
 Head expansion (`tools/expand_model_head.py`) keeps existing class ids and their
 order in the detection head, and appends classes not yet known to the model after
 them in their dataset order. A class already known to the model keeps its existing
 id — overlapping annotations in the new dataset are aligned to that id by class
-name (`tools/convert_dataset_class_ids.py`), never duplicated. Task, eval, and
-replay datasets are converted into the current model's class-id space by name
-before training/eval/predict, so every DDP rank shares the same class space.
+name, never duplicated. Task, eval, and replay datasets are aligned to the current
+model's class-id space at load time: `tools/make_class_mapped_yaml.py` writes a
+tiny YAML with the target names and a `class_id_map`, and
+`ClassMappedYOLODataset` remaps labels after the shared label cache is read. Every
+DDP rank reads the same YAML and cache, so the class space is identical.
 
 Decode-config consistency: `end2end` / `agnostic_nms` / `max_det` are Python
 attributes on the Detect head, not state_dict entries, so any yaml rebuild
@@ -90,7 +97,7 @@ still win afterwards in `set_model_attributes`; the AntiForget/BPF frozen
 teacher and reference models get the current train args applied via
 `_apply_train_head_args` (`ultralytics/engine/anti_forget.py`) and a
 teacher/student `end2end` mismatch raises immediately with expected vs actual.
-Eval/predict use the checkpoint's pickled attributes unless explicit args are
+Eval uses the checkpoint's pickled attributes unless explicit args are
 passed through `--`.
 
 Per-stage aggregation at eval time (`tools/stage_task_map.py`) takes the stage
@@ -111,11 +118,6 @@ bash scripts/create.sh voc-tiny 15_5
 # Eval a finished run on any yaml sequences (full models × datasets matrix)
 bash scripts/eval.sh runs/<run> --tasks e1.yaml e2.yaml --cumulative c1.yaml c2.yaml
 
-# Inference on any image dir (add --labels for TP/FP/FN + Precision/Recall)
-python tools/predict.py --model runs/<run>/task-2/best.pt --images some/images --labels some/labels
-# ... or over yaml sequences with class-id alignment handled for you
-bash scripts/predict.sh --model runs/<run>/task-2/best.pt --tasks t1.yaml t2.yaml
-
 # Feature drift on task-1 images
 bash scripts/feature_drift.sh --tasks t1.yaml t2.yaml --model1 runs/<run>/task-1/best.pt --model2 runs/<run>/task-2/best.pt
 
@@ -123,9 +125,8 @@ bash scripts/feature_drift.sh --tasks t1.yaml t2.yaml --model1 runs/<run>/task-1
 bash scripts/dataset_similarity.sh --tasks t1.yaml t2.yaml --weights yoloe-26m-seg.pt
 ```
 
-`train.sh --` passes extra flags to `tools/train.py`; `eval.sh --` and
-`predict.sh --` forward to `tools/eval.py` / `tools/predict.py` (e.g.
-`-- --agnostic_nms True`).
+`train.sh --` passes extra flags to `tools/train.py`; `eval.sh --` forwards to
+`tools/eval.py` (e.g. `-- --agnostic_nms True`).
 
 ## Demo: VOC-TINY 15+5 (`scripts/voc/tiny/15+5/`)
 
@@ -139,9 +140,8 @@ scripts/voc/tiny/15+5/
 │                   # eval), CUMULATIVE_YAMLS (cumulative eval, () to skip)
 ├── train.sh        # checks TRAIN_YAMLS exist (hint: create the dataset), then scripts/train.sh
 ├── eval.sh         # scripts/eval.sh on EVAL_YAMLS + CUMULATIVE_YAMLS
-├── predict.sh      # scripts/predict.sh on the same two sequences (labeled inference)
 ├── similarity.sh   # scripts/dataset_similarity.sh on TRAIN_YAMLS (standalone)
-└── pipeline.sh     # train → eval → predict
+└── pipeline.sh     # train → eval
 ```
 
 The stage scripts resolve their own directory at runtime (`DEMO_DIR`) and walk
@@ -154,7 +154,7 @@ yaml sequences are plain bash arrays read from `common.sh` only (no
 environment or command-line override); the train, independent-eval, and
 cumulative-eval sequences are fully decoupled and may differ in content,
 order, and length. The scalar knobs further down (`MODEL`, `WEIGHTS`,
-`METHOD`, `RUN_DIR`, decode knobs, `EXTRA_*_ARGS`, `CLASS_AGNOSTIC_EVAL`,
+`METHOD`, `RUN_DIR`, decode knobs, `EXTRA_*_ARGS`,
 `EPOCHS`, `DEVICE`) can
 still be overridden per launch with an environment variable of the same name,
 e.g. `EPOCHS=1 RUN_DIR=runs/smoke bash <dir>/pipeline.sh`.
@@ -162,9 +162,9 @@ e.g. `EPOCHS=1 RUN_DIR=runs/smoke bash <dir>/pipeline.sh`.
 Conventions demonstrated: `yolo26m` + `yoloe-26m-seg.pt`; decode modes
 (`end2end` / `agnostic_nms` / `max_det`) are prominent knobs in `common.sh`
 (`END2END` / `AGNOSTIC_NMS` / `MAX_DET`, defaults `False` / `True` / `300`)
-forwarded to train/eval/predict via `DECODE_ARGS` in every `EXTRA_*_ARGS`;
+forwarded to train/eval via `DECODE_ARGS` in every `EXTRA_*_ARGS`;
 small-data hyps (AdamW, lr0, mosaic, freeze) passed explicitly after `--` via
-`EXTRA_TRAIN_ARGS` in `common.sh`; eval/predict on the `test` split (`val`
+`EXTRA_TRAIN_ARGS` in `common.sh`; eval on the `test` split (`val`
 fallback) in EVAL_YAMLS then CUMULATIVE_YAMLS order; `similarity.sh` runs the
 N x N dataset image-domain feature similarity on TRAIN_YAMLS with the
 pretrained backbone (`SIMILARITY_WEIGHTS`, defaults to `WEIGHTS`).
@@ -191,7 +191,7 @@ directory. Any positive integer sequence is allowed without adding a script:
 
 `create.sh` produces per-task yamls `task_<k>_cls_<nk>/dataset.yaml` plus
 cumulative yamls `task_1-<k>_cls_<sum>/dataset.yaml` (task 1 reuses the
-per-task yaml) — pass them explicitly to train/eval/predict afterwards.
+per-task yaml) — pass them explicitly to train/eval afterwards.
 
 COCO eval wants `--iou-threshold 0.75` on `eval.sh` for the extra AP column.
 
@@ -262,11 +262,10 @@ of the train yamls.
 | File | Role |
 |------|------|
 | `train.sh` | Parse `--tasks` + model/method → resolve → source `run_incremental.sh` |
-| `eval.sh` | Discover `task-*/best.pt` → per (model, yaml) convert class ids → `tools/eval.py` (class-aware + class-agnostic `object` pass) → tables + `tools/stage_task_map.py` |
+| `eval.sh` | Discover `task-*/best.pt` → per (model, yaml) write a class-map YAML → `tools/eval.py` (class-aware) → tables + `tools/stage_task_map.py` |
 | `create.sh` | CIL only: optional subsample (voc-tiny) then `create_incremental_dataset.py` |
 | `feature_drift.sh` | `tools/feature_drift.py` on `TASK_DATASETS[0]` |
 | `dataset_similarity.sh` | `tools/dataset_similarity.py` over the whole `--tasks` sequence |
-| `predict.sh` | Per yaml: convert class ids → `tools/predict.py --images --labels` |
 | `analyze.sh` | Dispatch to vis / confusion-matrix tools |
 | `libexec/experiment.sh` | create recipe, model/output resolution, yaml/split/model helpers |
 | `run_incremental.sh` | Validate adapter + loop tasks |
@@ -274,21 +273,12 @@ of the train yamls.
 | `model_adapters/<framework>.sh` | Framework-specific train / artifact hooks (importance, pca_cache, repre prototypes, `patch_prototypes.pt`, replay dataset) |
 
 Eval always writes the individual matrix table; it adds the cumulative matrix
-table whenever a cumulative sequence is given. Every cell is additionally
-scored under the class-agnostic protocol (disable with
-`CLASS_AGNOSTIC_EVAL=0`): all model class channels collapse to a per-location
-max objectness confidence and the eval dataset is converted to a single
-`object` class (`tools/convert_dataset_class_ids.py --class_agnostic`), then
-the same eval flow and metrics run unchanged, producing `*_object.csv` cells
-and `individual_datasets_eval_object.csv` / `cumulative_datasets_eval_object.csv`
-tables alongside the class-aware ones. `tools/stage_task_map.py` then
-aggregates every class-aware `model_<k>_eval_*.csv` into per-stage mAP tables
+table whenever a cumulative sequence is given. `tools/stage_task_map.py` then
+aggregates every `model_<k>_eval_*.csv` into per-stage mAP tables
 (`<name>_stage_mAP.csv`) grouped by the class spaces of the per-task eval yaml
-sequence, plus the combined `stage_mAP_sequence.csv`
-(`*_object` cells are excluded — a single `object` class has no per-stage
-class breakdown).
+sequence, plus the combined `stage_mAP_sequence.csv`.
 
-Trainer/validator/predictor intermediates live inside the run dir, never under
+Trainer/validator intermediates live inside the run dir, never under
 `runs/detect/`: entry points absolutize `OUTPUT_DIR` (a relative ultralytics
 `--project` would be re-rooted at `runs/detect/`), so training logs land in
 `task-<k>/train/` and eval logs in `evaluation_results/model_*_eval_*/`.
@@ -313,7 +303,6 @@ set); final artifacts (`best.pt`, CSVs) are overwritten in place.
 | `PATCH_PROTO_MAX_SAMPLES` / `PATCH_PROTO_SEED` | patches kept per class for clustering, artifact seed | 256 / 0 |
 | `YOLO26_DEFAULT_HYPS` | Set `0` to skip yolo26 extras | 1 |
 | `TINY_FRACTION` / `SEED` | voc-tiny subsample (create.sh) | 0.1 / 0 |
-| `CLASS_AGNOSTIC_EVAL` | Set `0` to skip the class-agnostic eval pass | 1 |
 
 `DEVICE` may be a multi-GPU list for training (`0,1`). Artifact tools use
 `TOOL_DEVICE` (first GPU of `DEVICE` unless overridden).
@@ -347,12 +336,12 @@ five functions.
 
 1. Ensure `data/<DATASET>/` exists; each task is a subdirectory with a yaml.
 2. No registration needed: pass `--tasks data/<DATASET>/*/data.yaml` (and
-   optional `--cumulative`) to train/eval/predict.
+   optional `--cumulative`) to train/eval.
 
 ## Checklist: running an arbitrary incremental protocol
 
 1. No repo change needed: pass `--tasks` to `train.sh`, and any (possibly
-   different) `--tasks` / `--cumulative` sequences to `eval.sh` / `predict.sh`.
+   different) `--tasks` / `--cumulative` sequences to `eval.sh`.
 2. Copy `scripts/voc/tiny/15+5/` as a starting point and edit only the dataset
    block of the copied `common.sh`.
 

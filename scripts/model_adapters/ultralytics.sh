@@ -138,6 +138,7 @@ model_adapter_initialize() {
     ESPREG_LOSS_WEIGHT="${ESPREG_LOSS_WEIGHT:-100.0}"
     DIST_LOSS_WEIGHT="${DIST_LOSS_WEIGHT:-100.0}"
     DIST_TOPK="${DIST_TOPK:-1}"
+    DIST_MODE="${DIST_MODE:-topk}"
     LWF_MODE="${LWF_MODE:-yolo_lwf}"
     LWF_CLS_LOSS_WEIGHT="${LWF_CLS_LOSS_WEIGHT:-4000.0}"
     LWF_REG_LOSS_WEIGHT="${LWF_REG_LOSS_WEIGHT:-500.0}"
@@ -300,16 +301,22 @@ model_adapter_prepare_task() {
             --dataset "$DATASET_PATH" \
             --save_path "$expanded_model"
 
-        converted_data="${TASK_DIR}/task_${TASK_ID}_id_converted"
-        python tools/convert_dataset_class_ids.py \
+        mapped_data="${TASK_DIR}/task_${TASK_ID}_class_map.yaml"
+        python tools/make_class_mapped_yaml.py \
             --model "$expanded_model" \
             --dataset "$DATASET_PATH" \
-            --output_dir "$converted_data" \
-            --workers "$WORKERS"
+            --output "$mapped_data" \
+            --strict
 
         TRAIN_MODEL="$expanded_model"
         REFERENCE_MODEL="$expanded_model"
-        TRAIN_DATA="${converted_data}/dataset.yaml"
+        if [[ "${REFERENCE_MODEL_MODE:-expanded}" == "previous" ]]; then
+            REFERENCE_MODEL="$PREVIOUS_MODEL"
+        elif [[ "${REFERENCE_MODEL_MODE:-expanded}" != "expanded" ]]; then
+            echo "REFERENCE_MODEL_MODE must be 'expanded' or 'previous', got '${REFERENCE_MODEL_MODE}'" >&2
+            exit 1
+        fi
+        TRAIN_DATA="$mapped_data"
         TRAINER_ARGS=(--trainer antiforget)
 
         if method_has ewc; then
@@ -391,6 +398,7 @@ model_adapter_prepare_task() {
                 --distillation True
                 --dist_loss_weight "$DIST_LOSS_WEIGHT"
                 --dist_topk "$DIST_TOPK"
+                --dist_mode "$DIST_MODE"
             )
         fi
 
@@ -476,19 +484,18 @@ model_adapter_prepare_task() {
                 echo "Previous task replay dataset not found: $PREVIOUS_REPLAY" >&2
                 exit 1
             fi
-            # Replay labels live in the previous task's class-id space. Head expansion keeps
-            # existing class ids and appends unseen classes after them; remap the replay
-            # dataset into the expanded model's class-id space, same as the task dataset above.
-            converted_replay="${TASK_DIR}/replay_id_converted"
-            python tools/convert_dataset_class_ids.py \
+            # Replay labels stay in the finished task's class-id space; the mapped
+            # YAML remaps them by class name when the expanded model loads the labels.
+            mapped_replay="${TASK_DIR}/replay_class_map.yaml"
+            python tools/make_class_mapped_yaml.py \
                 --model "$expanded_model" \
                 --dataset "$PREVIOUS_REPLAY/dataset.yaml" \
-                --output_dir "$converted_replay" \
-                --workers "$WORKERS"
+                --output "$mapped_replay" \
+                --strict
             TRAINER_ARGS+=(
                 --replay True
                 --replay_mode "$REPLAY_MODE"
-                --replay_data "$converted_replay/dataset.yaml"
+                --replay_data "$mapped_replay"
                 --replay_loss_weight "$REPLAY_LOSS_WEIGHT"
             )
         fi
@@ -520,14 +527,14 @@ model_adapter_prepare_task() {
             fi
         done
         if [[ -n "$cumulative_yaml" ]]; then
-            local stage_test_dir="${TASK_DIR}/stage_test"
-            python tools/convert_dataset_class_ids.py \
+            local stage_test_yaml="${TASK_DIR}/stage_test_class_map.yaml"
+            python tools/make_class_mapped_yaml.py \
                 --model "$expanded_model" \
                 --dataset "$cumulative_yaml" \
+                --output "$stage_test_yaml" \
                 --splits test \
-                --output_dir "$stage_test_dir" \
-                --workers "$WORKERS"
-            stage_test_data="${stage_test_dir}/dataset.yaml"
+                --strict
+            stage_test_data="$stage_test_yaml"
         else
             echo "Cumulative test dataset not found; stage-wise test evaluation disabled"
         fi
@@ -679,11 +686,10 @@ model_adapter_finalize_task() {
         if [[ -n "$PREVIOUS_REPLAY" ]]; then
             history_args=(--load_hist "$PREVIOUS_REPLAY")
         fi
-        # TRAIN_DATA labels are in this task's class-id space (task-1 local IDs; later tasks use
-        # the id-converted dataset), and select_replay_samples remaps carried-over history labels
-        # into the same space by class name, so each task's replay_dataset stays self-consistent.
-        # The next task's prepare step remaps the replay dataset into the expanded model's
-        # class-id space before training (see model_adapter_prepare_task).
+        # The finished task's original labels are in this task's class-id space; select_replay_samples
+        # remaps carried-over history labels into the same space by class name, so each task's
+        # replay_dataset stays self-consistent. The next task's mapped YAML remaps the replay
+        # dataset by class name when the expanded model loads it.
         # Pool strategies (ocdm) keep the memory at --num samples and annotate the
         # pool with the model of the task that just finished.
         ocdm_args=()
@@ -698,7 +704,7 @@ model_adapter_finalize_task() {
             )
         fi
         python tools/select_replay_samples.py \
-            --dataset "$TRAIN_DATA" \
+            --dataset "$DATASET_PATH" \
             --output_dir "${TASK_DIR}/replay_dataset" \
             --num "$REPLAY_SAMPLE_NUM" \
             --strategy "$REPLAY_STRATEGY" \

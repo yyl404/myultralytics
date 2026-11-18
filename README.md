@@ -80,7 +80,7 @@ OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`
 - **训练**：`--tasks` 增量训练数据集序列（每任务一个 yaml，必需）；
 - **评估**：`--tasks` 单任务评估数据集序列（必需）+ `--cumulative` 累积评估数据集序列（可选，不提供则不做累积评估）。
 
-训练序列与评估序列不必相同，也不必等长：评估矩阵严格按 run 目录里实际的 `task-*/best.pt` 数量 × 实际给定的评估 yaml 数量构建（全 cross product）。`train.sh` / `eval.sh` / `predict.sh` / `feature_drift.sh` / `dataset_similarity.sh` 均接受 `--tasks`（单个逗号分隔参数也可以）。
+训练序列与评估序列不必相同，也不必等长：评估矩阵严格按 run 目录里实际的 `task-*/best.pt` 数量 × 实际给定的评估 yaml 数量构建（全 cross product）。`train.sh` / `eval.sh` / `feature_drift.sh` / `dataset_similarity.sh` 均接受 `--tasks`（单个逗号分隔参数也可以）。
 
 ### 2.4 预训练权重
 
@@ -103,19 +103,18 @@ OdinW-13 为预打包数据集，无需创建脚本，直接将 `OdinW-13-yolo/`
 
 ```bash
 # 前置：数据集已就绪（否则先 bash scripts/create.sh voc-tiny 15_5）
-bash scripts/voc/tiny/15+5/pipeline.sh   # 训练 → 评估 → 有标签推理
+bash scripts/voc/tiny/15+5/pipeline.sh   # 训练 → 评估
 
 # 或逐环节独立运行
 bash scripts/voc/tiny/15+5/train.sh
 bash scripts/voc/tiny/15+5/eval.sh
-bash scripts/voc/tiny/15+5/predict.sh
 bash scripts/voc/tiny/15+5/similarity.sh   # 训练序列的 N x N 图像域特征相似度（无需训练产物）
 
 # 环境变量覆盖示例（冒烟调试 / 临时换设置，无需改文件；仅标量，数据集序列除外）
 EPOCHS=1 MODEL=yolo26x RUN_DIR=runs/smoke bash scripts/voc/tiny/15+5/pipeline.sh
 ```
 
-约定：`yolo26m` + `yoloe-26m-seg.pt` 预训练；三个数据集序列完全解耦——`train.sh` 只在 `TRAIN_YAMLS` 上增量训练，`eval.sh` / `predict.sh` 依次在独立评估序列 `EVAL_YAMLS` 与累积评估序列 `CUMULATIVE_YAMLS`（置为 `()` 则跳过累积评估）上运行，三者内容、顺序、长度互不必一致；对各 yaml 的 `test` 分割运行（无 `test` 则用 `val`）；解码 / NMS 模式是 `common.sh` 中醒目列出的旋钮——`END2END`（默认 `False`，one2many + NMS）、`AGNOSTIC_NMS`（默认 `True`）、`MAX_DET`（默认 `300`），经 `DECODE_ARGS` 统一透传到训练 / 评估 / 推理三个环节，改默认值只改 `common.sh` 一处；`similarity.sh` 的骨干权重为 `SIMILARITY_WEIGHTS`（默认取 `WEIGHTS`，即 `yoloe-26m-seg.pt`）。
+约定：`yolo26m` + `yoloe-26m-seg.pt` 预训练；三个数据集序列完全解耦——`train.sh` 只在 `TRAIN_YAMLS` 上增量训练，`eval.sh` 在独立评估序列 `EVAL_YAMLS` 与累积评估序列 `CUMULATIVE_YAMLS`（置为 `()` 则跳过累积评估）上运行，三者内容、顺序、长度互不必一致；对各 yaml 的 `test` 分割运行（无 `test` 则用 `val`）；解码 / NMS 模式是 `common.sh` 中醒目列出的旋钮——`END2END`（默认 `False`，one2many + NMS）、`AGNOSTIC_NMS`（默认 `True`）、`MAX_DET`（默认 `300`），经 `DECODE_ARGS` 统一透传到训练 / 评估两个环节，改默认值只改 `common.sh` 一处；`similarity.sh` 的骨干权重为 `SIMILARITY_WEIGHTS`（默认取 `WEIGHTS`，即 `yoloe-26m-seg.pt`）。
 
 ### 3.1 训练
 
@@ -162,9 +161,9 @@ EPOCHS=1 END_TASK=2 bash scripts/train.sh --tasks data/OdinW-13-yolo/*/data.yaml
 
 训练产物保存在 `runs/<MODEL_ID>_<DATA_TAG>_pretrained-from-<weights>_<method>/task-<k>/`（`best.pt`、EWC 的 `importance.pth`、ESPReg/NSGP 的 `pca_cache.pkl`、RePRE 的 `repre_prototypes.pt` 等）。训练器中间产物（`weights/`、`results.csv`、曲线图等）保存在 `task-<k>/train/` 下，重跑同一任务前会清空重建，不会累积 `train2/train3/...`。
 
-类别空间约定：任务 `k>1` 开始时由 `tools/expand_model_head.py` 扩展检测头——既有类别的 id 与在检测头中的顺序保持不变，新数据集中未见过的类别按其 yaml 中的顺序追加在最后；若新数据集含有与既有类别同名的类别，则不新增通道，其标注由 `tools/convert_dataset_class_ids.py` 按类别名统一对齐到既有 id。训练、评估与推理用到的数据集都会先按类别名对齐到当前模型的类别空间，DDP 各 rank 加载同一扩展权重与同一转换后数据集，类别空间天然一致。
+类别空间约定：任务 `k>1` 开始时由 `tools/expand_model_head.py` 扩展检测头——既有类别的 id 与在检测头中的顺序保持不变，新数据集中未见过的类别按其 yaml 中的顺序追加在最后；若新数据集含有与既有类别同名的类别，则不新增通道。任务 `k>1` 的训练与评估不再把数据集重写成转换后的标签树：`tools/make_class_mapped_yaml.py` 只写一份小 YAML（目标类别名 + `class_id_map`），`ClassMappedYOLODataset` 在读取标签缓存后按类别名把标注映射到当前模型的 id；原始图像/标签与缓存可跨模型共享，DDP 各 rank 读取同一 YAML 与同一缓存，类别空间天然一致。
 
-解码配置一致性：`end2end` / `agnostic_nms` / `max_det` 是 Detect 头上的 Python 属性，不在 state_dict 中；从 yaml 重建检测头会回落到 yaml 默认值（`yolo26*.yaml` 为 `end2end=True`），若不加处理，扩展后的模型会静默改走未训练的 one2one 分支（伪标签、抗遗忘随之失效）。管线各环节以「当前阶段实际生效的训练/评估参数 + 上一阶段 checkpoint 保存的属性」为准：`tools/expand_model_head.py` 扩头时把源模型检测头的这三个属性随权重一起复制到扩展模型；所有"yaml 重建 + 权重迁移"的路径（训练器 `setup_model`、`Model.train` 内部预重建、蒸馏教师重建）经 `BaseModel.load`（`ultralytics/nn/tasks.py`）从源模型继承这些属性，显式传入的 `--end2end` 等训练参数仍在其后优先生效；AntiForget/BPF 的冻结教师与参考模型加载后套用当前训练参数（`ultralytics/engine/anti_forget.py` 的 `_apply_train_head_args`），且教师的 `end2end` 与学生不一致时立即报错（给出期望 vs 实际），不会静默回退到 yaml 默认。评估与推理沿用 checkpoint 中保存的属性，经 `--` 显式透传的 `--end2end` / `--agnostic_nms` / `--max_det` 优先。
+解码配置一致性：`end2end` / `agnostic_nms` / `max_det` 是 Detect 头上的 Python 属性，不在 state_dict 中；从 yaml 重建检测头会回落到 yaml 默认值（`yolo26*.yaml` 为 `end2end=True`），若不加处理，扩展后的模型会静默改走未训练的 one2one 分支（伪标签、抗遗忘随之失效）。管线各环节以「当前阶段实际生效的训练/评估参数 + 上一阶段 checkpoint 保存的属性」为准：`tools/expand_model_head.py` 扩头时把源模型检测头的这三个属性随权重一起复制到扩展模型；所有"yaml 重建 + 权重迁移"的路径（训练器 `setup_model`、`Model.train` 内部预重建、蒸馏教师重建）经 `BaseModel.load`（`ultralytics/nn/tasks.py`）从源模型继承这些属性，显式传入的 `--end2end` 等训练参数仍在其后优先生效；AntiForget/BPF 的冻结教师与参考模型加载后套用当前训练参数（`ultralytics/engine/anti_forget.py` 的 `_apply_train_head_args`），且教师的 `end2end` 与学生不一致时立即报错（给出期望 vs 实际），不会静默回退到 yaml 默认。评估沿用 checkpoint 中保存的属性，经 `--` 显式透传的 `--end2end` / `--agnostic_nms` / `--max_det` 优先。
 
 ### 3.2 评估
 
@@ -175,31 +174,15 @@ bash scripts/eval.sh runs/<run> --tasks e1.yaml e2.yaml
 bash scripts/eval.sh runs/<run> --tasks e1.yaml e2.yaml --cumulative c1.yaml c2.yaml
 # COCO 等需要额外 IoU 阈值列时：
 bash scripts/eval.sh runs/<run> --tasks e1.yaml e2.yaml --iou-threshold 0.75
-# NMS / agnostic 等预测参数经 -- 透传给 tools/eval.py：
+# NMS / agnostic 等评估参数经 -- 透传给 tools/eval.py：
 bash scripts/eval.sh runs/<run> --tasks e1.yaml e2.yaml -- --agnostic_nms True
 ```
 
 结果矩阵严格按实际构建：run 目录中每个 `task-k/best.pt` × 每个评估 yaml（per-task 与 cumulative 序列各自做全 cross product），两个序列的长度与顺序都不必与训练序列一致。每个 yaml 默认在 `test` 分割上评估，无 `test` 键则用 `val`（`--split` 可覆盖）。模型类空间与某评估数据集完全不相交的格子产出空 CSV，在表中标为 `N/A`。
 
-每个评估格子在两种协议下各评一次：
+每个评估格子按类别相关（class-aware）协议评估，逐类对齐模型类别空间。
 
-- **类别相关（class-aware）**：现有协议，逐类对齐模型类别空间。
-- **类别无关（class-agnostic，默认开启，`CLASS_AGNOSTIC_EVAL=0` 关闭）**：模型全部分类通道的置信度按逐位置取 max 汇聚为 objectness 置信度（类别无关 NMS，预测类别 id 归零，由 `ClassAgnosticDetectionValidator` 强制 `single_cls` 语义实现）；评估数据经 `tools/convert_dataset_class_ids.py --class_agnostic` 把全部类别统一映射为单一 `object` 类（id 0）；随后完全沿用类别相关评估的流程与指标，独立评估序列与累积评估序列都各产出一份结果。
-
-结果写入 `<run>/evaluation_results/`：逐类指标 CSV（类别相关为 `model_<k>_eval_task_<j>.csv` / `model_<k>_eval_cumulative_<j>.csv`，类别无关为同名加 `_object` 后缀）、混淆矩阵 CSV、矩阵表 `individual_datasets_eval[_object].csv` 与 `cumulative_datasets_eval[_object].csv`，以及按增量阶段聚合的 mAP 表——`tools/stage_task_map.py` 对每个类别相关评估 CSV 按独立评估 yaml 序列（`--tasks`）划分阶段类别空间（第 `j` 阶段的类别空间即第 `j` 个评估 yaml 的类别集合），产出 `<同名>_stage_mAP.csv` 与汇总 `stage_mAP_sequence.csv`（类别无关格子只有单一 `object` 类，无阶段类别拆分，不参与该聚合）。评估器中间产物（`<eval>/model_*_eval_*/`）在每次重跑评估前清空重建。
-
-### 3.3 推理（predict）
-
-```bash
-# 任意图像目录，纯推理（无 GT 比较）
-python tools/predict.py --model runs/<run>/task-2/best.pt --images some/images
-
-# 提供标签目录：输出 TP/FP/FN/Precision/Recall/F1（metrics.csv）并按 TP/FP/FN 分类可视化
-python tools/predict.py --model runs/<run>/task-2/best.pt --images some/images --labels some/labels
-
-# 对一串数据集 yaml 批量推理（类别 id 先按名对齐到模型空间；默认 test 分割，无 test 用 val）
-bash scripts/predict.sh --model runs/<run>/task-2/best.pt --tasks t1.yaml t2.yaml --cumulative c1.yaml c2.yaml
-```
+结果写入 `<run>/evaluation_results/`：逐类指标 CSV（`model_<k>_eval_task_<j>.csv` / `model_<k>_eval_cumulative_<j>.csv`）、混淆矩阵 CSV、矩阵表 `individual_datasets_eval.csv` 与 `cumulative_datasets_eval.csv`，以及按增量阶段聚合的 mAP 表——`tools/stage_task_map.py` 对每个评估 CSV 按独立评估 yaml 序列（`--tasks`）划分阶段类别空间（第 `j` 阶段的类别空间即第 `j` 个评估 yaml 的类别集合），产出 `<同名>_stage_mAP.csv` 与汇总 `stage_mAP_sequence.csv`。评估器中间产物（`<eval>/model_*_eval_*/`）在每次重跑评估前清空重建。
 
 ---
 

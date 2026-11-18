@@ -1,9 +1,9 @@
 """Summarize one incremental run into a single plain-text report.
 
 The report collects everything needed to read a finished run offline: the per-task and
-cumulative evaluation matrices (class-aware and class-agnostic), the final-model
-Old/New/All figures, the per-stage aggregation, the patch-prototype PCA reconstruction
-deviations of every stage sample set, and the file inventory of the underlying CSVs.
+cumulative evaluation matrices, the final-model Old/New/All figures, the per-stage
+aggregation, the patch-prototype PCA reconstruction deviations of every stage sample
+set, and the file inventory of the underlying CSVs.
 
 Usage:
     python tools/summarize_run.py --run runs/<run> --output runs/<run>/summary.txt
@@ -32,9 +32,9 @@ def read_csv(path):
         return list(csv.DictReader(handle))
 
 
-def read_matrix(run_dir, kind, suffix):
+def read_matrix(run_dir, kind):
     """Return ``{model_task: {eval_task: mAP50-95}}`` for one evaluation matrix."""
-    rows = read_csv(run_dir / "evaluation_results" / f"{kind}_datasets_eval{suffix}.csv")
+    rows = read_csv(run_dir / "evaluation_results" / f"{kind}_datasets_eval.csv")
     if rows is None:
         return None
     matrix = {}
@@ -213,7 +213,7 @@ def main():
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
     output = Path(args.output) if args.output else run_dir / "summary.txt"
 
-    individual = read_matrix(run_dir, "individual", "")
+    individual = read_matrix(run_dir, "individual")
     tasks = args.tasks or (max(individual) if individual else 0)
     lines = [
         "=" * 78,
@@ -230,14 +230,13 @@ def main():
     lines += training_protocol(run_dir) or ["  (no args.yaml found)"]
 
     for kind, prefix in MATRIX_KINDS:
-        for suffix, label in (("", "class-aware"), ("_object", "class-agnostic")):
-            matrix = read_matrix(run_dir, kind, suffix)
-            lines.append("")
-            lines.append(f"--- {kind} mAP50-95 matrix ({label}) ---")
-            if matrix is None:
-                lines.append(f"  N/A (evaluation_results/{kind}_datasets_eval{suffix}.csv missing)")
-                continue
-            lines += format_matrix(matrix, prefix, tasks)
+        matrix = read_matrix(run_dir, kind)
+        lines.append("")
+        lines.append(f"--- {kind} mAP50-95 matrix ---")
+        if matrix is None:
+            lines.append(f"  N/A (evaluation_results/{kind}_datasets_eval.csv missing)")
+            continue
+        lines += format_matrix(matrix, prefix, tasks)
 
     lines.append("")
     lines.append("--- per-stage mAP (stage_task_map) ---")

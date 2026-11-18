@@ -32,7 +32,6 @@
 #   SEED                           LoCo image assignment and training seed (default 0)
 #   FORCE_TRAIN                    set 1 to retrain every task (default 0)
 #   FORCE_CREATE                   set 1 to rebuild both LoCo datasets (default 0; pair with FORCE_TRAIN=1)
-#   CLASS_AGNOSTIC_EVAL            set 0 to skip the class-agnostic eval pass (default 1)
 #   END2END, AGNOSTIC_NMS, MAX_DET decode mode (default False / True / 300)
 #   CONF_MIN, CONF_MAX, CONF_STEP  error-rate confidence sweep (default 0.05 / 0.95 / 0.05)
 #   VIS_CONF, PREDICT_CONF         example and dump confidence (default 0.25 / 0.01)
@@ -74,7 +73,6 @@ DEVICE="${DEVICE:-0}"
 EVAL_DEVICE="${EVAL_DEVICE:-${DEVICE%%,*}}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_CREATE="${FORCE_CREATE:-0}"
-CLASS_AGNOSTIC_EVAL="${CLASS_AGNOSTIC_EVAL:-1}"
 END2END="${END2END:-False}"
 AGNOSTIC_NMS="${AGNOSTIC_NMS:-True}"
 MAX_DET="${MAX_DET:-300}"
@@ -85,7 +83,7 @@ VIS_CONF="${VIS_CONF:-0.25}"
 PREDICT_CONF="${PREDICT_CONF:-0.01}"
 IOU_THRESHOLD="${IOU_THRESHOLD:-0.5}"
 
-export SEED WORKERS EPOCHS BATCH_SIZE IMGSZ DEVICE CLASS_AGNOSTIC_EVAL
+export SEED WORKERS EPOCHS BATCH_SIZE IMGSZ DEVICE
 
 TAG_TWO="VOC_LoCo_10+10"
 TAG_FOUR="VOC_LoCo_5+5+5+5"

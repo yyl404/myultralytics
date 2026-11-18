@@ -7,8 +7,8 @@ Class-id space invariant: head expansion keeps existing class ids and order, and
 unseen classes after them (tools/expand_model_head.py). Each task's replay_dataset is kept
 uniformly in that task's class-id space, matching its dataset.yaml names: carried-over
 history labels are remapped by class name on carry-over, and the next task's prepare step
-remaps the whole replay dataset again into the expanded model's class-id space with
-tools/convert_dataset_class_ids.py (same conversion as the task training data).
+writes a class-map YAML so the replay labels are remapped by class name when the expanded
+model loads them.
 
 Selection is pluggable through two registries:
 

@@ -2,6 +2,7 @@
 
 from .base import BaseDataset
 from .build import build_dataloader, build_grounding, build_yolo_dataset, load_inference_source
+from .class_mapped import ClassMappedYOLODataset, build_class_id_map
 from .dataset import (
     ClassificationDataset,
     GroundingDataset,
@@ -14,6 +15,7 @@ from .dataset import (
 
 __all__ = (
     "BaseDataset",
+    "ClassMappedYOLODataset",
     "ClassificationDataset",
     "GroundingDataset",
     "PolygonSemanticDataset",
@@ -21,6 +23,7 @@ __all__ = (
     "YOLOConcatDataset",
     "YOLODataset",
     "YOLOMultiModalDataset",
+    "build_class_id_map",
     "build_dataloader",
     "build_grounding",
     "build_yolo_dataset",

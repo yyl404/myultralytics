@@ -1,6 +1,6 @@
 #!/bin/bash
 # Shared dataset / model / output resolution for the unified experiment entry points.
-# Sourced from the repo root (scripts/train.sh, eval.sh, predict.sh, create.sh,
+# Sourced from the repo root (scripts/train.sh, eval.sh, create.sh,
 # feature_drift.sh).
 #
 # Dataset identity knobs (--dataset/--split) exist ONLY for create.sh (slicing a

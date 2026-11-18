@@ -17,6 +17,7 @@ from PIL import Image
 from torch.utils.data import Dataset, dataloader, distributed
 
 from ultralytics.cfg import IterableSimpleNamespace
+from ultralytics.data.class_mapped import ClassMappedYOLODataset
 from ultralytics.data.dataset import (
     DepthDataset,
     GroundingDataset,
@@ -261,6 +262,13 @@ def build_yolo_dataset(
         dataset = YOLOMultiModalDataset
     else:
         dataset = YOLODataset
+
+    if "class_id_map" in data:
+        if dataset is not YOLODataset:
+            raise ValueError(
+                "class_id_map is supported only for YOLODataset-based detection, segmentation, pose and OBB datasets"
+            )
+        dataset = ClassMappedYOLODataset
 
     if fraction is None:
         fraction = cfg.fraction if mode == "train" else 1.0

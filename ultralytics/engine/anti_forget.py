@@ -378,53 +378,108 @@ def _decode_detect_output(head, raw_output):
     return head._inference(raw_output)
 
 
-def get_dist_loss(model_pred, base_model_pred, model, base_model, dist_topk=1):
-    """KL distillation from teacher to student on the teacher's top-k class channels.
+def _foreground_anchor_mask(head, batch, num_anchors, device):
+    """Return a (B, A) mask of anchor centers inside any ground-truth box."""
+    if batch is None:
+        raise ValueError("dist_mode='foreground' requires the current training batch")
+    anchors = getattr(head, "anchors", None)
+    strides = getattr(head, "strides", None)
+    if anchors is None or strides is None or anchors.numel() == 0:
+        raise RuntimeError("Detect head anchors are not initialized for foreground distillation")
+    if anchors.shape[0] == 2:  # Detect stores anchors as (2, A)
+        anchors = anchors.transpose(0, 1)
+    if strides.shape[0] == 1:
+        strides = strides.transpose(0, 1)
+    if anchors.shape[0] != num_anchors:
+        raise RuntimeError(f"Anchor count mismatch: {anchors.shape[0]} vs {num_anchors}")
 
-    For each anchor, take the k teacher class channels (historical classes only) with the
-    highest confidence, compute a binary KL(teacher || student) on each selected channel
-    independently, weight each channel's loss by its teacher confidence, and normalize by
-    the sum of all selected teacher confidences over all anchors and channels.
+    img = batch["img"]
+    batch_size, _, height, width = img.shape
+    anchor_xy = anchors.to(device) * strides.to(device)
+    anchor_xy = anchor_xy / anchor_xy.new_tensor([width, height])
+    boxes = batch["bboxes"].to(device)
+    batch_idx = batch["batch_idx"].to(device).long()
+    mask = torch.zeros(batch_size, num_anchors, dtype=torch.bool, device=device)
+    for index in range(batch_size):
+        selected = batch_idx == index
+        if not selected.any():
+            continue
+        box = boxes[selected]
+        x1 = box[:, 0] - box[:, 2] / 2
+        x2 = box[:, 0] + box[:, 2] / 2
+        y1 = box[:, 1] - box[:, 3] / 2
+        y2 = box[:, 1] + box[:, 3] / 2
+        inside = (
+            (anchor_xy[None, :, 0] >= x1[:, None])
+            & (anchor_xy[None, :, 0] <= x2[:, None])
+            & (anchor_xy[None, :, 1] >= y1[:, None])
+            & (anchor_xy[None, :, 1] <= y2[:, None])
+        )
+        mask[index] = inside.any(dim=0)
+    return mask
+
+
+def get_dist_loss(
+    model_pred,
+    base_model_pred,
+    model,
+    base_model,
+    dist_topk=1,
+    dist_mode="topk",
+    batch=None,
+):
+    """Distillation from the historical-class teacher to the expanded student.
 
     Args:
         model_pred: Student raw output (pre-NMS), train-mode dict or end2end train-mode dict.
         base_model_pred: Teacher raw output, eval-mode (decoded, preds) tuple.
         model: Student detection model (used to locate the student Detect head).
         base_model: Teacher detection model (used to locate the teacher Detect head).
-        dist_topk (int): Number of teacher channels to distill per anchor; -1 means all
-            historical class channels. Must be -1 or >= 1.
+        dist_topk (int): Number of teacher channels for the ``topk`` mode; -1 means all
+            historical class channels. Ignored by ``uniform`` and ``foreground``.
+        dist_mode (str): ``topk`` = confidence-masked top-k CAD (default);
+            ``uniform`` = all historical classes, all anchors, no confidence mask;
+            ``foreground`` = all historical classes, anchors inside GT boxes, no confidence mask.
+        batch (dict, optional): Current training batch, required for ``foreground``.
 
     Returns:
-        Weighted KL distillation loss (scalar tensor).
+        KL distillation loss (scalar tensor).
     """
+    if dist_mode not in {"topk", "uniform", "foreground"}:
+        raise ValueError(f"dist_mode must be one of topk/uniform/foreground, got {dist_mode!r}")
+
     eps = 1e-6
     student_head = _get_detect_head(model)
     teacher_head = _get_detect_head(base_model)
-    nc = student_head.nc
-    model_pred = _decode_detect_output(student_head, model_pred)  # (B, 4 + nc, A)
+    nc_student = student_head.nc
+    nc_teacher = teacher_head.nc
+    model_pred = _decode_detect_output(student_head, model_pred)  # (B, 4 + nc_student, A)
     base_model_pred = _decode_detect_output(teacher_head, base_model_pred)  # (B, 4 + nc_teacher, A)
-    cls_start, cls_end = 4, 4 + nc
-    student_cls = model_pred[:, cls_start:cls_end, :]  # (B, C, A)
-    teacher_cls = base_model_pred[:, cls_start:cls_end, :]  # (B, C_t, A), historical classes only
+    student_cls = model_pred[:, 4 : 4 + nc_student, :]  # (B, C, A)
+    teacher_cls = base_model_pred[:, 4 : 4 + nc_teacher, :]  # (B, C_t, A), historical classes only
+
+    # Binary KL(teacher || student) on every historical teacher channel.
+    p = teacher_cls.to(torch.float32).clamp(eps, 1.0 - eps)
+    q = student_cls[:, :nc_teacher, :].to(torch.float32).clamp(eps, 1.0 - eps)
+    teacher_bin = torch.stack((p, 1 - p), dim=2)  # (B, C_t, 2, A)
+    student_bin = torch.stack((q, 1 - q), dim=2)  # (B, C_t, 2, A)
+    kl_all = F.kl_div(student_bin.log(), teacher_bin, reduction="none").sum(dim=2)  # (B, C_t, A)
+    kl_all = kl_all.to(model_pred.dtype)
+
+    if dist_mode == "uniform":
+        return kl_all.mean()
+
+    if dist_mode == "foreground":
+        mask = _foreground_anchor_mask(student_head, batch, kl_all.shape[-1], kl_all.device)
+        if not mask.any():
+            return kl_all.sum() * 0.0
+        return kl_all.permute(0, 2, 1)[mask].mean()
 
     n_teacher_ch = teacher_cls.shape[1]
     k = n_teacher_ch if dist_topk == -1 else min(dist_topk, n_teacher_ch)
-    # Per-anchor top-k teacher channels by confidence.
     teacher_topk, topk_idx = teacher_cls.topk(k, dim=1)  # (B, K, A), (B, K, A)
-    student_topk = torch.gather(student_cls, 1, topk_idx)  # (B, K, A)
-
-    # Binary KL(teacher || student) per selected channel:
-    # p,q in (0,1) from sigmoid cls; complementary mass is 1-p / 1-q.
-    dtype = model_pred.dtype
-    p = teacher_topk.to(torch.float32).clamp(eps, 1.0 - eps)
-    q = student_topk.to(torch.float32).clamp(eps, 1.0 - eps)
-    teacher_bin = torch.stack((p, 1 - p), dim=2)  # (B, K, 2, A)
-    student_bin = torch.stack((q, 1 - q), dim=2)  # (B, K, 2, A)
-    kl_per_channel = F.kl_div(student_bin.log(), teacher_bin, reduction="none").sum(dim=2).to(dtype)  # (B, K, A)
-
-    # Weighted sum over anchors and channels, normalized by total top-k confidence.
-    return (kl_per_channel * teacher_topk).sum() / teacher_topk.sum().clamp_min(eps)
-
+    kl_topk = torch.gather(kl_all, 1, topk_idx)  # (B, K, A)
+    return (kl_topk * teacher_topk).sum() / teacher_topk.sum().clamp_min(eps)
 
 def _cycle_batches(loader):
     """Yield batches from a dataloader indefinitely, re-entering it after each full pass.
@@ -1105,7 +1160,15 @@ class AntiForgetTrainer(BaseTrainer):
 
                     # ============================== MODIFIED: calculate KLD distillation loss ==========================
                     if self.args.distillation:
-                        _dist_loss = get_dist_loss(model_pred, base_model_pred, self.model, self.base_model, dist_topk=self.args.dist_topk)
+                        _dist_loss = get_dist_loss(
+                            model_pred,
+                            base_model_pred,
+                            self.model,
+                            self.base_model,
+                            dist_topk=self.args.dist_topk,
+                            dist_mode=self.args.dist_mode,
+                            batch=batch,
+                        )
                         self.loss += (_dist_loss * self.args.dist_loss_weight)
                         loss_items["dist_loss"] = _dist_loss.detach()
                     # ============================== END: calculate KL distillation loss ===============================

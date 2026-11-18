@@ -13,8 +13,8 @@ Usage:
     classification head; classes from --dataset/--new_classes that are not already
     known are appended after them in their dataset order. A class already known to
     the model keeps its existing id and is never duplicated; annotations of that
-    class in the new dataset are aligned to the existing id by class name during
-    dataset conversion (tools/convert_dataset_class_ids.py).
+    class in the new dataset are aligned to the existing id by class name when the
+    dataset is loaded (see tools/make_class_mapped_yaml.py).
 
     Arguments:
         --model: Path to the trained model checkpoint (.pt file)

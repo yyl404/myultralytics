@@ -147,6 +147,7 @@ filter_iou_threshold: 0.5
 distillation: False
 dist_loss_weight: 100.0
 dist_topk: 1 # (int) number of teacher top-confidence channels to distill per anchor; -1 = all historical class channels
+dist_mode: topk # (str) topk (confidence-masked CAD), uniform (all old classes, all anchors), foreground (all old classes, GT bbox anchors)
 
 # BPF (Bridge Past and Future) settings --------------------------------------------------------------------------
 bpf: False # (bool) use the BPF training path

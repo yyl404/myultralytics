@@ -142,8 +142,8 @@ dmypy.json
 
 # datasets and projects (ignore /datasets dir at root only to allow for docs/en/datasets dir)
 /datasets
-data
-data/
+/data
+/data/
 runs
 runs/
 runs-protected
