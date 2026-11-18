@@ -14,7 +14,7 @@ method_has() {
 }
 
 method_needs_importance() {
-    method_has ewc || method_has nsgp
+    method_has ewc
 }
 
 method_needs_pca() {
@@ -23,6 +23,10 @@ method_needs_pca() {
 
 method_needs_prototypes() {
     method_has repre
+}
+
+method_needs_patch_prototypes() {
+    method_has prad || method_has prd
 }
 
 method_needs_replay() {
@@ -39,7 +43,7 @@ model_adapter_check_method_components() {
     local component
     for component in ${METHOD//+/ }; do
         case "$component" in
-            naive|bpf|pseudo_label|ewc|l2|dist|espreg|nsgp|repre|replay)
+            naive|bpf|pseudo_label|ewc|l2|dist|lwf|espreg|nsgp|repre|replay|prad|prd)
                 ;;
             *)
                 echo "Unimplemented Ultralytics method component: '$component' (METHOD='$METHOD')" >&2
@@ -54,9 +58,6 @@ model_adapter_regenerate_missing_artifacts() {
 
     if method_needs_importance && [[ ! -f "$PREVIOUS_IMPORTANCE" ]]; then
         local -a importance_args=()
-        if method_has nsgp; then
-            importance_args=(--scope normalization)
-        fi
         echo "Regenerating missing importance artifact: $PREVIOUS_IMPORTANCE"
         python tools/compute_importance.py \
             --model "$PREVIOUS_MODEL" \
@@ -68,10 +69,27 @@ model_adapter_regenerate_missing_artifacts() {
             "${importance_args[@]}"
     fi
 
+    if method_needs_patch_prototypes && [[ ! -f "$PREVIOUS_PATCH_PROTOTYPES" ]]; then
+        echo "Regenerating missing patch prototype artifact: $PREVIOUS_PATCH_PROTOTYPES"
+        python tools/generate_patch_prototypes.py \
+            --model "$PREVIOUS_MODEL" \
+            --data "$previous_dataset" \
+            --output "$PREVIOUS_PATCH_PROTOTYPES" \
+            --device "$TOOL_DEVICE" \
+            --imgsz "$IMGSZ" \
+            --batch_size "$BATCH_SIZE" \
+            --workers "$WORKERS" \
+            --pca_dims "$PATCH_PCA_DIMS" \
+            --max_centers "$PATCH_PROTO_MAX_CENTERS" \
+            --split_ratio "$PATCH_PROTO_SPLIT_RATIO" \
+            --max_samples_per_class "$PATCH_PROTO_MAX_SAMPLES" \
+            --seed "$PATCH_PROTO_SEED"
+    fi
+
     if method_needs_pca && [[ ! -f "$PREVIOUS_PCA" ]]; then
-        local -a covariance_args=()
-        if method_has nsgp; then
-            covariance_args=(--uncentered --sample_num 0 --batch_size "$BATCH_SIZE")
+        local -a bbox_args=()
+        if method_has espreg; then
+            bbox_args=(--use_bbox)
         fi
         echo "Regenerating missing PCA artifact: $PREVIOUS_PCA"
         python tools/pca.py \
@@ -79,8 +97,15 @@ model_adapter_regenerate_missing_artifacts() {
             --dataset "$previous_dataset" \
             --save_path "$PREVIOUS_PCA" \
             --device "$TOOL_DEVICE" \
+            --pca_mode "$PCA_MODE" \
+            --sample_num "$PCA_SAMPLE_NUM" \
+            --batch_size "$BATCH_SIZE" \
+            --imgsz "$IMGSZ" \
+            --workers "$WORKERS" \
+            --seed "$PCA_SEED" \
+            --split "$PCA_SPLIT" \
             --exclude_head \
-            "${covariance_args[@]}"
+            "${bbox_args[@]}"
     fi
 
     if method_needs_prototypes && [[ ! -f "$PREVIOUS_PROTOTYPES" ]]; then
@@ -150,6 +175,15 @@ model_adapter_initialize() {
     ESPREG_LOSS_WEIGHT="${ESPREG_LOSS_WEIGHT:-100.0}"
     DIST_LOSS_WEIGHT="${DIST_LOSS_WEIGHT:-100.0}"
     DIST_TOPK="${DIST_TOPK:-1}"
+    DIST_MODE="${DIST_MODE:-topk}"
+    LWF_MODE="${LWF_MODE:-yolo_lwf}"
+    LWF_CLS_LOSS_WEIGHT="${LWF_CLS_LOSS_WEIGHT:-4000.0}"
+    LWF_REG_LOSS_WEIGHT="${LWF_REG_LOSS_WEIGHT:-500.0}"
+    LWF_FEATURE_LOSS_WEIGHT="${LWF_FEATURE_LOSS_WEIGHT:-1.0}"
+    LWF_TEMPERATURE="${LWF_TEMPERATURE:-2.0}"
+    LWF_WCE="${LWF_WCE:-True}"
+    LWF_CLS_IOU="${LWF_CLS_IOU:-True}"
+    LWF_MASK_OLD="${LWF_MASK_OLD:-True}"
     RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
     BPF_INTERIM_EPOCHS="${BPF_INTERIM_EPOCHS:-$EPOCHS}"
     BPF_SCORE_THRESHOLD="${BPF_SCORE_THRESHOLD:-0.75}"
@@ -164,8 +198,39 @@ model_adapter_initialize() {
     BPF_DWF_WEIGHT="${BPF_DWF_WEIGHT:-0.15}"
     REPLAY_SAMPLE_NUM="${REPLAY_SAMPLE_NUM:-100}"
     REPLAY_STRATEGY="${REPLAY_STRATEGY:-random}"
+    REPLAY_MODE="${REPLAY_MODE:-supervised}"
+    OCDM_STATS="${OCDM_STATS:-model}"
+    OCDM_CONF="${OCDM_CONF:-0.5}"
+    OCDM_BATCH_SIZE="${OCDM_BATCH_SIZE:-1000}"
     REPLAY_LOSS_WEIGHT="${REPLAY_LOSS_WEIGHT:-1.0}"
     REPLAY_SEED="${REPLAY_SEED:-0}"
+    ESPREG_WEIGHT_MODE="${ESPREG_WEIGHT_MODE:-nt}"
+    ESPREG_FORM="${ESPREG_FORM:-original}"
+    ESPREG_SCOPE="${ESPREG_SCOPE:-all}"
+    PRAD_FG_THRESHOLD="${PRAD_FG_THRESHOLD:-0.5}"
+    PRAD_BG_THRESHOLD="${PRAD_BG_THRESHOLD:-0.1}"
+    PRAD_CONF_POWER="${PRAD_CONF_POWER:-1.0}"
+    PRAD_PROTO_THRESHOLD="${PRAD_PROTO_THRESHOLD:-0.5}"
+    PRAD_PROTO_TEMPERATURE="${PRAD_PROTO_TEMPERATURE:-0.1}"
+    PRAD_BG_WEIGHT="${PRAD_BG_WEIGHT:-1.0}"
+    PRAD_SPLIT_NORMALIZE="${PRAD_SPLIT_NORMALIZE:-True}"
+    PRAD_MAX_FG="${PRAD_MAX_FG:-512}"
+    PRAD_CLS_LOSS_WEIGHT="${PRAD_CLS_LOSS_WEIGHT:-30.0}"
+    PRAD_REG_LOSS_WEIGHT="${PRAD_REG_LOSS_WEIGHT:-1.5}"
+    PRD_SAMPLES="${PRD_SAMPLES:-64}"
+    PRD_STD_SCALE="${PRD_STD_SCALE:-1.0}"
+    PRD_LOSS_WEIGHT="${PRD_LOSS_WEIGHT:-30.0}"
+    PRD_REG_LOSS_WEIGHT="${PRD_REG_LOSS_WEIGHT:-5.0}"
+    PATCH_PCA_DIMS="${PATCH_PCA_DIMS:-128}"
+    PATCH_PROTO_MAX_CENTERS="${PATCH_PROTO_MAX_CENTERS:-8}"
+    PATCH_PROTO_SPLIT_RATIO="${PATCH_PROTO_SPLIT_RATIO:-0.2}"
+    PATCH_PROTO_MAX_SAMPLES="${PATCH_PROTO_MAX_SAMPLES:-256}"
+    PATCH_PROTO_SEED="${PATCH_PROTO_SEED:-0}"
+    PCA_SEED="${PCA_SEED:-42}"
+    PCA_SPLIT="${PCA_SPLIT:-val}"
+    PCA_MODE="${PCA_MODE:-incremental}"
+    STAGE_EVAL_PERIOD="${STAGE_EVAL_PERIOD:-10}"
+    PCA_SAMPLE_NUM="${PCA_SAMPLE_NUM:-500}"
     if ! declare -p EXTRA_TRAIN_ARGS >/dev/null 2>&1; then
         EXTRA_TRAIN_ARGS=()
     fi
@@ -175,6 +240,7 @@ model_adapter_initialize() {
     PREVIOUS_PROTOTYPES=""
     PREVIOUS_IMPORTANCE=""
     PREVIOUS_REPLAY=""
+    PREVIOUS_PATCH_PROTOTYPES=""
     if (( START_TASK > 1 )); then
         previous_task_dir="${OUTPUT_DIR}/task-$((START_TASK - 1))"
         PREVIOUS_MODEL="${previous_task_dir}/best.pt"
@@ -182,6 +248,7 @@ model_adapter_initialize() {
         PREVIOUS_PROTOTYPES="${previous_task_dir}/repre_prototypes.pt"
         PREVIOUS_IMPORTANCE="${previous_task_dir}/importance.pth"
         PREVIOUS_REPLAY="${previous_task_dir}/replay_dataset"
+        PREVIOUS_PATCH_PROTOTYPES="${previous_task_dir}/patch_prototypes.pt"
         if [[ ! -f "$PREVIOUS_MODEL" ]]; then
             echo "Previous task model not found: $PREVIOUS_MODEL" >&2
             exit 1
@@ -194,6 +261,13 @@ model_adapter_initialize() {
         model_adapter_regenerate_missing_artifacts "$previous_dataset"
         if method_needs_importance && [[ ! -f "$PREVIOUS_IMPORTANCE" ]]; then
             echo "Previous task importance artifact not found: $PREVIOUS_IMPORTANCE" >&2
+            exit 1
+        fi
+        # The fixed shared PCA inside the patch artifact is fitted at the base stage: the adapter can
+        # rebuild it only when the previous task is that stage (START_TASK=2), never from a later one.
+        if method_needs_patch_prototypes && [[ ! -f "$PREVIOUS_PATCH_PROTOTYPES" ]] && (( START_TASK > 2 )); then
+            echo "Previous task patch prototype artifact not found: $PREVIOUS_PATCH_PROTOTYPES" >&2
+            echo "The fixed shared PCA is fitted at the base stage; rerun from START_TASK=2" >&2
             exit 1
         fi
         if method_needs_pca && [[ ! -f "$PREVIOUS_PCA" ]]; then
@@ -255,19 +329,25 @@ model_adapter_prepare_task() {
             --dataset "$DATASET_PATH" \
             --save_path "$expanded_model"
 
-        converted_data="${TASK_DIR}/task_${TASK_ID}_id_converted"
-        python tools/convert_dataset_class_ids.py \
+        mapped_data="${TASK_DIR}/task_${TASK_ID}_class_map.yaml"
+        python tools/make_class_mapped_yaml.py \
             --model "$expanded_model" \
             --dataset "$DATASET_PATH" \
-            --output_dir "$converted_data" \
-            --workers "$WORKERS"
+            --output "$mapped_data" \
+            --strict
 
         TRAIN_MODEL="$expanded_model"
         REFERENCE_MODEL="$expanded_model"
-        TRAIN_DATA="${converted_data}/dataset.yaml"
+        if [[ "${REFERENCE_MODEL_MODE:-expanded}" == "previous" ]]; then
+            REFERENCE_MODEL="$PREVIOUS_MODEL"
+        elif [[ "${REFERENCE_MODEL_MODE:-expanded}" != "expanded" ]]; then
+            echo "REFERENCE_MODEL_MODE must be 'expanded' or 'previous', got '${REFERENCE_MODEL_MODE}'" >&2
+            exit 1
+        fi
+        TRAIN_DATA="$mapped_data"
         TRAINER_ARGS=(--trainer antiforget)
 
-        if method_has ewc && ! method_has nsgp; then
+        if method_has ewc; then
             expanded_importance="${TASK_DIR}/task-$((TASK_ID - 1))-importance-expanded.pth"
             python tools/expand_importance.py \
                 --old_importance "$PREVIOUS_IMPORTANCE" \
@@ -326,7 +406,7 @@ model_adapter_prepare_task() {
             )
         fi
 
-        if method_has ewc && ! method_has nsgp; then
+        if method_has ewc; then
             TRAINER_ARGS+=(
                 --ewc True
                 --importance_path "$PREVIOUS_IMPORTANCE"
@@ -346,6 +426,22 @@ model_adapter_prepare_task() {
                 --distillation True
                 --dist_loss_weight "$DIST_LOSS_WEIGHT"
                 --dist_topk "$DIST_TOPK"
+                --dist_mode "$DIST_MODE"
+            )
+        fi
+
+        if method_has lwf; then
+            TRAINER_ARGS+=(
+                --lwf True
+                --lwf_mode "$LWF_MODE"
+                --lwf_teacher_model "$PREVIOUS_MODEL"
+                --lwf_cls_loss_weight "$LWF_CLS_LOSS_WEIGHT"
+                --lwf_reg_loss_weight "$LWF_REG_LOSS_WEIGHT"
+                --lwf_feature_loss_weight "$LWF_FEATURE_LOSS_WEIGHT"
+                --lwf_temperature "$LWF_TEMPERATURE"
+                --lwf_wce "$LWF_WCE"
+                --lwf_cls_iou "$LWF_CLS_IOU"
+                --lwf_mask_old "$LWF_MASK_OLD"
             )
         fi
 
@@ -354,6 +450,44 @@ model_adapter_prepare_task() {
                 --espreg True
                 --pca_cache_path "$PREVIOUS_PCA"
                 --espreg_loss_weight "$ESPREG_LOSS_WEIGHT"
+                --espreg_weight_mode "$ESPREG_WEIGHT_MODE"
+                --espreg_form "$ESPREG_FORM"
+                --espreg_scope "$ESPREG_SCOPE"
+            )
+        fi
+
+        if method_has prad || method_has prd; then
+            TRAINER_ARGS+=(
+                --lwf_teacher_model "$PREVIOUS_MODEL"
+                --patch_prototypes "$PREVIOUS_PATCH_PROTOTYPES"
+            )
+        fi
+
+        if method_has prad; then
+            TRAINER_ARGS+=(
+                --lwf True
+                --lwf_mode prad
+                --lwf_mask_old "$LWF_MASK_OLD"
+                --prad_fg_threshold "$PRAD_FG_THRESHOLD"
+                --prad_bg_threshold "$PRAD_BG_THRESHOLD"
+                --prad_conf_power "$PRAD_CONF_POWER"
+                --prad_proto_threshold "$PRAD_PROTO_THRESHOLD"
+                --prad_proto_temperature "$PRAD_PROTO_TEMPERATURE"
+                --prad_bg_weight "$PRAD_BG_WEIGHT"
+                --prad_split_normalize "$PRAD_SPLIT_NORMALIZE"
+                --prad_max_fg "$PRAD_MAX_FG"
+                --prad_cls_loss_weight "$PRAD_CLS_LOSS_WEIGHT"
+                --prad_reg_loss_weight "$PRAD_REG_LOSS_WEIGHT"
+            )
+        fi
+
+        if method_has prd; then
+            TRAINER_ARGS+=(
+                --prd True
+                --prd_samples "$PRD_SAMPLES"
+                --prd_std_scale "$PRD_STD_SCALE"
+                --prd_loss_weight "$PRD_LOSS_WEIGHT"
+                --prd_reg_loss_weight "$PRD_REG_LOSS_WEIGHT"
             )
         fi
 
@@ -362,9 +496,6 @@ model_adapter_prepare_task() {
                 --nsgp True
                 --nsgp_flexibility 1.0
                 --pca_cache_path "$PREVIOUS_PCA"
-                --ewc True
-                --importance_path "$PREVIOUS_IMPORTANCE"
-                --ewc_loss_weight 2000.0
             )
         fi
 
@@ -379,18 +510,18 @@ model_adapter_prepare_task() {
         if method_has replay; then
             # A resumed run may find the previous task's replay dataset missing.
             model_adapter_regenerate_replay_dataset $((TASK_ID - 1))
-            # Replay labels live in the previous task's class-id space. Head expansion keeps
-            # existing class ids and appends unseen classes after them; remap the replay
-            # dataset into the expanded model's class-id space, same as the task dataset above.
-            converted_replay="${TASK_DIR}/replay_id_converted"
-            python tools/convert_dataset_class_ids.py \
+            # Replay labels stay in the finished task's class-id space; the mapped
+            # YAML remaps them by class name when the expanded model loads the labels.
+            mapped_replay="${TASK_DIR}/replay_class_map.yaml"
+            python tools/make_class_mapped_yaml.py \
                 --model "$expanded_model" \
                 --dataset "$PREVIOUS_REPLAY/dataset.yaml" \
-                --output_dir "$converted_replay" \
-                --workers "$WORKERS"
+                --output "$mapped_replay" \
+                --strict
             TRAINER_ARGS+=(
                 --replay True
-                --replay_data "$converted_replay/dataset.yaml"
+                --replay_mode "$REPLAY_MODE"
+                --replay_data "$mapped_replay"
                 --replay_loss_weight "$REPLAY_LOSS_WEIGHT"
             )
         fi
@@ -400,6 +531,46 @@ model_adapter_prepare_task() {
         freeze_index=$((TASK_ID - 1))
         if (( freeze_index < ${#TASK_FREEZE_LAYERS[@]} )) && [[ -n "${TASK_FREEZE_LAYERS[$freeze_index]}" ]]; then
             FREEZE_ARGS=(--freeze "${TASK_FREEZE_LAYERS[$freeze_index]}")
+        fi
+    fi
+
+    # Periodic stage-wise cumulative test evaluation: incremental stages only.
+    # Stage-1 training keeps exactly its previous behavior (no extra artifacts/args).
+    if (( TASK_ID > 1 )); then
+        local stage_classes_json="${TASK_DIR}/stage_classes.json"
+        python tools/stage_class_map.py \
+            --datasets "${TASK_DATASETS[@]:0:TASK_ID}" \
+            --output "$stage_classes_json"
+
+        local stage_test_data=""
+        local data_root
+        data_root="$(cd "$(dirname "$DATASET_PATH")/.." && pwd)"
+        local cumulative_yaml=""
+        for candidate in "$data_root/task_1-${TASK_ID}_cls_"*/dataset.yaml; do
+            if [[ -f "$candidate" ]]; then
+                cumulative_yaml="$candidate"
+                break
+            fi
+        done
+        if [[ -n "$cumulative_yaml" ]]; then
+            local stage_test_yaml="${TASK_DIR}/stage_test_class_map.yaml"
+            python tools/make_class_mapped_yaml.py \
+                --model "$expanded_model" \
+                --dataset "$cumulative_yaml" \
+                --output "$stage_test_yaml" \
+                --splits test \
+                --strict
+            stage_test_data="$stage_test_yaml"
+        else
+            echo "Cumulative test dataset not found; stage-wise test evaluation disabled"
+        fi
+
+        TRAINER_ARGS+=(
+            --stage_classes_path "$stage_classes_json"
+            --stage_eval_period "$STAGE_EVAL_PERIOD"
+        )
+        if [[ -n "$stage_test_data" ]]; then
+            TRAINER_ARGS+=(--stage_test_data "$stage_test_data")
         fi
     fi
 }
@@ -446,9 +617,6 @@ model_adapter_finalize_task() {
         importance_args=()
         history_args=()
         reference_args=()
-        if method_has nsgp; then
-            importance_args=(--scope normalization)
-        fi
         if [[ -n "$PREVIOUS_IMPORTANCE" ]]; then
             history_args=(--load_hist "$PREVIOUS_IMPORTANCE")
         fi
@@ -474,20 +642,27 @@ model_adapter_finalize_task() {
 
     if method_needs_pca; then
         history_args=()
-        covariance_args=()
+        local -a bbox_args=()
         if [[ -n "$PREVIOUS_PCA" ]]; then
             history_args=(--load_hist "$PREVIOUS_PCA")
         fi
-        if method_has nsgp; then
-            covariance_args=(--uncentered --sample_num 0 --batch_size "$BATCH_SIZE")
+        if method_has espreg; then
+            bbox_args=(--use_bbox)
         fi
         python tools/pca.py \
             --model "$PREVIOUS_MODEL" \
             --dataset "$DATASET_PATH" \
             --save_path "${TASK_DIR}/pca_cache.pkl" \
             --device "$TOOL_DEVICE" \
+            --pca_mode "$PCA_MODE" \
+            --sample_num "$PCA_SAMPLE_NUM" \
+            --batch_size "$BATCH_SIZE" \
+            --imgsz "$IMGSZ" \
+            --workers "$WORKERS" \
+            --seed "$PCA_SEED" \
+            --split "$PCA_SPLIT" \
             --exclude_head \
-            "${covariance_args[@]}" \
+            "${bbox_args[@]}" \
             "${history_args[@]}"
         PREVIOUS_PCA="${TASK_DIR}/pca_cache.pkl"
     fi
@@ -510,23 +685,58 @@ model_adapter_finalize_task() {
         PREVIOUS_PROTOTYPES="${TASK_DIR}/repre_prototypes.pt"
     fi
 
+    if method_needs_patch_prototypes; then
+        history_args=()
+        if [[ -n "$PREVIOUS_PATCH_PROTOTYPES" ]]; then
+            history_args=(--load_hist "$PREVIOUS_PATCH_PROTOTYPES")
+        fi
+        python tools/generate_patch_prototypes.py \
+            --model "$PREVIOUS_MODEL" \
+            --data "$TRAIN_DATA" \
+            --output "${TASK_DIR}/patch_prototypes.pt" \
+            --device "$TOOL_DEVICE" \
+            --imgsz "$IMGSZ" \
+            --batch_size "$BATCH_SIZE" \
+            --workers "$WORKERS" \
+            --pca_dims "$PATCH_PCA_DIMS" \
+            --max_centers "$PATCH_PROTO_MAX_CENTERS" \
+            --split_ratio "$PATCH_PROTO_SPLIT_RATIO" \
+            --max_samples_per_class "$PATCH_PROTO_MAX_SAMPLES" \
+            --seed "$PATCH_PROTO_SEED" \
+            "${history_args[@]}"
+        PREVIOUS_PATCH_PROTOTYPES="${TASK_DIR}/patch_prototypes.pt"
+    fi
+
     if method_needs_replay; then
         history_args=()
         if [[ -n "$PREVIOUS_REPLAY" ]]; then
             history_args=(--load_hist "$PREVIOUS_REPLAY")
         fi
-        # TRAIN_DATA labels are in this task's class-id space (task-1 local IDs; later tasks use
-        # the id-converted dataset), and select_replay_samples remaps carried-over history labels
-        # into the same space by class name, so each task's replay_dataset stays self-consistent.
-        # The next task's prepare step remaps the replay dataset into the expanded model's
-        # class-id space before training (see model_adapter_prepare_task).
+        # The finished task's original labels are in this task's class-id space; select_replay_samples
+        # remaps carried-over history labels into the same space by class name, so each task's
+        # replay_dataset stays self-consistent. The next task's mapped YAML remaps the replay
+        # dataset by class name when the expanded model loads it.
+        # Pool strategies (ocdm) keep the memory at --num samples and annotate the
+        # pool with the model of the task that just finished.
+        ocdm_args=()
+        if [[ "$REPLAY_STRATEGY" == "ocdm" ]]; then
+            ocdm_args=(
+                --ocdm_stats "$OCDM_STATS"
+                --ocdm_model "$PREVIOUS_MODEL"
+                --ocdm_conf "$OCDM_CONF"
+                --ocdm_imgsz "$IMGSZ"
+                --ocdm_device "$TOOL_DEVICE"
+                --ocdm_batch_size "$OCDM_BATCH_SIZE"
+            )
+        fi
         python tools/select_replay_samples.py \
-            --dataset "$TRAIN_DATA" \
+            --dataset "$DATASET_PATH" \
             --output_dir "${TASK_DIR}/replay_dataset" \
             --num "$REPLAY_SAMPLE_NUM" \
             --strategy "$REPLAY_STRATEGY" \
             --seed "$REPLAY_SEED" \
-            "${history_args[@]}"
+            "${history_args[@]}" \
+            "${ocdm_args[@]}"
         PREVIOUS_REPLAY="${TASK_DIR}/replay_dataset"
     fi
 }

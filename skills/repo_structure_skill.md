@@ -37,12 +37,12 @@ scripts/
 ├── estimate_keep.sh               # i.i.d. keep-ratio knee from backbone features
 ├── feature_drift.sh
 ├── domain_similarity.sh             # pluggable feature x distribution-metric similarity over yamls or image dirs
-├── predict.sh                     # per-dataset inference dumps
 ├── analyze.sh
 ├── run_incremental.sh
 ├── libexec/experiment.sh          # dataset / model resolution
 ├── model_adapters/ultralytics.sh
-└── prune_compare/voc/             # VOC prune-vs-random template (common.sh + run.sh)
+├── prune_compare/voc/             # VOC prune-vs-random template (common.sh + run.sh)
+└── cvpr27/                        # fixed 3-machine CVPR-27 revision queues
 ```
 
 Example:
@@ -56,8 +56,9 @@ bash scripts/create.sh voc 15_5
 Rules:
 - Put **all** launch / scheduling scripts under `scripts/`.
 - Do **not** put implementation code under `scripts/`.
+- The IOD pipeline ends at `eval.sh`; do not add a `predict.sh`.
 - `--dataset/--split` is registered in `scripts/libexec/experiment.sh` and used
-  by `create.sh` only; train / eval / predict take explicit yaml sequences.
+  by `create.sh` only; train / eval take explicit yaml sequences.
 - Keep eval model-agnostic: `scripts/eval.sh` takes a run directory.
 
 ## Code placement

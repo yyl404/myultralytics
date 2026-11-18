@@ -1,70 +1,62 @@
-"""Perform PCA analysis on intermediate layer input feature activations of YOLO models.
+"""Estimate per-conv input statistics (PCA / second moment) for ESPReg and NSGP.
 
 Usage:
-    $ python tools/pca.py \
-        --model <path/to/model.pt> \
-        --sample_dir <path/to/sample_dir> \
-        --save_path <path/to/save_path> \
-        [--sample_num <sample_num> \
-         --label_dir <label_dir> \
-         --layers <layer1> <layer2> ... \
-         --modules <module1> <module2> ... \
-         --mode <mode> \
-         --check]
+    $ python tools/pca.py --model <path/to/model.pt> --dataset <dataset.yaml> \
+        --save_path <path/to/pca_cache.pkl> [--split val] [--imgsz 640] [--seed 42] \
+        [--pca_mode {incremental,gram,exact}] [--use_bbox] [--exclude_head] \
+        [--load_hist <previous.pkl>]
 
 Arguments:
     --model: Path to the model checkpoint (.pt file)
-    --sample_dir: Path to the sample images directory for PCA computation
-    --save_path: Path to save the PCA results file
-    --sample_num: Maximum number of samples to use (default: 100)
-    --label_dir: (optional) Path to the label directory for bounding box-based feature sampling
-    --layers: (optional) Layers to calculate PCA for, space-separated. If not specified, all intermediate layers are analyzed
-    --modules: (optional) Specific module names to calculate PCA for, space-separated. Provides more detailed control than --layers
-    --mode: (optional) Mode to calculate PCA, choices: unfold (default), fold
-    --check: (optional) Check the correctness of convolution kernel unfolding operations
+    --dataset: Dataset yaml; samples are drawn from its validation dataloader, so the
+        images are letterboxed and normalized exactly like training/validation.
+    --save_path: Path to save the PCA cache file
+    --split: Dataset split (default: val; falls back to val/test/train)
+    --imgsz: Inference size of the validation dataloader (default: 640)
+    --seed: Random seed for image/position sampling (default: 42)
+    --sample_num: Number of images to use, drawn as a seeded random subset (0 = all, default: 500)
+    --use_bbox: Sample only feature positions inside ground-truth boxes (ESPReg's
+        foreground-local statistics) instead of the whole feature map.
+    --layers: (optional) Layers to calculate PCA for, space-separated
+    --modules: (optional) Specific module names to calculate PCA for
+    --mode: (optional) unfold (default) or fold
+    --pca_mode: incremental (upstream IncrementalPCA, centered; default), gram
+        (streaming D x D uncentered Gram), or exact (collect vectors, chunked exact
+        uncentered second moment).
+    --load_hist: Previous cache to accumulate into
+    --check: (optional) Verify the convolution kernel unfolding
     --device: Device to use (default: "cuda")
 
 Examples:
-    $ python tools/pca.py \
-        --model yolov8n.pt \
-        --sample_dir data/images/train \
-        --save_path pca_results.pkl \
-        --sample_num 200 \
-        --layers 10 11 12
-    
-    $ python tools/pca.py \
-        --model yolov8n.pt \
-        --sample_dir data/images/train \
-        --save_path pca_results.pkl \
-        --modules model.10.conv model.11.conv \
-        --label_dir data/labels/train \
-        --mode unfold \
-        --check
+    $ python tools/pca.py --model runs/task-1/best.pt \
+        --dataset data/VOC_10+10/task_1_cls_10/dataset.yaml \
+        --save_path runs/task-1/pca_cache.pkl --pca_mode incremental --sample_num 0 --exclude_head
 """
 
-import joblib
+import argparse
 import os.path as OSP
 import random
-import cv2
-from tqdm import tqdm
-import glob
-import argparse
 
+import joblib
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from ultralytics import YOLO
-from ultralytics.utils import (
-    LOGGER, YAML
-)
-
+from pca_on_gpu import ExactMomentPCAonGPU as ExactMomentPCA
 from pca_on_gpu import IncrementalPCAonGPU as IncrementalPCA
 from pca_on_gpu import UncenteredPCAonGPU as UncenteredPCA
+from tqdm import tqdm
 from utils import RealTimeMemoryMonitor
 
+from ultralytics import YOLO
+from ultralytics.cfg import get_cfg
+from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.data.utils import check_det_dataset
+from ultralytics.utils import LOGGER
+from ultralytics.utils.ops import xywh2xyxy
 
-def conv_meta(module):
+
+def module_meta(module):
     if isinstance(module, nn.Conv2d):
         return {
             "kernel_size": module.kernel_size,
@@ -74,6 +66,27 @@ def conv_meta(module):
             "dilation": module.dilation,
             "in_channels": module.in_channels,
             "out_channels": module.out_channels,
+        }
+    if isinstance(module, nn.Linear):
+        return {
+            "kernel_size": (1, 1),
+            "stride": (1, 1),
+            "padding": (0, 0),
+            "groups": 1,
+            "dilation": (1, 1),
+            "in_channels": module.in_features,
+            "out_channels": module.out_features,
+        }
+    if isinstance(module, nn.MultiheadAttention):
+        weight = module.in_proj_weight if module.in_proj_weight is not None else module.q_proj_weight
+        return {
+            "kernel_size": (1, 1),
+            "stride": (1, 1),
+            "padding": (0, 0),
+            "groups": 1,
+            "dilation": (1, 1),
+            "in_channels": module.embed_dim,
+            "out_channels": weight.shape[0],
         }
     # CosineConv2d is a 1x1 dense classifier (no groups/dilation/padding by design).
     return {
@@ -87,13 +100,28 @@ def conv_meta(module):
     }
 
 
-def is_supported_conv_module(module):
-    return isinstance(module, nn.Conv2d)
+def module_param(module):
+    """Return the governed parameter name of a supported module."""
+    if isinstance(module, nn.MultiheadAttention):
+        if module.in_proj_weight is not None:
+            return "in_proj_weight"
+        if module.q_proj_weight is not None:
+            return "q_proj_weight"
+        raise ValueError("MultiheadAttention has no in_proj_weight/q_proj_weight to constrain")
+    return "weight"
+
+
+def is_supported_module(module):
+    if isinstance(module, (nn.Conv2d, nn.Linear)):
+        return True
+    return isinstance(module, nn.MultiheadAttention) and (
+        module.in_proj_weight is not None or module.q_proj_weight is not None
+    )
 
 
 class PCAHooker:
     def __init__(
-        self, model, layers=None, modules=None, device="cuda", check=False, unfold=True, uncentered=False
+        self, model, layers=None, modules=None, device="cuda", check=False, unfold=True, pca_mode="incremental"
     ):
         self.model = model
         self.modules = {}
@@ -104,16 +132,19 @@ class PCAHooker:
         self.device = device
         self.check = check
         self.unfold = unfold
-        self.uncentered = uncentered
+        self.pca_mode = pca_mode
+        self.use_bbox = False
 
         def _build_operator(module, input_dim):
-            if self.uncentered:
+            if self.pca_mode == "gram":
                 return UncenteredPCA(n_components=input_dim, device=self.device)
-            return IncrementalPCA(n_components=input_dim)
+            if self.pca_mode == "exact":
+                return ExactMomentPCA(n_components=input_dim, device=self.device)
+            return IncrementalPCA(n_components=input_dim, device=self.device)
         
         def _match(n, m, lid):
             "dfl layer is always frozen, so we don't need to calculate PCA for it"
-            return f"model.{lid}." in n and is_supported_conv_module(m) and "dfl" not in n
+            return f"model.{lid}." in n and is_supported_module(m) and "dfl" not in n
 
         self.feature_caches, self._handles = {}, []
 
@@ -121,7 +152,7 @@ class PCAHooker:
             # If modules are provided, only calculate PCA for the specified modules
             for n, m in model.named_modules():
                 if n in modules:
-                    meta = conv_meta(m)
+                    meta = module_meta(m)
                     k, c_in, g = meta["kernel_size"], meta["in_channels"], meta["groups"]
                     self.modules[n] = m
                     self.pca_operators[n] = []
@@ -137,7 +168,7 @@ class PCAHooker:
                 # If layers are provided, calculate PCA for all conv modules within layers
                 for n, m in model.named_modules():
                     if _match(n, m, lid):
-                        meta = conv_meta(m)
+                        meta = module_meta(m)
                         k, c_in, g = meta["kernel_size"], meta["in_channels"], meta["groups"]
                         self.modules[n] = m
                         self.pca_operators[n] = []
@@ -152,11 +183,7 @@ class PCAHooker:
             raise ValueError("Either modules or layers must be provided")
 
     def _get_sample_feature_indices(self, bs, h_out, w_out):
-        if self.uncentered:
-            return torch.arange(bs * h_out * w_out, device=self.device)
-        # Randomly sample feature indices for the legacy PCA/ESPReg path.
-        sample_feature_indices = torch.randperm(bs*h_out*w_out, device=self.device)[:100]
-        return sample_feature_indices
+        return torch.arange(bs * h_out * w_out, device=self.device)
 
     @property
     def names(self):
@@ -167,14 +194,44 @@ class PCAHooker:
         for n, mod in self.modules.items():
             self._handles.append(mod.register_forward_hook(self._hook(n, self.unfold)))
 
+    def _consume(self, module_name, feat_sampled, groups):
+        """Feed one sampled patch matrix to the configured PCA operator(s)."""
+        pca_operators = self.pca_operators[module_name]
+        if self.pca_mode in {"gram", "exact"}:
+            for group_idx in range(groups):
+                pca_operators[group_idx].partial_fit(feat_sampled[group_idx].T)
+            torch.cuda.empty_cache()
+            return
+
+        # Bound each incremental update while keeping at least four updates worth of
+        # data in the accumulation, so small datasets still reach n_components rows.
+        cap = max(100, pca_operators[0].n_components // 4)
+        if feat_sampled.shape[2] > cap:
+            indices = torch.randperm(feat_sampled.shape[2], device=feat_sampled.device)[:cap]
+            feat_sampled = feat_sampled[:, :, indices]
+        feature_cache = self.feature_caches[module_name]
+        feature_cache.append(feat_sampled)
+        # Incremental PCA needs its first batch to contain at least n_components rows.
+        if sum(x.shape[2] for x in feature_cache) >= pca_operators[0].n_components:
+            merged = torch.cat(feature_cache, dim=2)
+            feature_cache.clear()
+            for group_idx in range(groups):
+                try:
+                    pca_operators[group_idx].partial_fit(merged[group_idx].T)
+                except Exception as error:
+                    raise RuntimeError(
+                        f"PCA fit failed for module '{module_name}' group {group_idx} "
+                        f"with {merged[group_idx].shape[1]} rows and {merged[group_idx].shape[0]} features"
+                    ) from error
+
     def _hook(self, module_name, unfold=True):
         """
         If unfold is True, the input feature will be unfolded into a sequence of vectors with shape [c_in*k[0]*k[1], bs*h_out*w_out],
         otherwise, the input feature will be reshaped into a matrix with shape [c_in, bs*h_out*w_out].
         """
         def fn(module, feat_in, feat_out):
-            if is_supported_conv_module(module):
-                meta = conv_meta(module)
+            if is_supported_module(module):
+                meta = module_meta(module)
                 k, s, p, g, d, c_in, c_out = (
                     meta["kernel_size"],
                     meta["stride"],
@@ -185,8 +242,25 @@ class PCAHooker:
                     meta["out_channels"],
                 )
 
+                raw_in = feat_in
                 feat_in = feat_in[0]  # Module may accept multiple input features, and we only extract the first
-                if self.uncentered:
+                if isinstance(module, (nn.Linear, nn.MultiheadAttention)):
+                    if isinstance(module, nn.MultiheadAttention):
+                        # in_proj_weight is shared by query/key/value; use all three inputs.
+                        parts = [part for part in raw_in[:3] if isinstance(part, torch.Tensor)]
+                        tokens = torch.cat([part.reshape(-1, part.shape[-1]) for part in parts], dim=0)
+                    else:
+                        tokens = feat_in.reshape(-1, feat_in.shape[-1])
+                    feat_reshaped = tokens.T.unsqueeze(0)  # (1, in_features, num_tokens)
+                    sample_feature_indices = PCAHooker._get_sample_feature_indices(
+                        self, 1, 1, tokens.shape[0]
+                    )
+                    if sample_feature_indices.shape[0] == 0:
+                        return
+                    sampled = feat_reshaped[:, :, sample_feature_indices]
+                    self._consume(module_name, sampled, 1)
+                    return
+                if self.pca_mode == "gram" and not self.use_bbox:
                     feat_in = feat_in.mean(dim=0, keepdim=True)
                 bs, _, h_in_raw, w_in_raw = feat_in.shape
                 if p[0] > 0 or p[1] > 0:
@@ -234,8 +308,7 @@ class PCAHooker:
                     feat_unfold = feat_unfold.permute(1, 2, 5, 6, 0, 3, 4).contiguous()
                     # Squeeze: [g, c_in//g, actual_k_h, actual_k_w, bs, h_out, w_out] --> [g, c_in//g*actual_k_h*actual_k_w, bs*h_out*w_out]
                     feat_reshaped = feat_unfold.view(g, c_in_grouped*actual_k_h*actual_k_w, bs*h_out*w_out)
-                    if module.bias is not None and not self.uncentered:
-                        feat_reshaped = torch.concat((feat_reshaped, torch.ones(g, 1, bs*h_out*w_out).to(feat_reshaped.device)), dim=1)
+
                     pos_h, pos_w = h_out, w_out
 
                     # The following code is used to check whether the unfolding representation of convolution operation
@@ -268,21 +341,7 @@ class PCAHooker:
                 feat_sampled = feat_reshaped[:, :, sample_feature_indices]
                 # unfold true: [g, c_in//g*k*k, len(sample_feature_indices)] | unfold false: [g, c_in//g, len(sample_feature_indices)]
                 
-                feature_cache = self.feature_caches[module_name]
-                pca_operators = self.pca_operators[module_name]
-                if self.uncentered:
-                    for group_idx in range(g):
-                        pca_operators[group_idx].partial_fit(feat_sampled[group_idx].T)
-                    torch.cuda.empty_cache()
-                    return
-
-                feature_cache.append(feat_sampled)
-                # Incremental PCA requires the first batch's size is larger than n_components
-                if sum([x.shape[2] for x in feature_cache]) >= pca_operators[0].n_components:
-                    feat_sampled = torch.cat(feature_cache, dim=2)
-                    feature_cache.clear()
-                    for ig in range(g):
-                        pca_operators[ig].partial_fit(feat_sampled[ig].T)
+                self._consume(module_name, feat_sampled, g)
             else:
                 raise RuntimeError(f"Module type {type(module)} is not supported")
 
@@ -296,15 +355,17 @@ class PCAHooker:
     def clear_feature_cache(self):
         for n, cache in self.feature_caches.items():
             if len(cache) > 0:
+                merged = torch.cat(cache, dim=2)
                 for ig in range(len(self.pca_operators[n])):
-                    # Before clearing the cache, we need to fit the PCA operator with the final batch of features
-                    if hasattr(self.pca_operators[n][ig], 'components_'):
-                        self.pca_operators[n][ig].partial_fit(torch.cat(cache, dim=2)[ig].T)
+                    samples = merged[ig].T
+                    operator = self.pca_operators[n][ig]
+                    if hasattr(operator, "components_"):
+                        operator.partial_fit(samples)
+                    elif self.pca_mode == "incremental" and samples.shape[0] < operator.n_components:
+                        # Fewer samples than dimensions: exact SVD of what we have.
+                        _fit_exact_incremental(operator, samples)
                     else:
-                        # No components_ means PCA hasn't been fitted yet (samples < n_components), 
-                        # use normal PCA instead of Incremental PCA
-                        LOGGER.info(f"Too few samples to fit PCA in module {n}. Use normal PCA instead.")
-                        self.pca_operators[n][ig].fit(torch.cat(cache, dim=2)[ig].T)
+                        operator.fit(samples)
             cache.clear()
             for operator in self.pca_operators[n]:
                 if hasattr(operator, "finalize"):
@@ -345,7 +406,11 @@ class PCAHooker:
                         f"were collected."
                     )
             pca_cache[n] = [
-                {"class": type(operator).__name__, "state": operator.state_dict()}
+                {
+                    "class": type(operator).__name__,
+                    "param": module_param(self.modules[n]),
+                    "state": operator.state_dict(),
+                }
                 for operator in operators
             ]
 
@@ -406,10 +471,11 @@ class PCAHookerWithBboxes(PCAHooker):
         device="cuda",
         check=False,
         unfold=True,
-        uncentered=False,
+        pca_mode="incremental",
     ):
-        super().__init__(model, layers, modules, device, check, unfold, uncentered)
+        super().__init__(model, layers, modules, device, check, unfold, pca_mode)
         self.bboxes = bboxes
+        self.use_bbox = True
         
     def set_bboxes(self, bboxes):
         self.bboxes = bboxes
@@ -430,7 +496,7 @@ class PCAHookerWithBboxes(PCAHooker):
             return torch.tensor([], device=self.device)
 
         # Convert to tensor for vectorized calculation
-        bbox_tensor = torch.tensor(all_bboxes, device=self.device)  # [N, 4]
+        bbox_tensor = torch.stack(all_bboxes).to(self.device)  # [N, 4]
         
         # Scale bbox coordinates to feature map size
         feat_coords = bbox_tensor * torch.tensor([w_out, h_out, w_out, h_out], device=self.device)
@@ -455,127 +521,164 @@ class PCAHookerWithBboxes(PCAHooker):
                 sample_feature_indices.append(_batch_id * h_out * w_out + grid_y * w_out + grid_x)
         sample_feature_indices = torch.tensor(sample_feature_indices, device=self.device)
 
-        # If too many features, randomly sample to accelerate the PCA computation
-        if len(sample_feature_indices) > 100:
-            sampled_indices = torch.randperm(len(sample_feature_indices), device=self.device)[:100]
-            sample_feature_indices = sample_feature_indices[sampled_indices]
-        
         return sample_feature_indices
 
 
-def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda",
-           check=False, pca_cache_save_path=None, sample_num=100, unfold=True, load_hist=None,
-           uncentered=False, batch_size=1):
+def _fit_exact_incremental(operator, samples):
+    """Exact centered PCA over ``samples`` when fewer rows than components exist.
+
+    The upstream IncrementalPCA refuses the first update when ``rows < n_components``.
+    Fall back to a direct SVD of the collected rows, keeping ``min(rows, D)``
+    components (rank-deficient but exact for the available data) and warn.
+    """
+    rows, features = samples.shape
+    mean = samples.mean(dim=0)
+    centered = samples - mean
+    _, singular_values, right_vectors = torch.linalg.svd(centered, full_matrices=False)
+    dof = max(1, rows - 1)
+    energy = centered.square().sum()
+    operator.mean_ = mean
+    operator.var_ = centered.square().mean(dim=0)
+    operator.components_ = right_vectors
+    operator.singular_values_ = singular_values
+    operator.explained_variance_ = singular_values.square() / dof
+    operator.explained_variance_ratio_ = (
+        singular_values.square() / energy if energy > 0 else torch.zeros_like(singular_values)
+    )
+    operator.noise_variance_ = 0.0
+    operator.mean_proj_ = mean @ right_vectors.mH
+    operator.n_components_ = right_vectors.shape[0]
+    operator.n_features_ = features
+    operator.n_samples_seen_ = rows
+    operator.weight_sum_ = float(rows)
+    operator.weight_square_sum_ = float(rows)
+    LOGGER.warning(
+        f"Only {rows} samples for {features} features in an incremental PCA; "
+        f"falling back to the exact covariance decomposition with {right_vectors.shape[0]} components"
+    )
+
+
+def _seed_everything(seed: int) -> None:
+    """Seed every RNG used by artifact sampling."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+class _SubsetWithCollate(torch.utils.data.Subset):
+    """Subset that forwards the parent dataset's collate function to the loader."""
+
+    def __init__(self, dataset, indices):
+        super().__init__(dataset, indices)
+        self.collate_fn = dataset.collate_fn
+
+
+def _resolve_split(data: dict, split: str) -> str:
+    """Return the first requested split that the dataset config provides."""
+    for candidate in (split, "val", "test", "train"):
+        if candidate and candidate in data:
+            if candidate != split:
+                LOGGER.warning(f"Split '{split}' not found in the dataset config; using '{candidate}'")
+            return candidate
+    raise KeyError(f"No usable split in the dataset config; tried '{split}', 'val', 'test' and 'train'")
+
+
+def _build_val_loader(dataset, imgsz, batch_size, workers, split, device, stride=32, sample_num=500, seed=42):
+    """Build the same letterboxed, unaugmented loader that validation uses.
+
+    When ``sample_num`` is positive, the images are a seeded random subset of the
+    split (not the first N), matching the historical artifact sampling.
+    """
+    data = check_det_dataset(dataset)
+    split = _resolve_split(data, split)
+    cfg = get_cfg(overrides={"imgsz": imgsz, "task": "detect", "rect": False, "cache": False, "workers": workers})
+    dataset_obj = build_yolo_dataset(cfg, data[split], batch_size, data, mode="val", stride=stride)
+    if sample_num > 0 and len(dataset_obj) > sample_num:
+        generator = torch.Generator().manual_seed(seed)
+        indices = torch.randperm(len(dataset_obj), generator=generator)[:sample_num].tolist()
+        dataset_obj = _SubsetWithCollate(dataset_obj, indices)
+    loader = build_dataloader(
+        dataset_obj,
+        batch_size,
+        workers,
+        shuffle=False,
+        rank=-1,
+        drop_last=False,
+        pin_memory=False,
+        device=device,
+    )
+    LOGGER.info(f"PCA samples: dataset '{dataset}' split '{split}' ({len(dataset_obj)} images, imgsz={imgsz})")
+    return loader
+
+
+def do_pca(model, layers, modules, dataset, device="cuda", check=False, pca_cache_save_path=None,
+           sample_num=500, unfold=True, load_hist=None, pca_mode="incremental", batch_size=1,
+           split="val", imgsz=640, workers=8, use_bbox=False, seed=42):
+    """Accumulate input statistics and write the PCA cache.
+
+    Args:
+        model: Model in eval mode.
+        layers: Layers whose conv modules are analysed when ``modules`` is None.
+        modules: Explicit conv module names to analyse.
+        dataset: Dataset yaml; samples come from its validation dataloader.
+        device: Device for inference and Gram accumulation.
+        check: Verify the unfolding against the real convolution.
+        pca_cache_save_path: Output cache path.
+        sample_num: Number of images to sample (0 = all); the subset is drawn with ``seed``.
+        unfold: Unfold patches with the conv kernel (True) or use channel vectors (False).
+        load_hist: Previous cache to accumulate into.
+        pca_mode: ``incremental`` (upstream centered IncrementalPCA), ``gram``
+            (streaming uncentered Gram), or ``exact`` (collected vectors, exact
+            uncentered second moment with chunked Gram accumulation).
+        batch_size: Batch size of the sampling pass. With ``use_bbox`` every image
+            contributes its own in-box positions (no batch averaging).
+        split: Dataset split to sample from.
+        imgsz: Inference size of the validation dataloader.
+        workers: Dataloader workers.
+        use_bbox: Sample only feature positions inside ground-truth boxes.
+        seed: Seed for the image subset and position sampling.
+    """
+    if dataset is None:
+        raise ValueError("PCA sampling requires --dataset")
     if batch_size < 1:
         raise ValueError(f"PCA batch_size must be positive, got {batch_size}")
-    # Create PCA Hooker
-    if label_dir is not None and not uncentered:
-        pca_hooker = PCAHookerWithBboxes(
-            model, layers, modules, None, device, check, unfold, uncentered
-        )
+    if use_bbox:
+        pca_hooker = PCAHookerWithBboxes(model, layers, modules, None, device, check, unfold, pca_mode)
     else:
-        pca_hooker = PCAHooker(model, layers, modules, device, check, unfold, uncentered)
-    
-    # Load historical PCA cache if specified
+        pca_hooker = PCAHooker(model, layers, modules, device, check, unfold, pca_mode)
+
     if load_hist is not None:
         if OSP.exists(load_hist):
             pca_hooker.load_pca_cache(load_hist)
         else:
             LOGGER.warning(f"Historical PCA cache file not found: {load_hist}. Starting from scratch.")
 
-    memory_monitor = RealTimeMemoryMonitor(update_interval=0.2)  # Monitor memory and CUDA memory usage
-    if sample_dir is not None:
-        image_extensions = ['jpg', 'png', 'jpeg', 'bmp']
-        sample_files = []
-        if isinstance(sample_dir, list) or isinstance(sample_dir, tuple):
-            for _dir in sample_dir:
-                for ext in image_extensions:
-                    sample_files.extend(glob.glob(OSP.join(_dir, f'*.{ext.lower()}')))
-                    sample_files.extend(glob.glob(OSP.join(_dir, f'*.{ext.upper()}')))
-        else:
-            for ext in image_extensions:
-                sample_files.extend(glob.glob(OSP.join(sample_dir, f'*.{ext.lower()}')))
-                sample_files.extend(glob.glob(OSP.join(sample_dir, f'*.{ext.upper()}')))
-        random.shuffle(sample_files)
-        
-        if label_dir is not None:
-            label_files = []
-            for _sample_file in sample_files:
-                _label_name = OSP.splitext(OSP.basename(_sample_file))[0] + '.txt'
-                if isinstance(label_dir, list) or isinstance(label_dir, tuple):
-                    exist_label_file = False
-                    for _dir_label in label_dir:
-                        if OSP.exists(OSP.join(_dir_label, _label_name)):
-                            label_files.append(OSP.join(_dir_label, _label_name))
-                            exist_label_file = True
-                            break
-                    if not exist_label_file:
-                        label_files.append(None)
-                        LOGGER.warning(f"Label file {_label_name} not found in {label_dir}")
-                else:
-                    if OSP.exists(OSP.join(label_dir, _label_name)):
-                        label_files.append(OSP.join(label_dir, _label_name))
-                    else:
-                        label_files.append(None)
-                        LOGGER.warning(f"Label file {_label_name} not found in {label_dir}")
-        
-        
-        sample_count = len(sample_files) if sample_num <= 0 else min(sample_num, len(sample_files))
-        step_size = batch_size if uncentered else 1
-        sample_starts = range(0, sample_count, step_size)
-        pbar = tqdm(sample_starts, desc="PCA computing", total=len(sample_starts))
+    memory_monitor = RealTimeMemoryMonitor(update_interval=0.2)
+    try:
+        stride = int(torch.as_tensor(getattr(model, "stride", 32)).max())
+        loader = _build_val_loader(
+            dataset, imgsz, batch_size, workers, split, device, stride, sample_num=sample_num, seed=seed
+        )
+        pbar = tqdm(loader, desc="PCA computing")
         memory_monitor.set_progress_bar(pbar)
         memory_monitor.start_monitoring()
-        for sample_start in pbar:
-            sample_indices = range(sample_start, min(sample_start + step_size, sample_count))
-            images = []
-            for sample_idx in sample_indices:
-                image = cv2.imread(sample_files[sample_idx])
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                image = cv2.resize(image, (640, 640))
-                image = image.transpose(2, 0, 1) / 255.0
-                images.append(torch.from_numpy(image).float())
-            image_batch = torch.stack(images).to(device)
-
-            if label_dir is not None and not uncentered:
-                bboxes = []
-                if label_files[sample_start] is not None:
-                    with open(label_files[sample_start], "r") as f:
-                        for line_number, raw_line in enumerate(f, start=1):
-                            fields = raw_line.split()
-                            if not fields:
-                                continue
-                            try:
-                                x, y, w, h = (float(fields[i]) for i in range(1, 5))
-                            except (IndexError, ValueError):
-                                LOGGER.warning(
-                                    f"Skipping malformed label line {line_number} "
-                                    f"in {label_files[sample_start]}: {raw_line.strip()!r}"
-                                )
-                                continue
-                            x_min, y_min, x_max, y_max = x - w/2, y - h/2, x + w/2, y + h/2
-                            bboxes.append([x_min, y_min, x_max, y_max])
-                pca_hooker.set_bboxes([bboxes])
-            
-            pca_hooker.register_hook()
-            with torch.no_grad():
-                _ = model(image_batch)
-            pca_hooker.remove_handle_()
-    else:
-        LOGGER.warning("No sample images provided, using random images for PCA")
-        pbar = tqdm(range(sample_num), desc="PCA computing", total=sample_num)
-        memory_monitor.set_progress_bar(pbar)
-        memory_monitor.start_monitoring()
-        for i in pbar:
-            image = torch.randn(3, 640, 640).to(device)
-            pca_hooker.register_hook()
-            with torch.no_grad():
-                _ = model(image.unsqueeze(0))
-            pca_hooker.remove_handle_()
-    
-    memory_monitor.stop_monitoring()
+        pca_hooker.register_hook()
+        with torch.no_grad():
+            for batch in pbar:
+                images = batch["img"].to(device, non_blocking=True).float() / 255.0
+                if use_bbox:
+                    # Dataset boxes are (cx, cy, w, h) normalized to the letterboxed
+                    # image, concatenated over the batch; split them per image and
+                    # convert to xyxy for the feature-grid sampler.
+                    counts = torch.bincount(batch["batch_idx"].long(), minlength=images.shape[0])
+                    pca_hooker.set_bboxes(list(torch.split(xywh2xyxy(batch["bboxes"]), counts.tolist())))
+                _ = model(images)
+    finally:
+        pca_hooker.remove_handle_()
+        memory_monitor.stop_monitoring()
     pca_hooker.clear_feature_cache()
-    
+
     if pca_cache_save_path:
         pca_hooker.save_pca_cache(pca_cache_save_path)
 
@@ -583,47 +686,20 @@ def do_pca(model, layers, modules, sample_dir=None, label_dir=None, device="cuda
 def main(args):
     if args.device.isdigit():
         args.device = f"cuda:{args.device}"
-    # Test CUDA availability
     if "cuda" in args.device and not torch.cuda.is_available():
         LOGGER.warning(f"{args.device} is not available, using cpu instead")
         args.device = "cpu"
 
-    # Load model
+    _seed_everything(args.seed)
+
     model = YOLO(args.model).model.to(args.device).eval()
 
-    # Get layers
     if args.layers is None and args.modules is None:
         end_layer = len(model.model) - 1 if args.exclude_head else len(model.model)
         layers = list(range(end_layer))
     else:
         layers = args.layers
 
-    # Get module names directly
-    if args.modules is not None:
-        modules = args.modules
-    else:
-        modules = None
-
-    # If specifying samples and labels by --dataset, get the sample dir and label dir
-    if args.dataset is not None:
-        sample_dirs = []
-        label_dirs = []
-        for dataset_path in args.dataset:
-            dataset_config = YAML.load(dataset_path)
-            if 'path' not in dataset_config.keys():
-                sample_dir = OSP.join(OSP.dirname(dataset_path), dataset_config['train'])
-            else:
-                sample_dir = OSP.join(dataset_config['path'], dataset_config['train'])
-            label_dir = sample_dir.replace("images", "labels")
-            sample_dirs.append(sample_dir)
-            label_dirs.append(label_dir)
-        # Convert to lists (do_pca supports both list and string, but list is more consistent)
-        args.sample_dir = sample_dirs
-        args.label_dir = label_dirs
-    if args.dataset is None and args.sample_dir is None:
-        raise ValueError("Either --dataset or --sample_dir must be provided")
-
-    # Mode
     if args.mode == "unfold":
         unfold = True
     elif args.mode == "fold":
@@ -631,43 +707,55 @@ def main(args):
     else:
         raise ValueError(f"Invalid mode: {args.mode}")
 
-    # Perform PCA
     do_pca(
         model,
         layers,
-        modules,
-        args.sample_dir,
-        args.label_dir,
-        args.device,
-        args.check,
-        args.save_path,
-        args.sample_num,
-        unfold,
-        args.load_hist,
-        args.uncentered,
-        args.batch_size,
+        args.modules,
+        args.dataset,
+        device=args.device,
+        check=args.check,
+        pca_cache_save_path=args.save_path,
+        sample_num=args.sample_num,
+        unfold=unfold,
+        load_hist=args.load_hist,
+        pca_mode=args.pca_mode,
+        batch_size=args.batch_size,
+        split=args.split,
+        imgsz=args.imgsz,
+        workers=args.workers,
+        use_bbox=args.use_bbox,
+        seed=args.seed,
     )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--sample_dir", type=str, default=None)
+    parser.add_argument("--dataset", type=str, required=True,
+        help="Dataset yaml; samples come from its validation dataloader (letterboxed, imgsz, no augmentation).")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_path", type=str, default=None)
-    parser.add_argument("--label_dir", type=str, default=None)
-    parser.add_argument("--dataset", nargs="+", type=str, default=None,
-        help="Dataset YAML configuration file(s). Can specify multiple datasets.")
-    parser.add_argument("--sample_num", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--split", type=str, default="val",
+        help="Dataset split (falls back to val/test/train, in that order).")
+    parser.add_argument("--imgsz", type=int, default=640, help="Inference size of the validation dataloader.")
+    parser.add_argument("--workers", type=int, default=8, help="Dataloader workers.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for position sampling.")
+    parser.add_argument("--sample_num", type=int, default=500,
+        help="Number of images to sample, drawn as a seeded random subset (0 = all images).")
+    parser.add_argument("--batch_size", type=int, default=1,
+        help="Batch size; uncentered statistics average the batch before unfolding, so this is a statistical knob.")
+    parser.add_argument("--use_bbox", action="store_true",
+        help="Sample only feature positions inside ground-truth boxes (ESPReg's foreground-local statistics).")
     parser.add_argument("--layers", nargs="+", type=int, default=None,
         help="Layers to calculate PCA for, use comma to separate, conv modules within layers are analyzed.")
     parser.add_argument("--modules", nargs="+", type=str, default=None,
-        help="Modules to calculate PCA for, use comma to separate, providing more detailed control over the "+
-        "modules to calculate PCA.")
+        help="Modules to calculate PCA for, use comma to separate, providing more detailed control over the "
+             "modules to calculate.")
     parser.add_argument("--exclude_head", action="store_true",
         help="Exclude the final detection head; NSGP governs the feature extractor only.")
-    parser.add_argument("--uncentered", action="store_true",
-        help="Accumulate uncentered input covariance as required by NSGP.")
+    parser.add_argument("--pca_mode", type=str, choices=["incremental", "gram", "exact"], default="incremental",
+        help="incremental = upstream centered IncrementalPCA (default); gram = streaming uncentered Gram; "
+             "exact = collected vectors with a chunked exact uncentered second moment.")
     parser.add_argument("--mode", type=str, choices=["unfold", "fold"], default="unfold",
         help="Mode to calculate PCA, choices: unfold (default), fold.")
     parser.add_argument("--load_hist", type=str, default=None,

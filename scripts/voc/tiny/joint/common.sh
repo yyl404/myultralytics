@@ -18,10 +18,10 @@
 #                      task, in task order (train.sh / similarity.sh)
 #   EVAL_YAMLS         independent EVAL sequence: datasets each checkpoint is
 #                      evaluated on one by one; may differ from TRAIN_YAMLS in
-#                      content, order, and length (eval.sh / predict.sh /
+#                      content, order, and length (eval.sh /
 #                      similarity.sh, crossed with TRAIN_YAMLS)
 #   CUMULATIVE_YAMLS   cumulative EVAL sequence (optional); set to () to skip
-#                      cumulative evaluation (eval.sh / predict.sh)
+#                      cumulative evaluation (eval.sh)
 # ============================================================================
 DATA_ROOT="data/VOC-TINY-YOLO"
 DATA_TAG="VOC_15+5"
@@ -40,7 +40,7 @@ CUMULATIVE_YAMLS=(
 
 # Run identity.
 MODEL="${MODEL:-yolo26m}"
-WEIGHTS="${WEIGHTS:-yoloe-26m-seg.pt}"
+WEIGHTS="${WEIGHTS:-yolo26m-cls.pt}"
 METHOD="${METHOD:-naive}"
 # Default output dir is composed from the identity above (same naming rule as
 # scripts/train.sh); override RUN_DIR to use a fixed location instead.
@@ -52,9 +52,6 @@ if [[ -z "${RUN_DIR:-}" ]]; then
     fi
 fi
 
-# Model used for the predict stage (any task-k/best.pt).
-PREDICT_MODEL="${PREDICT_MODEL:-$RUN_DIR/task-2/best.pt}"
-
 # Backbone spec for the backbone feature block of the similarity stage
 # (similarity.sh): a local YOLO .pt path, torchvision:<name> or
 # timm:<name>; defaults to the same weights used to initialize training.
@@ -65,7 +62,7 @@ SIMILARITY_WEIGHTS="${SIMILARITY_WEIGHTS:-$WEIGHTS}"
 #   END2END       False = one-to-many + NMS (default) | True = NMS-free one-to-one
 #   AGNOSTIC_NMS  True = class-agnostic NMS (default) | False = per-class NMS
 #   MAX_DET       Max detections kept per image (default: 300)
-# Forwarded to train / eval / predict via DECODE_ARGS in the EXTRA_*_ARGS
+# Forwarded to train / eval via DECODE_ARGS in the EXTRA_*_ARGS
 # below. scripts/train.sh additionally reads the exported END2END for its
 # yolo26 default hyps, so training stays consistent even when EXTRA_TRAIN_ARGS
 # is overridden from the environment.
@@ -77,24 +74,16 @@ export END2END
 
 DECODE_ARGS="--end2end $END2END --agnostic_nms $AGNOSTIC_NMS --max_det $MAX_DET"
 
-# Extra args forwarded to tools/train.py / tools/eval.py / tools/predict.py
+# Extra args forwarded to tools/train.py / tools/eval.py
 # (everything after `--`). Overriding an EXTRA_*_ARGS env var replaces the
 # whole string, decode knobs included.
 if [[ -z "${EXTRA_TRAIN_ARGS:-}" ]]; then
-    EXTRA_TRAIN_ARGS="--optimizer AdamW --lr0 0.001 --warmup_bias_lr 0.0 --mosaic 0.5 --freeze 10 $DECODE_ARGS"
+    EXTRA_TRAIN_ARGS="--optimizer AdamW --lr0 0.001 --warmup_bias_lr 0.0 --mosaic 0.5 $DECODE_ARGS"
 fi
 read -ra EXTRA_TRAIN_ARGS <<< "$EXTRA_TRAIN_ARGS"
 EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS:-$DECODE_ARGS}"
 read -ra EXTRA_EVAL_ARGS <<< "$EXTRA_EVAL_ARGS"
-EXTRA_PREDICT_ARGS="${EXTRA_PREDICT_ARGS:-$DECODE_ARGS}"
-read -ra EXTRA_PREDICT_ARGS <<< "$EXTRA_PREDICT_ARGS"
-
-# Class-agnostic eval protocol: scripts/eval.sh scores every eval cell a
-# second time with all classes merged into a single 'object' class (model
-# class channels collapsed to per-location max confidence as objectness).
-# Set CLASS_AGNOSTIC_EVAL=0 to skip that pass (eval.sh / pipeline.sh).
-export CLASS_AGNOSTIC_EVAL="${CLASS_AGNOSTIC_EVAL:-1}"
 
 # Train knobs (read from the environment by scripts/train.sh).
-export EPOCHS="${EPOCHS:-10}"
+export EPOCHS="${EPOCHS:-100}"
 export DEVICE="${DEVICE:-0}"

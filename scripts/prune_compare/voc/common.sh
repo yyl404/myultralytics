@@ -75,7 +75,6 @@ EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS:-$DECODE_ARGS}"
 read -ra EXTRA_EVAL_ARGS <<< "$EXTRA_EVAL_ARGS"
 
 # Skip the class-agnostic eval pass; this comparison only needs class-aware mAP50.
-export CLASS_AGNOSTIC_EVAL="${CLASS_AGNOSTIC_EVAL:-0}"
 
 # Train knobs (read from the environment by scripts/train.sh).
 export EPOCHS="${EPOCHS:-20}"

@@ -1,45 +1,13 @@
+from __future__ import annotations
+
 from typing import Dict, List
 
 import torch
-from torch import Tensor
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import scipy.ndimage
+from torch import Tensor
 
+from ultralytics.engine.spectrum import find_elbow_point
 from ultralytics.nn import BaseModel
-from ultralytics.utils import LOGGER
-
-
-def find_elbow_point(svals: torch.Tensor) -> int:
-    """Find the elbow point in singular value spectrum using second-order derivatives.
-    
-    Args:
-        svals: Singular values in descending order, shape (N,)
-    
-    Returns:
-        int: Index of the elbow point
-    """
-    points = svals.cpu().numpy()
-    assert points.ndim == 1
-    
-    if len(points) >= 128:
-        fil_points = scipy.ndimage.gaussian_filter1d(points, sigma=10)
-        _delta = 1
-        diff_o1 = fil_points[:-_delta] - fil_points[_delta:]
-        diff_o2 = diff_o1[:-1] - diff_o1[1:]
-        _drop_ratio = 0.03
-        drop_num = int(len(points) * _drop_ratio / 2)
-        assert len(points) - drop_num >= 10
-        valid_o2 = diff_o2[drop_num:-drop_num]
-        thres_val = points[np.argmax(valid_o2) + int((len(points) - len(valid_o2)) / 2)]
-    else:
-        diff_o1 = points[:-1] - points[1:]
-        diff_o2 = diff_o1[:-1] - diff_o1[1:]
-        thres_val = points[np.argmax(diff_o2) + int((len(points) - len(diff_o2)) / 2)]
-    
-    i_thres = np.arange(len(points))[points >= thres_val].max()
-    return int(i_thres)
 
 
 def adjust_eigen_values(eigen_values: Dict[str, Tensor]) -> Dict[str, Tensor]:
@@ -89,55 +57,95 @@ def adjust_eigen_values(eigen_values: Dict[str, Tensor]) -> Dict[str, Tensor]:
     return adjusted
 
 
-class EWPRegLoss:
+class ESPRegLoss:
     """ESPReg (Eigen-value Scaled Projection Regularization) loss.
-    Regularization loss based on eigen-value weighted projection length of parameter updates
-    in the principal component subspace. Also referred to as EWPReg in implementation.
+
+    Penalizes the projection of the accumulated parameter update ``Delta W`` onto the
+    historical principal directions, weighted by the historical spectrum of the
+    non-centered input second moment ``Sigma = E[x x^T]``. Two reductions share the
+    interface:
+
+    - ``form="original"``: mean over output channels of the weighted projection length,
+      ``mean_o sqrt(sum_k w_k^2 (Delta W_o . u_k)^2)`` with the truncated/normalized
+      spectrum ``w = lambda*``. This is the implementation used by the earlier runs.
+    - ``form="frobenius"``: the squared weighted projection energy,
+      ``sum_o sum_k w_k (Delta W_o . u_k)^2 = Tr(Delta W U diag(w) U^T Delta W^T)``,
+      which equals the local response disturbance when ``w = lambda`` and ``alpha_l = 1``.
+
+    With ``weight_mode="raw"`` and ``form="frobenius"`` the penalty is exactly the
+    expected squared pre-activation drift on historical inputs, so the eigen-values
+    must be those of the non-centered second moment (the PCA cache is built with
+    ``tools/pca.py --uncentered``).
+
+    Args:
+        model_update: The model being updated during training
+        model_base: The base model for comparison
+        module_names: List of module names to apply ESPReg loss
+        components: Dictionary of PCA components for each module
+        eigen_values: Dictionary of second-moment eigen values for each module
+        weight_mode: ``"raw"`` uses the eigenvalues as they are, ``"nt"`` uses the
+            elbow-normalized and truncated spectrum
+        form: ``"original"`` or ``"frobenius"`` reduction, see the class docstring
     """
+
+    WEIGHT_MODES = ("raw", "nt")
+    FORMS = ("original", "frobenius")
+
     def __init__(self, model_update: BaseModel, model_base: BaseModel, module_names: List,
-                 components: Dict[str, Tensor], eigen_values: Dict[str, Tensor]):
+                 components: Dict[str, Tensor], eigen_values: Dict[str, Tensor],
+                 param_names: Dict[str, str] | None = None,
+                 weight_mode: str = "nt", form: str = "original"):
         """
         Args:
             model_update: The model being updated during training
             model_base: The base model for comparison
-            module_names: List of module names to apply EWPReg loss
+            module_names: List of module names to apply ESPReg loss
             components: Dictionary of PCA components for each module
             eigen_values: Dictionary of eigen values for each module
+            param_names: Module name -> governed parameter attribute (default ``weight``)
+            weight_mode: ``"raw"`` or ``"nt"``
+            form: ``"original"`` or ``"frobenius"``
         """
+        if weight_mode not in self.WEIGHT_MODES:
+            raise ValueError(f"weight_mode must be one of {self.WEIGHT_MODES}, got {weight_mode!r}")
+        if form not in self.FORMS:
+            raise ValueError(f"form must be one of {self.FORMS}, got {form!r}")
         self.model_update = model_update
         self.model_base = model_base
-        self.module_names = module_names
+        self.module_names = list(module_names)
+        self.param_names = dict(param_names or {})
         self.components = components
         self.eigen_values = eigen_values
-        self.eigen_values_adjusted = adjust_eigen_values(eigen_values)
+        self.weight_mode = weight_mode
+        self.form = form
+        self.eigen_values_adjusted = adjust_eigen_values(eigen_values) if weight_mode == "nt" else None
 
         for key in components.keys():
             # Freeze PCA attributes
             self.components[key].requires_grad_(False)
             self.eigen_values[key].requires_grad_(False)
-            self.eigen_values_adjusted[key].requires_grad_(False)
+            if self.eigen_values_adjusted is not None:
+                self.eigen_values_adjusted[key].requires_grad_(False)
 
         self.update_modules, self.base_modules = {}, {}
         for n, m in model_update.named_modules():
-            if n in module_names:
+            if n in self.module_names:
                 self.update_modules[n] = m
         for n, m in model_base.named_modules():
-            if n in module_names:
+            if n in self.module_names:
                 self.base_modules[n] = m
+        missing = [n for n in self.module_names if n not in self.update_modules or n not in self.base_modules]
+        if missing:
+            raise KeyError(f"ESPReg modules are missing from the student/base model: {missing}")
         
         self.update_weights, self.base_weights = {}, {}
         self._handles = []
+        self._device = None
 
     def register_hook(self):
+        """Register the weight-capture hooks used by one training epoch."""
         self.remove_handle_()
         for n in self.module_names:
-            if n not in self.update_modules:
-                LOGGER.warning(f"Module '{n}' not found in update_modules, skipping hook registration")
-                continue
-            if n not in self.base_modules:
-                LOGGER.warning(f"Module '{n}' not found in base_modules, skipping hook registration")
-                continue
-            
             u_mod = self.update_modules[n]
             b_mod = self.base_modules[n]
             self._handles.append(u_mod.register_forward_hook(self._hook(self.update_weights, n)))
@@ -147,11 +155,25 @@ class EWPRegLoss:
         def fn(module, _, __):
             # This hook is responsible for extracting given module's weight
             if isinstance(module, nn.Conv2d):
-                dict_w[n] = module.weight.reshape(module.groups, module.weight.shape[0]//module.groups, -1) # [g, c_out//g, c_in//g*k*k]
-                if module.bias is not None:
-                    dict_w[n] = torch.concat((dict_w[n], module.bias.data.reshape(module.groups, module.out_channels//module.groups, 1)), dim=2)
+                groups = module.groups
+            elif isinstance(module, (nn.Linear, nn.MultiheadAttention)):
+                groups = 1
             else:
-                LOGGER.warning(f"Module {n}'s type {type(module)} is not supported, skipped")
+                raise TypeError(
+                    f"ESPReg only supports Conv2d/Linear/MultiheadAttention modules, got {type(module)} for '{n}'"
+                )
+            param = getattr(module, self.param_names.get(n, "weight"))
+            out_channels = param.shape[0]
+            flat_weight = param.reshape(groups, out_channels // groups, -1)
+            # A bias column is appended only when the cached basis was fitted with one
+            # (centered PCA on biased convolutions). Uncentered second-moment caches have
+            # no bias dimension.
+            bias = getattr(module, "bias", None)
+            if bias is not None and self.components[n].shape[-1] == flat_weight.shape[-1] + 1:
+                flat_weight = torch.concat(
+                    (flat_weight, bias.data.reshape(groups, out_channels // groups, 1)), dim=2
+                )
+            dict_w[n] = flat_weight
         return fn
 
     def remove_handle_(self):
@@ -160,24 +182,57 @@ class EWPRegLoss:
             h.remove()
         self._handles.clear()
 
+    def _ensure_device(self, device: torch.device) -> None:
+        """Move the cached spectra to the training device once per process."""
+        if self._device == device:
+            return
+        for table in (self.components, self.eigen_values, self.eigen_values_adjusted):
+            if table is None:
+                continue
+            for name, value in table.items():
+                table[name] = value.to(device)
+        self._device = device
+
     def get_loss(self) -> Tensor:
+        """Return the ESPReg penalty of the current accumulated parameter update."""
+        missing = [
+            name
+            for name in self.module_names
+            if name not in self.update_weights or name not in self.base_weights
+        ]
+        if missing:
+            raise RuntimeError(
+                f"ESPReg weights were not captured for {len(missing)} module(s), e.g. '{missing[0]}'; "
+                "run a forward pass through both models after register_hook()"
+            )
+        self._ensure_device(next(iter(self.update_weights.values())).device)
+        source = self.eigen_values_adjusted if self.weight_mode == "nt" else self.eigen_values
         loss = 0
         for n in self.module_names:
-            proj = self.components[n] # [g, c_in//g*k*k, c_in//g*k*k]
-            scale = self.eigen_values_adjusted[n] # [g, c_in//g*k*k]
-            
-            update_w = self.update_weights[n] # [g, c_out//g, c_in//g*k*k]
-            base_w = self.base_weights[n] # [g, c_out//g, c_in//g*k*k]
-            delta_w = update_w - base_w # [g, c_out//g, c_in//g*k*k]
-            
-            proj = proj.to(delta_w.device, delta_w.dtype)
-            scale = scale.to(delta_w.device, delta_w.dtype)
-            
-            # ([g, c_out//g, c_in//g*k*k] @ [g, c_in//g*k*k, c_in//g*k*k]) * [g, 1, c_in//g*k*k]
-            #       = [g, c_out//g, c_in//g*k*k] * [g, 1, c_in//g*k*k]
-            #       = [g, c_out//g, c_in//g*k*k]
-            #       -> norm([g, c_out//g, c_in//g*k*k], dim=2) = [g, c_out//g]
-            #       -> mean([g, c_out//g]) = scalar
-            loss += 100 * ((delta_w @ proj.transpose(1, 2)) * scale.unsqueeze(1)).norm(dim=2).mean()
+            proj = self.components[n] # [g, D, D], rows are the principal directions u_k
+            scale = source[n] # [g, D] weights w_k
+
+            update_w = self.update_weights[n] # [g, c_out//g, D]
+            base_w = self.base_weights[n] # [g, c_out//g, D]
+            if update_w.shape != base_w.shape:
+                raise RuntimeError(
+                    f"ESPReg weight mismatch for '{n}': update {tuple(update_w.shape)}, "
+                    f"base {tuple(base_w.shape)}"
+                )
+            delta_w = update_w - base_w # [g, c_out//g, D]
+            if delta_w.shape[-1] != proj.shape[-1]:
+                raise RuntimeError(
+                    f"ESPReg component dimension mismatch for '{n}': update {delta_w.shape[-1]}, "
+                    f"components {proj.shape[-1]}. Generate the PCA cache with tools/pca.py --uncentered."
+                )
+
+            # Projections onto every principal direction: [g, c_out//g, D] with entry (o, k) = Delta W_o . u_k
+            projected = delta_w @ proj.transpose(1, 2)
+            if self.form == "frobenius":
+                # sum_k w_k (Delta W_o . u_k)^2, summed over output channels and groups
+                loss += 100 * (projected * scale.sqrt().unsqueeze(1)).pow(2).sum()
+            else:
+                # mean over output channels/groups of sqrt(sum_k w_k^2 (Delta W_o . u_k)^2)
+                loss += 100 * (projected * scale.unsqueeze(1)).norm(dim=2).mean()
         loss = loss / len(self.module_names)
         return loss

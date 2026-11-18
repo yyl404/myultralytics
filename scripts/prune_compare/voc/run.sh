@@ -54,7 +54,7 @@ run_one() {
         python tools/attach_source_splits.py --src_data "$SRC_DATA" --dst_yaml "$yaml" --splits "${ATTACH_SOURCE_SPLITS[@]}"
     fi
     if [[ ! -f "$eval_csv" ]]; then
-    EPOCHS="$EPOCHS" DEVICE="$DEVICE" BATCH_SIZE="$BATCH_SIZE" CLASS_AGNOSTIC_EVAL=0 \
+    EPOCHS="$EPOCHS" DEVICE="$DEVICE" BATCH_SIZE="$BATCH_SIZE" \
         bash scripts/train.sh \
             --tasks "$yaml" \
             --model "$MODEL" \
@@ -64,7 +64,6 @@ run_one() {
             --output "$run_dir" \
             -- \
             "${EXTRA_TRAIN_ARGS[@]}"
-    CLASS_AGNOSTIC_EVAL=0 \
         bash scripts/eval.sh --run "$run_dir" --tasks "$EVAL_YAML" --split "$EVAL_SPLIT" -- "${EXTRA_EVAL_ARGS[@]}"
     fi
     local map50

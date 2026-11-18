@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import warnings
 from copy import deepcopy
@@ -28,15 +29,14 @@ from ultralytics.utils.torch_utils import (
     EarlyStopping,
     ModelEMA,
     autocast,
+    unwrap_model,
     unset_deterministic,
 )
 
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.ops import xyxy2xywhn, xywh2xyxy
 from ultralytics.utils.metrics import bbox_iou, batch_probiou
-from ultralytics.engine.espreg import (
-    EWPRegLoss,
-)
+from ultralytics.engine.espreg import ESPRegLoss
 from ultralytics.engine.bpf import (
     bpf_pseudo_detections,
     compute_dwf_loss,
@@ -45,7 +45,18 @@ from ultralytics.engine.bpf import (
 )
 from ultralytics.engine.ewc import EWCLoss, load_ewc_state
 from ultralytics.engine.l2 import L2Loss
+from ultralytics.engine.lwf import YOLOLwFLoss, detect_branch_output, feature_l2_loss
 from ultralytics.engine.nsgp import NSGP
+from ultralytics.engine.patch_proto import (
+    RecordingDetectionLoss,
+    get_assignment,
+    head_input_channels,
+    head_patch_radius,
+    load_patch_artifact,
+    new_class_mask,
+)
+from ultralytics.engine.prad import PrototypeReliabilityLwFLoss
+from ultralytics.engine.prd import PatchReplayDistillation
 from ultralytics.engine.repre import RegionalPrototypeReplay
 from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.nn.modules.head import Detect, OBB
@@ -166,12 +177,14 @@ def _extract_pca_spectra(pca_cache):
         pca_cache (dict): module name -> list of serialized per-group operator entries.
 
     Returns:
-        tuple[dict, dict]: module name -> (groups, n_components) components tensor,
-            and module name -> (groups, n_components) explained-variance tensor.
+        tuple[dict, dict, dict]: module name -> (groups, n_components) components
+            tensor, module name -> (groups, n_components) explained-variance tensor,
+            and module name -> governed parameter name (``weight`` by default).
     """
-    components, eigen_values = {}, {}
+    components, eigen_values, param_names = {}, {}, {}
     for name, entries in pca_cache.items():
         group_components, group_eigen_values = [], []
+        param_names[name] = entries[0].get("param", "weight") if entries else "weight"
         for ig, entry in enumerate(entries):
             if not isinstance(entry, dict) or "state" not in entry:
                 raise TypeError(
@@ -183,7 +196,7 @@ def _extract_pca_spectra(pca_cache):
             group_eigen_values.append(entry["state"]["explained_variance_"])
         components[name] = torch.stack(group_components)
         eigen_values[name] = torch.stack(group_eigen_values)
-    return components, eigen_values
+    return components, eigen_values, param_names
 
 
 def _head_raw_output_to_list(head, raw_output, img_h, img_w, conf_threshold, agnostic_nms=False):
@@ -365,53 +378,108 @@ def _decode_detect_output(head, raw_output):
     return head._inference(raw_output)
 
 
-def get_dist_loss(model_pred, base_model_pred, model, base_model, dist_topk=1):
-    """KL distillation from teacher to student on the teacher's top-k class channels.
+def _foreground_anchor_mask(head, batch, num_anchors, device):
+    """Return a (B, A) mask of anchor centers inside any ground-truth box."""
+    if batch is None:
+        raise ValueError("dist_mode='foreground' requires the current training batch")
+    anchors = getattr(head, "anchors", None)
+    strides = getattr(head, "strides", None)
+    if anchors is None or strides is None or anchors.numel() == 0:
+        raise RuntimeError("Detect head anchors are not initialized for foreground distillation")
+    if anchors.shape[0] == 2:  # Detect stores anchors as (2, A)
+        anchors = anchors.transpose(0, 1)
+    if strides.shape[0] == 1:
+        strides = strides.transpose(0, 1)
+    if anchors.shape[0] != num_anchors:
+        raise RuntimeError(f"Anchor count mismatch: {anchors.shape[0]} vs {num_anchors}")
 
-    For each anchor, take the k teacher class channels (historical classes only) with the
-    highest confidence, compute a binary KL(teacher || student) on each selected channel
-    independently, weight each channel's loss by its teacher confidence, and normalize by
-    the sum of all selected teacher confidences over all anchors and channels.
+    img = batch["img"]
+    batch_size, _, height, width = img.shape
+    anchor_xy = anchors.to(device) * strides.to(device)
+    anchor_xy = anchor_xy / anchor_xy.new_tensor([width, height])
+    boxes = batch["bboxes"].to(device)
+    batch_idx = batch["batch_idx"].to(device).long()
+    mask = torch.zeros(batch_size, num_anchors, dtype=torch.bool, device=device)
+    for index in range(batch_size):
+        selected = batch_idx == index
+        if not selected.any():
+            continue
+        box = boxes[selected]
+        x1 = box[:, 0] - box[:, 2] / 2
+        x2 = box[:, 0] + box[:, 2] / 2
+        y1 = box[:, 1] - box[:, 3] / 2
+        y2 = box[:, 1] + box[:, 3] / 2
+        inside = (
+            (anchor_xy[None, :, 0] >= x1[:, None])
+            & (anchor_xy[None, :, 0] <= x2[:, None])
+            & (anchor_xy[None, :, 1] >= y1[:, None])
+            & (anchor_xy[None, :, 1] <= y2[:, None])
+        )
+        mask[index] = inside.any(dim=0)
+    return mask
+
+
+def get_dist_loss(
+    model_pred,
+    base_model_pred,
+    model,
+    base_model,
+    dist_topk=1,
+    dist_mode="topk",
+    batch=None,
+):
+    """Distillation from the historical-class teacher to the expanded student.
 
     Args:
         model_pred: Student raw output (pre-NMS), train-mode dict or end2end train-mode dict.
         base_model_pred: Teacher raw output, eval-mode (decoded, preds) tuple.
         model: Student detection model (used to locate the student Detect head).
         base_model: Teacher detection model (used to locate the teacher Detect head).
-        dist_topk (int): Number of teacher channels to distill per anchor; -1 means all
-            historical class channels. Must be -1 or >= 1.
+        dist_topk (int): Number of teacher channels for the ``topk`` mode; -1 means all
+            historical class channels. Ignored by ``uniform`` and ``foreground``.
+        dist_mode (str): ``topk`` = confidence-masked top-k CAD (default);
+            ``uniform`` = all historical classes, all anchors, no confidence mask;
+            ``foreground`` = all historical classes, anchors inside GT boxes, no confidence mask.
+        batch (dict, optional): Current training batch, required for ``foreground``.
 
     Returns:
-        Weighted KL distillation loss (scalar tensor).
+        KL distillation loss (scalar tensor).
     """
+    if dist_mode not in {"topk", "uniform", "foreground"}:
+        raise ValueError(f"dist_mode must be one of topk/uniform/foreground, got {dist_mode!r}")
+
     eps = 1e-6
     student_head = _get_detect_head(model)
     teacher_head = _get_detect_head(base_model)
-    nc = student_head.nc
-    model_pred = _decode_detect_output(student_head, model_pred)  # (B, 4 + nc, A)
+    nc_student = student_head.nc
+    nc_teacher = teacher_head.nc
+    model_pred = _decode_detect_output(student_head, model_pred)  # (B, 4 + nc_student, A)
     base_model_pred = _decode_detect_output(teacher_head, base_model_pred)  # (B, 4 + nc_teacher, A)
-    cls_start, cls_end = 4, 4 + nc
-    student_cls = model_pred[:, cls_start:cls_end, :]  # (B, C, A)
-    teacher_cls = base_model_pred[:, cls_start:cls_end, :]  # (B, C_t, A), historical classes only
+    student_cls = model_pred[:, 4 : 4 + nc_student, :]  # (B, C, A)
+    teacher_cls = base_model_pred[:, 4 : 4 + nc_teacher, :]  # (B, C_t, A), historical classes only
+
+    # Binary KL(teacher || student) on every historical teacher channel.
+    p = teacher_cls.to(torch.float32).clamp(eps, 1.0 - eps)
+    q = student_cls[:, :nc_teacher, :].to(torch.float32).clamp(eps, 1.0 - eps)
+    teacher_bin = torch.stack((p, 1 - p), dim=2)  # (B, C_t, 2, A)
+    student_bin = torch.stack((q, 1 - q), dim=2)  # (B, C_t, 2, A)
+    kl_all = F.kl_div(student_bin.log(), teacher_bin, reduction="none").sum(dim=2)  # (B, C_t, A)
+    kl_all = kl_all.to(model_pred.dtype)
+
+    if dist_mode == "uniform":
+        return kl_all.mean()
+
+    if dist_mode == "foreground":
+        mask = _foreground_anchor_mask(student_head, batch, kl_all.shape[-1], kl_all.device)
+        if not mask.any():
+            return kl_all.sum() * 0.0
+        return kl_all.permute(0, 2, 1)[mask].mean()
 
     n_teacher_ch = teacher_cls.shape[1]
     k = n_teacher_ch if dist_topk == -1 else min(dist_topk, n_teacher_ch)
-    # Per-anchor top-k teacher channels by confidence.
     teacher_topk, topk_idx = teacher_cls.topk(k, dim=1)  # (B, K, A), (B, K, A)
-    student_topk = torch.gather(student_cls, 1, topk_idx)  # (B, K, A)
-
-    # Binary KL(teacher || student) per selected channel:
-    # p,q in (0,1) from sigmoid cls; complementary mass is 1-p / 1-q.
-    dtype = model_pred.dtype
-    p = teacher_topk.to(torch.float32).clamp(eps, 1.0 - eps)
-    q = student_topk.to(torch.float32).clamp(eps, 1.0 - eps)
-    teacher_bin = torch.stack((p, 1 - p), dim=2)  # (B, K, 2, A)
-    student_bin = torch.stack((q, 1 - q), dim=2)  # (B, K, 2, A)
-    kl_per_channel = F.kl_div(student_bin.log(), teacher_bin, reduction="none").sum(dim=2).to(dtype)  # (B, K, A)
-
-    # Weighted sum over anchors and channels, normalized by total top-k confidence.
-    return (kl_per_channel * teacher_topk).sum() / teacher_topk.sum().clamp_min(eps)
-
+    kl_topk = torch.gather(kl_all, 1, topk_idx)  # (B, K, A)
+    return (kl_topk * teacher_topk).sum() / teacher_topk.sum().clamp_min(eps)
 
 def _cycle_batches(loader):
     """Yield batches from a dataloader indefinitely, re-entering it after each full pass.
@@ -421,6 +489,37 @@ def _cycle_batches(loader):
     """
     while True:
         yield from loader
+
+
+def _mean_lwf_terms(first, second):
+    """Average two ``(classification, regression)`` LwF term pairs.
+
+    ``None`` marks a term the configured LwF mode does not produce (the plain LwF
+    baseline has no classification term), and averaging it in keeps the mean over
+    the current-task and replay images identical to a single concatenated batch.
+    """
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return tuple(None if a is None else 0.5 * (a + b) for a, b in zip(first, second))
+
+
+def _load_stage_classes(path):
+    """Load the per-stage class-name lists written by tools/stage_class_map.py."""
+    if not path:
+        return None
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"stage_classes_path not found: {path}")
+    with open(path, encoding="utf-8") as file:
+        stages = json.load(file)
+    if not isinstance(stages, list) or not stages:
+        raise ValueError(f"stage_classes_path must hold a non-empty list of class-name lists, got {path}")
+    for index, stage in enumerate(stages):
+        if not isinstance(stage, list) or not stage or not all(isinstance(name, str) for name in stage):
+            raise ValueError(f"Stage {index + 1} in '{path}' must be a non-empty list of class names")
+    return [list(stage) for stage in stages]
 
 
 class AntiForgetTrainer(BaseTrainer):
@@ -434,6 +533,11 @@ class AntiForgetTrainer(BaseTrainer):
             _callbacks (list, optional): List of callback functions.
         """
         super().__init__(cfg, overrides, _callbacks)
+        self.stage_classes = _load_stage_classes(getattr(self.args, "stage_classes_path", None))
+        self.stage_validator = None
+
+    def run_stage_eval(self, final_epoch: bool) -> None:
+        """Hook for the periodic cumulative stage-wise test evaluation (trainer-specific)."""
 
     def _anti_forget_loss_names(self):
         """Return training loss names extended with the enabled anti-forgetting loss terms.
@@ -454,9 +558,115 @@ class AntiForgetTrainer(BaseTrainer):
             loss_names.append("l2_loss")
         if self.args.repre:
             loss_names.append("repre_loss")
-        if self.args.replay:
+        if self.args.replay and self.args.replay_mode in {"supervised", "both"}:
             loss_names.append("replay_loss")
+        if self.args.lwf:
+            if self.args.lwf_mode == "lwf":
+                loss_names.append("lwf_loss")
+            elif self.args.lwf_mode == "prad":
+                loss_names.extend(("prad_cls_loss", "prad_bg_loss", "prad_reg_loss"))
+            else:
+                loss_names.extend(("lwf_cls_loss", "lwf_reg_loss"))
+        if self.args.prd:
+            loss_names.extend(("prd_cls_loss", "prd_reg_loss"))
         return tuple(loss_names)
+
+    def _lwf_teacher_output(self, batch):
+        """Run the frozen LwF teacher on a batch and return its output plus head input features.
+
+        The head input features are captured only for the plain LwF baseline, which
+        distills features instead of head outputs.
+        """
+        with torch.no_grad():
+            if self.args.lwf_mode == "lwf":
+                return get_model_raw_output_and_features(batch, self.lwf_teacher, self.device)
+            return get_model_raw_output(batch, self.lwf_teacher, self.device), None
+
+    def _lwf_terms(self, student_output, student_feats, teacher_output, teacher_feats):
+        """Return the (classification, regression) LwF terms of one student/teacher output pair."""
+        if self.args.lwf_mode == "lwf":
+            return None, feature_l2_loss(student_feats, teacher_feats, self.lwf_feature_channels)
+        return self.lwf_loss(
+            detect_branch_output(student_output),
+            detect_branch_output(teacher_output),
+            _get_detect_head(self.model).stride,
+        )
+
+    def _setup_patch_prototypes(self, student_head, teacher_head, prad_enabled):
+        """Load the patch prototype artifact and build the prad / prd losses.
+
+        Args:
+            student_head (Detect): Student detection head.
+            teacher_head (Detect): Frozen previous-task detection head.
+            prad_enabled (bool): Whether the prototype-reliability distillation is active.
+        """
+        if not self.args.patch_prototypes:
+            raise ValueError("patch_prototypes is required when prad or prd is enabled")
+        if student_head.reg_max != 1 or teacher_head.reg_max != 1:
+            raise ValueError(
+                f"Patch prototype distillation targets direct-regression heads (reg_max=1), got student "
+                f"{student_head.reg_max} and teacher {teacher_head.reg_max}"
+            )
+        if prad_enabled:
+            if getattr(unwrap_model(self.model), "end2end", False):
+                raise ValueError("prad requires end2end training to be disabled (dense one2many branch)")
+            if self.args.replay_mode in {"distill", "both"}:
+                raise ValueError(
+                    "prad is incompatible with replay_mode 'distill'/'both': it distills the current batch only. "
+                    "Use prd for prototype replay, or replay_mode 'supervised'."
+                )
+        subspace, bank, meta = load_patch_artifact(self.args.patch_prototypes)
+        radius = head_patch_radius(student_head)
+        if int(meta["patch_radius"]) != radius:
+            raise ValueError(
+                f"Patch artifact '{self.args.patch_prototypes}' stores radius {meta['patch_radius']} but the "
+                f"current detection head needs radius {radius}"
+            )
+        channels = head_input_channels(student_head)
+        if list(subspace.channels) != channels:
+            raise ValueError(
+                f"Patch artifact head channels {list(subspace.channels)} differ from the model {channels}"
+            )
+        if int(meta["history_nc"]) != teacher_head.nc:
+            raise ValueError(
+                f"Patch artifact was built for {meta['history_nc']} old classes but the teacher exposes "
+                f"{teacher_head.nc}; regenerate the artifact for this stage"
+            )
+        bank.bind_nc(student_head.nc)
+        subspace.to(self.device)
+        bank.to(self.device)
+        self.patch_subspace, self.patch_bank = subspace, bank
+        LOGGER.info(
+            f"Patch prototypes '{self.args.patch_prototypes}': {bank.num_components} components, "
+            f"dims {subspace.dims}, radius {radius}"
+        )
+        if prad_enabled:
+            self.prad_loss = PrototypeReliabilityLwFLoss(
+                subspace=subspace,
+                bank=bank,
+                history_nc=teacher_head.nc,
+                fg_threshold=self.args.prad_fg_threshold,
+                bg_threshold=self.args.prad_bg_threshold,
+                conf_power=self.args.prad_conf_power,
+                proto_threshold=self.args.prad_proto_threshold,
+                proto_temperature=self.args.prad_proto_temperature,
+                bg_weight=self.args.prad_bg_weight,
+                split_normalize=self.args.prad_split_normalize,
+                max_fg=self.args.prad_max_fg,
+            )
+            criterion = RecordingDetectionLoss(unwrap_model(self.model))
+            unwrap_model(self.model).criterion = criterion
+        if self.args.prd:
+            self.prd_loss = PatchReplayDistillation(
+                student_head=student_head,
+                teacher_head=teacher_head,
+                subspace=subspace,
+                bank=bank,
+                samples=self.args.prd_samples,
+                std_scale=self.args.prd_std_scale,
+                smooth_l1_beta=1.0,
+                seed=RANK if RANK > -1 else 0,
+            )
 
     def _setup_train(self, world_size):
         """Build dataloaders and optimizer on correct rank process."""
@@ -508,13 +718,6 @@ class AntiForgetTrainer(BaseTrainer):
                 raise ValueError("BPF DwF and the KL distillation loss are mutually exclusive")
         # ============================== END: set up BPF ========================================================
 
-        # ============================== MODIFIED: set up EWC loss ============================================
-        if self.args.ewc:
-            self.ewc_loss_weight = self.args.ewc_loss_weight
-            ewc_state = load_ewc_state(self.args.importance_path, map_location=self.device)
-            self.ewc_loss = EWCLoss(model=self.model, state=ewc_state)
-        # ============================== END: set up EWC loss =================================================
-
         # ============================== MODIFIED: set up L2 regularization loss ==============================
         if self.args.l2:
             self.l2_loss_weight = self.args.l2_loss_weight
@@ -525,28 +728,59 @@ class AntiForgetTrainer(BaseTrainer):
         if self.args.espreg:
             self.espreg_loss_weight = self.args.espreg_loss_weight
             self.pca_cache = joblib.load(self.args.pca_cache_path)
-            components, eigen_values = _extract_pca_spectra(self.pca_cache)
-            self.espreg_loss = EWPRegLoss(self.model, self.base_model, module_names=self.pca_cache.keys(),
-                                         components=components, eigen_values=eigen_values)
+            components, eigen_values, param_names = _extract_pca_spectra(self.pca_cache)
+            espreg_modules = tuple(self.pca_cache)
+            if self.args.espreg_scope == "backbone":
+                espreg_modules = tuple(_get_nsgp_backbone_names(self.model, espreg_modules))
+            elif self.args.espreg_scope != "all":
+                raise ValueError(f"espreg_scope must be 'all' or 'backbone', got {self.args.espreg_scope!r}")
+            self.espreg_loss = ESPRegLoss(
+                self.model,
+                self.base_model,
+                module_names=espreg_modules,
+                components={name: components[name] for name in espreg_modules},
+                eigen_values={name: eigen_values[name] for name in espreg_modules},
+                param_names={name: param_names[name] for name in espreg_modules},
+                weight_mode=self.args.espreg_weight_mode,
+                form=self.args.espreg_form,
+            )
+            self.governed_modules = tuple(espreg_modules)
+            LOGGER.info(
+                f"ESPReg over {len(espreg_modules)} modules ({self.args.espreg_scope}), "
+                f"weight_mode={self.args.espreg_weight_mode}, form={self.args.espreg_form}"
+            )
         # ============================== END: set up ESPReg loss =================================================
 
         # ============================== MODIFIED: set up NSGP ============================================
         if self.args.nsgp:
-            # Reuse pca_cache if already loaded for ESPReg, otherwise load it
-            if hasattr(self, 'pca_cache'):
-                pca_cache_nsgp = self.pca_cache
-            else:
-                pca_cache_nsgp = joblib.load(self.args.pca_cache_path)
-            components, eigen_values = _extract_pca_spectra(pca_cache_nsgp)
+            if not hasattr(self, "pca_cache"):
+                self.pca_cache = joblib.load(self.args.pca_cache_path)
+            components, eigen_values, param_names = _extract_pca_spectra(self.pca_cache)
             self.nsgp_flexibility = getattr(self.args, 'nsgp_flexibility', 1.0)
-            module_names = tuple(pca_cache_nsgp)
+            module_names = tuple(self.pca_cache)
+            governed = set(getattr(self, "governed_modules", ()))
+            governed.update(module_names)
+            self.governed_modules = tuple(sorted(governed))
             self.nsgp_operator = NSGP(
                 module_names=module_names,
                 components=components,
                 eigen_values=eigen_values,
+                param_names=param_names,
                 normalized_module_names=_get_nsgp_backbone_names(self.model, module_names),
             )
         # ============================== END: set up NSGP =================================================
+
+        # ============================== MODIFIED: set up EWC loss ============================================
+        if self.args.ewc:
+            self.ewc_loss_weight = self.args.ewc_loss_weight
+            exclude_prefixes = tuple(f"{name}." for name in getattr(self, "governed_modules", ()))
+            ewc_state = load_ewc_state(self.args.importance_path, map_location=self.device)
+            self.ewc_loss = EWCLoss(model=self.model, state=ewc_state, exclude_prefixes=exclude_prefixes)
+            LOGGER.info(
+                f"EWC over {len(self.ewc_loss.importance)} parameters, "
+                f"excluding {len(exclude_prefixes)} NSGP/ESPReg modules"
+            )
+        # ============================== END: set up EWC loss =================================================
 
         # ============================== MODIFIED: set up RePRE ===========================================
         if self.args.repre:
@@ -559,6 +793,69 @@ class AntiForgetTrainer(BaseTrainer):
                 device=self.device,
             )
         # ============================== END: set up RePRE ===============================================
+
+        # ============================== MODIFIED: validate replay mode =================================
+        if self.args.replay_mode not in {"supervised", "distill", "both"}:
+            raise ValueError(
+                f"replay_mode must be 'supervised', 'distill' or 'both', got {self.args.replay_mode!r}"
+            )
+        if self.args.replay_mode in {"distill", "both"} and not self.args.lwf:
+            raise ValueError(f"replay_mode '{self.args.replay_mode}' needs lwf to distill the replay samples")
+        # ============================== END: validate replay mode =======================================
+
+        # ============================== MODIFIED: set up distillation teacher =============================
+        self.lwf_keep_classes = None
+        self.patch_subspace = None
+        self.prad_loss = None
+        self.prd_loss = None
+        self.prad_teacher_feats = False
+        prad_enabled = self.args.lwf and self.args.lwf_mode == "prad"
+        if self.args.lwf or self.args.prd:
+            if not self.args.lwf_teacher_model:
+                raise ValueError(
+                    "lwf_teacher_model (the previous-task checkpoint) is required when lwf or prd is enabled"
+                )
+            if self.args.lwf and self.args.lwf_mode not in {"yolo_lwf", "lwf", "prad"}:
+                raise ValueError(f"lwf_mode must be 'yolo_lwf', 'lwf' or 'prad', got {self.args.lwf_mode!r}")
+            self.lwf_teacher, _ = load_checkpoint(self.args.lwf_teacher_model, device=self.device)
+            self.lwf_teacher = self.lwf_teacher.eval()
+            self.lwf_teacher.requires_grad_(False)
+            _apply_train_head_args(self.lwf_teacher, self.args)
+            _check_teacher_decode_alignment(self.lwf_teacher, self.model, "lwf_teacher_model")
+            student_head = _get_detect_head(self.model)
+            teacher_head = _get_detect_head(self.lwf_teacher)
+            self.lwf_history_nc = teacher_head.nc
+            if teacher_head.reg_max != student_head.reg_max:
+                raise ValueError(
+                    f"LwF teacher reg_max {teacher_head.reg_max} differs from the student reg_max "
+                    f"{student_head.reg_max}; the box head layout must match"
+                )
+            if not 0 < self.lwf_history_nc < student_head.nc:
+                raise ValueError(
+                    f"LwF needs history class channels below the student class count, got teacher nc "
+                    f"{self.lwf_history_nc} and student nc {student_head.nc}"
+                )
+            if self.args.lwf and self.args.lwf_mode in {"yolo_lwf", "lwf"}:
+                self.lwf_loss = YOLOLwFLoss(
+                    reg_max=student_head.reg_max,
+                    history_nc=self.lwf_history_nc,
+                    temperature=self.args.lwf_temperature,
+                    wce=self.args.lwf_wce,
+                    cls_iou=self.args.lwf_cls_iou,
+                )
+                self.lwf_feature_channels = 4 * student_head.reg_max + self.lwf_history_nc
+            if self.args.lwf and self.args.lwf_mask_old:
+                # Current-task labels do not annotate the history classes; masking keeps the
+                # detection loss on the new-class channels for every lwf-based mode.
+                self.lwf_keep_classes = torch.arange(self.lwf_history_nc, student_head.nc, device=self.device)
+            if prad_enabled or self.args.prd:
+                self._setup_patch_prototypes(student_head, teacher_head, prad_enabled)
+            LOGGER.info(
+                f"Distillation ({self.args.lwf_mode if self.args.lwf else 'prd'}) teacher "
+                f"'{self.args.lwf_teacher_model}' with {self.lwf_history_nc} history classes, "
+                f"student with {student_head.nc} class channels"
+            )
+        # ============================== END: set up distillation teacher ==================================
 
         # Freeze layers
         freeze_list = (
@@ -635,6 +932,18 @@ class AntiForgetTrainer(BaseTrainer):
                 str(replay_train_path), batch_size=batch_size, rank=LOCAL_RANK, mode="train"
             )
         # ============================== END: set up replay dataloader ==========================================
+        # ============================== MODIFIED: validate LwF label coverage ============================
+        if self.lwf_keep_classes is not None:
+            annotated = sorted(
+                {int(cls) for label in self.train_loader.dataset.labels for cls in np.asarray(label["cls"]).reshape(-1)}
+            )
+            unsupervised = sorted(set(annotated) - set(self.lwf_keep_classes.tolist()))
+            if unsupervised:
+                raise ValueError(
+                    f"The current-task labels annotate history class ids {unsupervised}, which lwf_mask_old "
+                    f"would drop from supervision; disable lwf_mask_old or fix the task split"
+                )
+        # ============================== END: validate LwF label coverage =================================
         # ============================== MODIFIED: DDP-safe validation setup (all ranks) ==================
         # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
         self.test_loader = self.get_dataloader(
@@ -769,12 +1078,15 @@ class AntiForgetTrainer(BaseTrainer):
                     if self.args.bpf and self.args.bpf_dwf:
                         with torch.no_grad():
                             bpf_interim_pred = get_model_raw_output(batch, self.bpf_interim_model, self.device)
-                    if self.args.bpf and self.args.bpf_future:
-                        model_pred, bpf_head_features = get_model_raw_output_and_features(
+                    if self.args.lwf or self.args.prd:
+                        lwf_teacher_pred, lwf_teacher_feats = self._lwf_teacher_output(batch)
+                    if (self.args.bpf and self.args.bpf_future) or (self.args.lwf and self.args.lwf_mode == "lwf"):
+                        model_pred, head_features = get_model_raw_output_and_features(
                             batch, self.model, self.device
                         )
                     else:
                         model_pred = get_model_raw_output(batch, self.model, self.device)
+                        head_features = None
                     # ============================== END: get raw preds =======================================
 
                     # ============================== MODIFIED: generate pseudo labels ===============================
@@ -812,7 +1124,7 @@ class AntiForgetTrainer(BaseTrainer):
                         batch["bpf_ignore_mask"] = select_future_ignore_mask(
                             head=_get_detect_head(self.model),
                             raw_output=_raw_detect_levels(model_pred),
-                            head_features=bpf_head_features,
+                            head_features=head_features,
                             batch=batch,
                             object_topk=self.args.bpf_object_topk,
                             attention_topk=self.args.bpf_attention_topk,
@@ -822,18 +1134,41 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== END: BPF labels and future mask ==============================
                     
                     # ============================== MODIFIED: get det loss ===============================
+                    if self.lwf_keep_classes is not None:
+                        batch["cls_keep_classes"] = self.lwf_keep_classes
                     loss, self.loss_items = self.model(batch, preds=model_pred)
                     # ============================== END: get det loss ====================================
 
                     # ============================== MODIFIED: make a copy of loss items ===============================
                     loss_items = dict(self.loss_items)  # criterion returns a dict of detached per-term scalars
                     # ============================== END: make a copy of loss items ====================================
+
+                    # ============================== MODIFIED: snapshot the current-batch assignment ==================
+                    # Later forwards (replay) overwrite the recorded assignment, so read it here.
+                    prad_assignment = None
+                    if self.prad_loss is not None:
+                        prad_assignment = get_assignment(unwrap_model(self.model).criterion)
+                    # ============================== END: snapshot the current-batch assignment =======================
                     
                     self.loss = loss.sum()
 
+                    # ============================== MODIFIED: YOLO LwF terms on the current batch ================
+                    lwf_current = None
+                    if self.args.lwf and self.args.lwf_mode != "prad":
+                        lwf_current = self._lwf_terms(model_pred, head_features, lwf_teacher_pred, lwf_teacher_feats)
+                    # ============================== END: YOLO LwF terms on the current batch =====================
+
                     # ============================== MODIFIED: calculate KLD distillation loss ==========================
                     if self.args.distillation:
-                        _dist_loss = get_dist_loss(model_pred, base_model_pred, self.model, self.base_model, dist_topk=self.args.dist_topk)
+                        _dist_loss = get_dist_loss(
+                            model_pred,
+                            base_model_pred,
+                            self.model,
+                            self.base_model,
+                            dist_topk=self.args.dist_topk,
+                            dist_mode=self.args.dist_mode,
+                            batch=batch,
+                        )
                         self.loss += (_dist_loss * self.args.dist_loss_weight)
                         loss_items["dist_loss"] = _dist_loss.detach()
                     # ============================== END: calculate KL distillation loss ===============================
@@ -886,15 +1221,75 @@ class AntiForgetTrainer(BaseTrainer):
                     # ============================== END: replay regional prototypes ====================================
 
                     # ============================== MODIFIED: calculate replay loss ====================================
+                    lwf_replay = None
                     if self.args.replay:
-                        # Replay samples carry old-class GT only, so the plain detection loss on a
-                        # replay batch supervises exactly the historical classes.
                         replay_batch = self.preprocess_batch(next(replay_iter))
-                        replay_loss_vec, _ = self.model(replay_batch)  # (box, cls, dfl|l1) * batch size
-                        _replay_loss = replay_loss_vec.sum()
-                        self.loss += _replay_loss * self.args.replay_loss_weight
-                        loss_items["replay_loss"] = _replay_loss.detach()
+                        replay_teacher_pred = replay_teacher_feats = None
+                        replay_pred = replay_feats = None
+                        if self.args.lwf and self.args.replay_mode in {"distill", "both"}:
+                            # Replay images are distilled only; no replay label takes part in it.
+                            replay_teacher_pred, replay_teacher_feats = self._lwf_teacher_output(replay_batch)
+                            if self.args.lwf_mode == "lwf":
+                                replay_pred, replay_feats = get_model_raw_output_and_features(
+                                    replay_batch, self.model, self.device
+                                )
+                            else:
+                                replay_pred = get_model_raw_output(replay_batch, self.model, self.device)
+                        if self.args.replay_mode in {"supervised", "both"}:
+                            # Replay samples carry old-class GT only, so the plain detection loss on a
+                            # replay batch supervises exactly the historical classes.
+                            replay_loss_vec, _ = self.model(replay_batch, preds=replay_pred)
+                            _replay_loss = replay_loss_vec.sum()
+                            self.loss += _replay_loss * self.args.replay_loss_weight
+                            loss_items["replay_loss"] = _replay_loss.detach()
+                        if replay_pred is not None:
+                            lwf_replay = self._lwf_terms(
+                                replay_pred, replay_feats, replay_teacher_pred, replay_teacher_feats
+                            )
                     # ============================== END: calculate replay loss =========================================
+
+                    # ============================== MODIFIED: compose YOLO LwF loss ===================================
+                    if lwf_current is not None:
+                        lwf_cls, lwf_reg = _mean_lwf_terms(lwf_current, lwf_replay)
+                        if lwf_cls is None:
+                            lwf_total = lwf_reg * self.args.lwf_feature_loss_weight
+                            loss_items["lwf_loss"] = lwf_reg.detach()
+                        else:
+                            lwf_total = (
+                                lwf_cls * self.args.lwf_cls_loss_weight + lwf_reg * self.args.lwf_reg_loss_weight
+                            )
+                            loss_items["lwf_cls_loss"] = lwf_cls.detach()
+                            loss_items["lwf_reg_loss"] = lwf_reg.detach()
+                        self.loss += lwf_total * batch["img"].shape[0]
+                    # ============================== END: compose YOLO LwF loss ========================================
+
+                    # ============================== MODIFIED: prototype reliability distillation ====================
+                    if self.prad_loss is not None:
+                        prad_terms = self.prad_loss(
+                            detect_branch_output(model_pred),
+                            detect_branch_output(lwf_teacher_pred),
+                            new_class_mask(prad_assignment, self.lwf_history_nc),
+                            _get_detect_head(self.model).stride,
+                        )
+                        self.loss += (
+                            prad_terms.cls * self.args.prad_cls_loss_weight
+                            + prad_terms.reg * self.args.prad_reg_loss_weight
+                        )
+                        loss_items["prad_cls_loss"] = prad_terms.cls_fg.detach()
+                        loss_items["prad_bg_loss"] = prad_terms.cls_bg.detach()
+                        loss_items["prad_reg_loss"] = prad_terms.reg.detach()
+                    # ============================== END: prototype reliability distillation =======================
+
+                    # ============================== MODIFIED: patch replay distillation =============================
+                    if self.prd_loss is not None:
+                        prd_terms = self.prd_loss.compute_loss()
+                        self.loss += (
+                            prd_terms.cls * self.args.prd_loss_weight
+                            + prd_terms.reg * self.args.prd_reg_loss_weight
+                        )
+                        loss_items["prd_cls_loss"] = prd_terms.cls.detach()
+                        loss_items["prd_reg_loss"] = prd_terms.reg.detach()
+                    # ============================== END: patch replay distillation =================================
 
                     if RANK != -1:
                         self.loss *= world_size                   
@@ -966,6 +1361,17 @@ class AntiForgetTrainer(BaseTrainer):
                 self.metrics, self.fitness = self.validate()
             # ============================== END: validate on all ranks ==================================
 
+            # ============================== MODIFIED: periodic stage-wise test eval =====================
+            stage_eval_period = int(getattr(self.args, "stage_eval_period", 0) or 0)
+            if (
+                stage_eval_period > 0
+                and getattr(self.args, "stage_test_data", None)
+                and self.stage_classes
+                and ((epoch + 1) % stage_eval_period == 0 or final_epoch)
+            ):
+                self.run_stage_eval(final_epoch)
+            # ============================== END: periodic stage-wise test eval =========================
+
             if RANK in {-1, 0}:
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
@@ -1023,21 +1429,14 @@ class AntiForgetTrainer(BaseTrainer):
         self.scaler.unscale_(self.optimizer)  # unscale gradients
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
         # ============================== MODIFIED: capture NSGP parameters ============================
-        nsgp_params = None
-        parameters_before_step = None
         if self.args.nsgp:
             model_to_use = self.model.module if hasattr(self.model, 'module') else self.model
-            nsgp_params = {name: param for name, param in model_to_use.named_parameters()}
-            parameters_before_step = self.nsgp_operator.capture_parameters(nsgp_params)
+            self.nsgp_operator.capture_parameters(dict(model_to_use.named_parameters()))
         # ============================== END: capture NSGP parameters ================================
         self.scaler.step(self.optimizer)
         # ============================== MODIFIED: apply NSGP update projection ======================
         if self.args.nsgp:
-            self.nsgp_operator.apply_parameter_projection(
-                params_dict=nsgp_params,
-                parameters_before_step=parameters_before_step,
-                flexibility=self.nsgp_flexibility,
-            )
+            self.nsgp_operator.apply_parameter_projection(flexibility=self.nsgp_flexibility)
         # ============================== END: apply NSGP update projection ===========================
         self.scaler.update()
         self.optimizer.zero_grad()

@@ -1,8 +1,8 @@
 """Per-stage mAP aggregation of evaluation CSVs over the eval dataset sequence.
 
 For every evaluation CSV ``model_<k>_eval_<tag>.csv`` under ``--eval_dir`` (per-task
-and cumulative cells alike; class-agnostic ``*_object`` cells are excluded — a single
-``object`` class has no per-stage class breakdown), aggregate its per-class rows into
+and cumulative cells alike; legacy class-agnostic ``*_object`` cells are excluded
+(a single ``object`` class has no per-stage class breakdown), aggregate its per-class rows into
 the class space of each incremental stage. The stage class spaces come from the
 ``--tasks`` eval dataset sequence: stage j is the class space of the j-th yaml.
 

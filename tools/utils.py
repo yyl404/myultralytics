@@ -7,10 +7,12 @@ import threading
 import time
 import shutil
 from collections.abc import Mapping
+from pathlib import Path
 
 from torch import nn
 import torch.nn.functional as F
 
+import numpy as np
 import psutil
 import torch
 
@@ -201,77 +203,139 @@ def convert_class_ids(label_lines, class_id_map, task="detect"):
     return converted_lines
 
 
-def convert_class_ids_from_dir(labels_dir, class_id_map, output_dir, task="detect", pbar=None):
-    """Read all .txt label files under labels_dir (recursively) and convert class IDs.
-
-    Nested layout under ``labels_dir`` is mirrored under ``output_dir`` (same relative paths).
+def pairwise_iou_xyxy(boxes_a, boxes_b):
+    """Compute pairwise IoU between two xyxy box sets.
 
     Args:
-        labels_dir: Root directory of YOLO-format ``*.txt`` labels (flat or nested).
-        class_id_map: Dict mapping old class id -> new class id.
-        output_dir: Root directory to write converted labels (subdirs created as needed).
-        task: "detect" for detection (xywh) labels, "obb" for OBB (xyxyxyxy) labels.
-        pbar: Optional progress bar with an ``update()`` method; incremented once per label file.
+        boxes_a (np.ndarray): Boxes with shape (N, 4) in xyxy order.
+        boxes_b (np.ndarray): Boxes with shape (M, 4) in xyxy order.
+
+    Returns:
+        np.ndarray: IoU matrix with shape (N, M); empty inputs give zeros.
     """
-    labels_dir = OSP.abspath(labels_dir)
-    output_dir = OSP.abspath(output_dir)
-    for root, _, files in os.walk(labels_dir):
-        rel_root = OSP.relpath(root, labels_dir)
-        out_sub = output_dir if rel_root == "." else OSP.join(output_dir, rel_root)
-        for label_file in files:
-            if not label_file.endswith(".txt"):
-                continue
-            label_path = OSP.join(root, label_file)
-            os.makedirs(out_sub, exist_ok=True)
-            with open(label_path, "r") as f:
-                lines = f.readlines()
-            converted_lines = convert_class_ids(lines, class_id_map, task=task)
-            output_path = OSP.join(out_sub, label_file)
-            with open(output_path, "w") as f:
-                f.writelines(converted_lines)
-            if pbar is not None:
-                pbar.update()
+    if len(boxes_a) == 0 or len(boxes_b) == 0:
+        return np.zeros((len(boxes_a), len(boxes_b)), dtype=np.float32)
+    a = np.asarray(boxes_a, dtype=np.float32)
+    b = np.asarray(boxes_b, dtype=np.float32)
+    left_top = np.maximum(a[:, None, :2], b[None, :, :2])
+    right_bottom = np.minimum(a[:, None, 2:], b[None, :, 2:])
+    wh = np.clip(right_bottom - left_top, 0, None)
+    inter = wh[..., 0] * wh[..., 1]
+    area_a = np.clip(a[:, 2] - a[:, 0], 0, None) * np.clip(a[:, 3] - a[:, 1], 0, None)
+    area_b = np.clip(b[:, 2] - b[:, 0], 0, None) * np.clip(b[:, 3] - b[:, 1], 0, None)
+    return inter / (area_a[:, None] + area_b[None, :] - inter + 1e-6)
 
 
-def mirror_image_files(source_dir: str, dest_dir: str, pbar=None, *, no_use_link: bool) -> None:
-    """Mirror ``source_dir`` into ``dest_dir`` with the same subtree layout.
-
-    Each leaf file is either a symlink to the source file (default) or a full copy. We do **not**
-    symlink the whole ``source_dir`` as ``dest_dir``: Ultralytics resolves dataset image roots
-    with ``Path.resolve()``, which follows a **directory** symlink and makes ``img2label_paths()``
-    point at the source ``labels/`` tree instead of converted labels under ``output_dir``.
+def resolve_split_roots(dataset_path, dataset_config, split):
+    """Resolve the image and label directories of one dataset split.
 
     Args:
-        source_dir: Root of the image tree to mirror (walked recursively).
-        dest_dir: Root output directory; any existing path at this name is removed first.
-        pbar: Optional progress object with ``update()``; called once per mirrored file.
-        no_use_link: If True, copy each file with ``shutil.copy2``. If False, create a symlink with
-            ``os.symlink`` pointing at the absolute source path (saves disk space).
+        dataset_path (Path | str): Dataset YAML file. Relative split entries are
+            resolved against its parent directory.
+        dataset_config (Mapping): Loaded dataset config with a ``split`` key.
+        split (str): Split name, e.g. ``"train"``.
+
+    Returns:
+        tuple[list[Path], list[Path]]: Image roots and their label roots, in the
+        order the split entries are declared. The label root of each image root
+        is its path with the ``images`` component replaced by ``labels``.
+
+    Raises:
+        FileNotFoundError: An image or label directory does not exist.
+        TypeError: The split value is not a path or non-empty path sequence.
     """
-    source_dir = OSP.abspath(source_dir)
-    if OSP.lexists(dest_dir):
-        if OSP.islink(dest_dir):
-            os.unlink(dest_dir)
-        elif OSP.isdir(dest_dir):
-            shutil.rmtree(dest_dir)
-        else:
-            os.remove(dest_dir)
-    for root, _, files in os.walk(source_dir):
-        rel = OSP.relpath(root, source_dir)
-        dest_sub = dest_dir if rel == "." else OSP.join(dest_dir, rel)
-        os.makedirs(dest_sub, exist_ok=True)
-        for name in files:
-            src = OSP.join(root, name)
-            dst = OSP.join(dest_sub, name)
-            # Replace existing file or symlink (lexists covers broken symlinks on some OSes).
-            if OSP.lexists(dst):
-                os.unlink(dst)
-            if no_use_link:
-                shutil.copy2(src, dst)
-            else:
-                os.symlink(OSP.abspath(src), dst)
-            if pbar is not None:
-                pbar.update()
+    dataset_path = Path(dataset_path)
+    if split not in dataset_config:
+        raise KeyError(f"Dataset config '{dataset_path}' has no '{split}' split")
+    split_value = dataset_config[split]
+    if isinstance(split_value, str):
+        split_entries = [split_value]
+    elif isinstance(split_value, (list, tuple)):
+        split_entries = list(split_value)
+    else:
+        split_entries = []
+    if not split_entries or not all(isinstance(entry, str) for entry in split_entries):
+        raise TypeError(f"Dataset split '{split}' must be a path or non-empty list of paths, got {split_value!r}")
+
+    configured_root = dataset_config.get("path")
+    dataset_root = dataset_path.parent
+    if configured_root is not None:
+        dataset_root = Path(configured_root)
+        if not dataset_root.is_absolute():
+            dataset_root = dataset_path.parent / dataset_root
+
+    image_roots = []
+    label_roots = []
+    for entry in split_entries:
+        image_root = Path(entry)
+        if not image_root.is_absolute():
+            image_root = dataset_root / image_root
+        image_root = image_root.resolve()
+        label_root = Path(str(image_root).replace("images", "labels"))
+        if not image_root.is_dir():
+            raise FileNotFoundError(f"Image directory for split '{split}' does not exist: {image_root}")
+        if not label_root.is_dir():
+            raise FileNotFoundError(f"Label directory for split '{split}' does not exist: {label_root}")
+        image_roots.append(image_root)
+        label_roots.append(label_root)
+    return image_roots, label_roots
+
+
+def index_label_files(label_dirs):
+    """Index YOLO label files by image stem across one or more directories.
+
+    Args:
+        label_dirs (Sequence[Path | str]): Label directories to scan (non-recursive).
+
+    Returns:
+        dict[str, Path]: Image stem -> label file. Every stem appears once.
+
+    Raises:
+        ValueError: Two label files share a stem, so the image/label pairing
+            would be ambiguous.
+    """
+    index = {}
+    for label_dir in label_dirs:
+        for label_path in sorted(Path(label_dir).glob("*.txt")):
+            previous = index.setdefault(label_path.stem, label_path)
+            if previous != label_path:
+                raise ValueError(f"Duplicate label stem '{label_path.stem}': '{previous}' and '{label_path}'")
+    return index
+
+
+def stage_class_names(stage_yamls):
+    """Return the class dictionaries of an ordered per-stage dataset yaml sequence.
+
+    Args:
+        stage_yamls (Sequence[Path | str]): One dataset yaml per incremental
+            stage, in stage order.
+
+    Returns:
+        list[dict[int, str]]: Per-stage ``{class_id: class_name}`` maps.
+
+    Raises:
+        ValueError: A yaml has no ``names`` or the same class name appears in
+            more than one stage.
+    """
+    from ultralytics.utils import YAML
+
+    if not stage_yamls:
+        raise ValueError("Need at least one stage dataset yaml")
+    stages = []
+    seen = {}
+    for stage_index, stage_yaml in enumerate(stage_yamls, start=1):
+        config = YAML().load(stage_yaml)
+        if "names" not in config:
+            raise KeyError(f"Stage dataset '{stage_yaml}' has no 'names'")
+        names = normalize_names(config["names"], source=f"stage {stage_index} dataset '{stage_yaml}'")
+        for class_name in names.values():
+            previous = seen.setdefault(class_name, stage_index)
+            if previous != stage_index:
+                raise ValueError(
+                    f"Class '{class_name}' appears in both stage {previous} and stage {stage_index}"
+                )
+        stages.append(names)
+    return stages
 
 
 def merge_labels_from_dir(label_dirs, output_dir, class_id_maps=None, filter_iou_threshold=None):

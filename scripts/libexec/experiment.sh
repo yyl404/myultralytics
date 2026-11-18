@@ -1,6 +1,6 @@
 #!/bin/bash
 # Shared dataset / model / output resolution for the unified experiment entry points.
-# Sourced from the repo root (scripts/train.sh, eval.sh, predict.sh, create.sh,
+# Sourced from the repo root (scripts/train.sh, eval.sh, create.sh,
 # feature_drift.sh).
 #
 # Dataset identity knobs (--dataset/--split) exist ONLY for create.sh (slicing a
@@ -8,7 +8,7 @@
 # and predict take explicit yaml sequences.
 
 experiment_known_datasets() {
-    echo "voc voc-tiny coco odinw-13"
+    echo "voc voc-loco voc-tiny coco odinw-13"
 }
 
 experiment_known_model_families() {
@@ -16,7 +16,7 @@ experiment_known_model_families() {
 }
 
 experiment_known_method_components() {
-    echo "naive bpf pseudo_label ewc l2 dist espreg nsgp repre replay"
+    echo "naive bpf pseudo_label ewc l2 dist lwf espreg nsgp repre replay prad prd"
 }
 
 experiment_die() {
@@ -99,6 +99,7 @@ experiment_load_dataset() {
     SPLIT="$split"
     CREATE_PREREQ_CMDS=()
     SOURCE_CFG=""
+    CREATE_MODE="sample-filter"
     CREATE_OVERWRITE_DEFAULT=""
 
     case "$dataset" in
@@ -107,6 +108,13 @@ experiment_load_dataset() {
             DATA_TAG="VOC_${split//_/+}"
             DATA_ROOT="data/${DATA_TAG}"
             SOURCE_CFG="data/VOC-YOLO/VOC.yaml"
+            ;;
+        voc-loco)
+            INCREMENTAL_SETTING="cil"
+            DATA_TAG="VOC_LoCo_${split//_/+}"
+            DATA_ROOT="data/${DATA_TAG}"
+            SOURCE_CFG="data/VOC-YOLO/VOC.yaml"
+            CREATE_MODE="loco"
             ;;
         voc-tiny)
             INCREMENTAL_SETTING="cil"
